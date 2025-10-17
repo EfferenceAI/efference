@@ -1,51 +1,38 @@
 """
 Security and Authentication for customer API keys with Credit tracking
 """
-import os
 import logging
 import secrets
-from datetime import datetime, timedelta
-
+from datetime import datetime
 import hashlib
-from .config import DATABASE_URL
+from typing import Optional
 from sqlalchemy.orm import Session
 
-from typing import Dict, Optional, Tuple, Any
-from fastapi import Security, HTTPException, status
-from fastapi.security import APIKeyHeader
-
-from .db import SessionLocal, get_db
-from .db.models import Customer, APIKey, CreditTransaction, APIKeyStatus, UsageType
-
-
+from ..db.models import Customer, CreditTransaction, APIKeyStatus, UsageType
 
 logger = logging.getLogger(__name__)
 
-# From my research, we typically want to pass the API key in the request headers
-api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-#api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False) # In case the above doesn't work
 
 def hash_api_key(api_key: str) -> str:
     """Hash API key for secure storage."""
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-### Customer Management
+# ============================================================================
+# Customer Management
+# ============================================================================
+
 def create_customer(
-        db: Session,
-        customer_id: str,
-        name: str,
-        email: str, 
-        initial_credits: float = 100.0
+    db: Session,
+    customer_id: str,
+    name: str,
+    email: str, 
+    initial_credits: float = 100.0
 ) -> Customer:
     """Create a new customer account."""
-    # check if customer already exists
     existing = db.query(Customer).filter(Customer.customer_id == customer_id).first()
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Customer ID already exists."
-        )
+        raise ValueError(f"Customer {customer_id} already exists")
 
     new_customer = Customer(
         customer_id=customer_id,
@@ -64,9 +51,26 @@ def create_customer(
     logger.info(f"Created new customer: {customer_id}")
     return new_customer
 
+
 def get_customer(db: Session, customer_id: str) -> Optional[Customer]:
     """Retrieve customer information."""
     return db.query(Customer).filter(Customer.customer_id == customer_id).first()
+
+
+def add_credits(db: Session, customer_id: str, credits_amount: float) -> Customer:
+    """Add credits to customer account."""
+    customer = get_customer(db, customer_id)
+    if not customer:
+        raise ValueError(f"Customer {customer_id} not found")
+    
+    customer.credits_available += credits_amount
+    customer.credits_total += credits_amount
+    customer.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(customer)
+    logger.info(f"Added {credits_amount} credits to {customer_id}. Total available: {customer.credits_available}")
+    return customer
 
 
 def deduct_credits(
