@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Dict
+from typing import Dict, Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ async def health_check() -> Dict[str, str]:
 
 
 @router.get("/health/db", status_code=200)
-async def db_health_check(db: Session = Depends(get_db)) -> Dict[str, any]:
+async def db_health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Health check with database connectivity.
     
