@@ -21,6 +21,8 @@ class UsageType(str, Enum):
     VIDEO_STORAGE = "video_storage"
 
 class Customer(BaseModel):
+    __table__ = "customers"
+    """Customer account information."""
     customer_id: str = Field(..., description="Unique identifier for the customer")
     name: str = Field(..., description="Full name of the customer")
     email: EmailStr = Field(..., description="Email address of the customer")
@@ -35,6 +37,7 @@ class Customer(BaseModel):
 
 class APIKey(BaseModel):
     """API key for customer authentication."""
+    __table__ = "api_keys"
     key_id: str = Field(..., description="Unique key ID")
     customer_id: str = Field(..., description="Customer this key belongs to")
     api_key: str = Field(..., description="The actual API key (hashed in DB)")
@@ -47,6 +50,7 @@ class APIKey(BaseModel):
 
 class CreditTransaction(BaseModel):
     """Record of credit usage."""
+    __table__ = "credit_transactions"
     transaction_id: str = Field(..., description="Unique transaction ID")
     customer_id: str = Field(..., description="Customer ID")
     api_key_id: str = Field(..., description="API key used")
@@ -61,6 +65,7 @@ class CreditTransaction(BaseModel):
 
 class CustomerCreateRequest(BaseModel):
     """Request to create a new customer."""
+    customer_id: str = Field(..., description="Unique customer ID")
     name: str = Field(..., description="Customer name")
     email: str = Field(..., description="Customer email")
     initial_credits: float = Field(default=100.0, description="Initial credit allocation")
