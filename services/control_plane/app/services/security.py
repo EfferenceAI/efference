@@ -102,7 +102,7 @@ def deduct_credits(
         key_id=key_id,
         usage_type=usage_type,
         credits_deducted=credits_amount,
-        metadata=metadata or {},
+        meta=metadata or {},
         status="completed",
         created_at=datetime.utcnow()
     )
@@ -113,3 +113,44 @@ def deduct_credits(
     
     logger.info(f"Deducted {credits_amount} credits from {customer_id}. Remaining: {customer.credits_available}")
     return True
+
+
+# ============================================================================
+# Demo Data Setup (for development)
+# ============================================================================
+
+def setup_demo_data():
+    """Create demo customers and keys for testing."""
+    from ..db import SessionLocal
+    
+    db = SessionLocal()
+    try:
+        # Create demo customer
+        try:
+            create_customer(
+                db=db,
+                customer_id="demo_customer_1",
+                name="Demo Customer",
+                email="demo@example.com",
+                initial_credits=1000.0
+            )
+        except ValueError:
+            logger.info("Demo customer already exists")
+        
+        # Create demo API key
+        try:
+            from .api import create_api_key
+            api_key, key_record = create_api_key(
+                db=db,
+                customer_id="demo_customer_1",
+                key_name="Demo Key",
+                expires_in_days=30,
+                rate_limit=100
+            )
+            logger.info(f"Demo API Key (save this): {api_key}")
+            return api_key
+        except ValueError:
+            logger.info("Demo API key already exists")
+            return None
+    finally:
+        db.close()
