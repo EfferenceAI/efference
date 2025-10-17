@@ -90,7 +90,7 @@ class CreditTransaction(Base):
     credits_deducted = Column(Float, nullable=False)
     
     # Metadata for transaction details (JSON)
-    metadata = Column(JSON, default={})
+    meta = Column(JSON, default={})
     
     # Status
     status = Column(String, default="completed", nullable=False)
