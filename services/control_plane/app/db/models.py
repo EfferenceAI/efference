@@ -2,11 +2,13 @@
 This is the Data Models for customer management, API Keys, and Credit Tracking
 
 """
+from pydantic import Field, BaseModel
 from datetime import datetime
 from sqlalchemy import Column, String, Float, DateTime, Enum as SqlEnum, Integer, JSON, ForeignKey
+from typing import Optional
 from sqlalchemy.orm import relationship
 from enum import Enum
-from .db import Base
+from .db import BaseModel
 
 
 
@@ -22,8 +24,10 @@ class UsageType(str, Enum):
     VIDEO_STORAGE = "video_storage"
 
 class Customer(Base):
-    __tablename__ = "customers"
     """Customer account information."""
+    __tablename__ = "customers"
+
+    
     customer_id = Column(String, primary_key=True, index=True, description="Unique identifier for the customer")
     name = Column(String, description="Full name of the customer")
     email = Column(String, description="Email address of the customer")
@@ -47,9 +51,10 @@ class Customer(Base):
     credit_transactions = relationship("CreditTransaction", back_populates="customer", cascade="all, delete-orphan")
 
 
-class APIKey(Base):
+class APIKey(BaseModel):
     """API key for customer authentication."""
-    __table__ = "api_keys"
+    __tablename__ = "api_keys"
+
     key_id = Column(String, primary_key=True, index=True, description="Unique key ID")
     customer_id = Column(String, ForeignKey("customers.customer_id"), description="Customer this key belongs to")
     api_key = Column(String, description="The actual API key (hashed in DB)")
@@ -74,17 +79,27 @@ class APIKey(Base):
 
 class CreditTransaction(BaseModel):
     """Record of credit usage."""
-    __table__ = "credit_transactions"
-    transaction_id: str = Field(..., description="Unique transaction ID")
-    customer_id: str = Field(..., description="Customer ID")
-    api_key_id: str = Field(..., description="API key used")
-    usage_type: UsageType = Field(..., description="Type of usage")
-    credits_deducted: float = Field(..., description="Credits charged")
-    metadata: dict = Field(default_factory=dict, description="Additional metadata")
-    status: str = Field(default="completed", description="Transaction status")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    __tablename__ = "credit_transactions"
 
-# metadata in this context can include details like: videofiles, duration, resolution, inference_time_ms, etc.
+    transaction_id = Column(String, primary_key=True, index=True, description="Unique transaction ID")
+    customer_id = Column(String, ForeignKey("customers.customer_id"), description="Customer ID")
+    key_id = Column(String, ForeignKey("api_keys.key_id"), description="API key used")
+
+    # transaction details
+    usage_type = Column(Enum(UsageType), description="Type of usage")
+    credits_deducted = Column(Float, description="Credits charged")
+
+    # metadata in this context can include details like: videofiles, duration, resolution, inference_time_ms, etc.
+    metadata = Column(JSON, default=dict, description="Additional metadata")
+
+    # status and timestamps
+    status = Column(String, default="completed", description="Transaction status")
+    created_at = Column(DateTime, default_factory=datetime.utcnow)
+
+    # relationships
+    customer = relationship("Customer", back_populates="credit_transactions")
+
+
 
 
 class CustomerCreateRequest(BaseModel):
