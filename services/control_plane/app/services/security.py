@@ -8,7 +8,7 @@ import hashlib
 from typing import Optional
 from sqlalchemy.orm import Session
 
-from ..db.models import Customer, CreditTransaction, APIKeyStatus, UsageType
+from ..db.models import Customer, CreditTransaction,APIKey, APIKeyStatus, UsageType
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,7 @@ def deduct_credits(
     return True
 
 
+
 # ============================================================================
 # Demo Data Setup (for development)
 # ============================================================================
@@ -125,7 +126,7 @@ def setup_demo_data():
     
     db = SessionLocal()
     try:
-        # Create demo customer
+        # Create demo customer (if it doesn't exist)
         try:
             create_customer(
                 db=db,
@@ -134,10 +135,23 @@ def setup_demo_data():
                 email="demo@example.com",
                 initial_credits=1000.0
             )
-        except ValueError:
-            logger.info("Demo customer already exists")
+            logger.info("Demo customer created")
+        except ValueError as e:
+            logger.info(f"Demo customer already exists: {str(e)}")
         
-        # Create demo API key
+        # Check if demo API key already exists
+        from .api import get_api_key
+        existing_key = db.query(APIKey).filter(
+            APIKey.customer_id == "demo_customer_1",
+            APIKey.name == "Demo Key"
+        ).first()
+        
+        if existing_key:
+            # API key already exists, just return it (but we can't show the plaintext again)
+            logger.info("Demo API key already exists, not creating a new one")
+            return None
+        
+        # Create demo API key only if it doesn't exist
         try:
             from .api import create_api_key
             api_key, key_record = create_api_key(
@@ -147,10 +161,10 @@ def setup_demo_data():
                 expires_in_days=30,
                 rate_limit=100
             )
-            logger.info(f"Demo API Key (save this): {api_key}")
+            logger.info(f"Demo API Key created: {api_key}")
             return api_key
-        except ValueError:
-            logger.info("Demo API key already exists")
+        except ValueError as e:
+            logger.info(f"Demo API key creation failed: {str(e)}")
             return None
     finally:
         db.close()
