@@ -2,11 +2,12 @@
 This is the Data Models for customer management, API Keys, and Credit Tracking
 
 """
-
 from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field, EmailStr
+from sqlalchemy import Column, String, Float, DateTime, Enum as SqlEnum, Integer, JSON, ForeignKey
+from sqlalchemy.orm import relationship
 from enum import Enum
+from .db import Base
+
 
 
 class APIKeyStatus(str, Enum):
@@ -20,33 +21,56 @@ class UsageType(str, Enum):
     FRAME_PROCESSING = "frame_processing"
     VIDEO_STORAGE = "video_storage"
 
-class Customer(BaseModel):
-    __table__ = "customers"
+class Customer(Base):
+    __tablename__ = "customers"
     """Customer account information."""
-    customer_id: str = Field(..., description="Unique identifier for the customer")
-    name: str = Field(..., description="Full name of the customer")
-    email: EmailStr = Field(..., description="Email address of the customer")
-    status: str = Field(default="active", description="Account status: active, suspended, inactive")
-    credits_available: float = Field(default=0.0, description="Available credits for the customer")
+    customer_id = Column(String, primary_key=True, index=True, description="Unique identifier for the customer")
+    name = Column(String, description="Full name of the customer")
+    email = Column(String, description="Email address of the customer")
+
+    # account status
+    status = Column(String, default="active", description="Account status: active, suspended, inactive")
+
+    # credit tracking
+    credits_available = Column(Float, default=0.0, description="Available credits for the customer")
     # I can essentially calculate this as credits_total - credits_available
     # But I don't want to do that calculation every time I need to access credits used (so I want just one query instead of two)
-    credits_used: float = Field(default=0.0, description="Total credits used by the customer") 
-    credits_total: float = Field(default=0.0, description="Total credits allocated to the customer")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp when the customer was created")
-    updated_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp when the customer was last updated")
+    credits_used = Column(Float, default=0.0, description="Total credits used by the customer")
+    credits_total = Column(Float, default=0.0, description="Total credits allocated to the customer")
 
-class APIKey(BaseModel):
+    # timestamps
+    created_at = Column(DateTime, default_factory=datetime.utcnow, description="Timestamp when the customer was created")
+    updated_at = Column(DateTime, default_factory=datetime.utcnow, description="Timestamp when the customer was last updated")
+
+    # relationships
+    api_keys = relationship("APIKey", back_populates="customer", cascade="all, delete-orphan")
+    credit_transactions = relationship("CreditTransaction", back_populates="customer", cascade="all, delete-orphan")
+
+
+class APIKey(Base):
     """API key for customer authentication."""
     __table__ = "api_keys"
-    key_id: str = Field(..., description="Unique key ID")
-    customer_id: str = Field(..., description="Customer this key belongs to")
-    api_key: str = Field(..., description="The actual API key (hashed in DB)")
-    name: str = Field(..., description="Key name/description")
-    status: APIKeyStatus = Field(default=APIKeyStatus.ACTIVE, description="Key status")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    last_used: Optional[datetime] = Field(default=None, description="Last usage timestamp")
-    expires_at: Optional[datetime] = Field(default=None, description="Expiration time")
-    rate_limit: int = Field(default=100, description="Requests per minute")
+    key_id = Column(String, primary_key=True, index=True, description="Unique key ID")
+    customer_id = Column(String, ForeignKey("customers.customer_id"), description="Customer this key belongs to")
+    api_key = Column(String, description="The actual API key (hashed in DB)")
+    name = Column(String, description="Key name/description")
+
+    # status and expiration
+    status = Column(Enum(APIKeyStatus), default=APIKeyStatus.ACTIVE, description="Key status")
+    expires_at = Column(DateTime, default=None, description="Expiration time")
+
+    # rate limiting
+    rate_limit = Column(Integer, default=100, description="Requests per minute")
+
+    # usage tracking
+    last_used = Column(DateTime, default=None, description="Last usage timestamp")
+
+    # timestamps
+    created_at = Column(DateTime, default_factory=datetime.utcnow)
+
+    # relationships
+    customer = relationship("Customer", back_populates="api_keys")
+
 
 class CreditTransaction(BaseModel):
     """Record of credit usage."""
