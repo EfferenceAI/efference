@@ -10,7 +10,7 @@ import hashlib
 from .config import DATABASE_URL
 from sqlalchemy.orm import Session
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 from fastapi import Security, HTTPException, status
 from fastapi.security import APIKeyHeader
 
@@ -69,3 +69,43 @@ def get_customer(db: Session, customer_id: str) -> Optional[Customer]:
     return db.query(Customer).filter(Customer.customer_id == customer_id).first()
 
 
+def deduct_credits(
+    db: Session,
+    customer_id: str,
+    credits_amount: float,
+    key_id: str,
+    usage_type: UsageType = UsageType.VIDEO_INFERENCE,
+    metadata: dict = None
+) -> bool:
+    """Deduct credits from customer account. Returns True if successful, False if insufficient."""
+    customer = get_customer(db, customer_id)
+    if not customer:
+        raise ValueError(f"Customer {customer_id} not found")
+    
+    if customer.credits_available < credits_amount:
+        logger.warning(f"Insufficient credits for {customer_id}. Available: {customer.credits_available}, Needed: {credits_amount}")
+        return False
+    
+    customer.credits_available -= credits_amount
+    customer.credits_used += credits_amount
+    customer.updated_at = datetime.utcnow()
+    
+    # Record transaction
+    txn_id = f"txn_{secrets.token_hex(8)}"
+    transaction = CreditTransaction(
+        transaction_id=txn_id,
+        customer_id=customer_id,
+        key_id=key_id,
+        usage_type=usage_type,
+        credits_deducted=credits_amount,
+        metadata=metadata or {},
+        status="completed",
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(transaction)
+    db.commit()
+    db.refresh(customer)
+    
+    logger.info(f"Deducted {credits_amount} credits from {customer_id}. Remaining: {customer.credits_available}")
+    return True
