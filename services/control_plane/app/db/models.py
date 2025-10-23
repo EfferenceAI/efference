@@ -24,7 +24,7 @@ class UsageType(str, Enum):
     VIDEO_INFERENCE = "video_inference"
     FRAME_PROCESSING = "frame_processing"
     VIDEO_STORAGE = "video_storage"
-    IMAGE_RGBD = "image_rgbd"  # Add this line
+    IMAGE_RGBD = "image_rgbd"  
 
 
 class Customer(Base):
