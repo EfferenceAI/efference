@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Tests
+tests/
+*.pytest_cache/
+
+# Model weights (will download from S3)
+weights/
+*.pt
+*.pth
+*.onnx
+
+# Large files
+*.mp4
+*.avi
+*.mov
+
+# OS
+.DS_Store
+Thumbs.db

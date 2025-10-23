@@ -1,0 +1,20 @@
+# Core FastAPI and server dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.0
+python-multipart==0.0.6
+
+# PyTorch
+torch==2.8  
+torchvision 
+numpy==1.24.0
+
+# Computer vision
+opencv-python==4.8.0.76
+
+# AWS SDK for S3 downloads
+boto3==1.28.0
+
+# External model packages - Install from Git
+# NOTE: This will also install its dependencies (einops, open3d, etc.)
+efference-rgbd @ git+https://github.com/EfferenceAI/efference-rgbd.git@v0.1.0
