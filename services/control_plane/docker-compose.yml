@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: efference
+      POSTGRES_PASSWORD: dev_password
+      POSTGRES_DB: efference
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U efference"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  control_plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://efference:dev_password@postgres:5432/efference
+      MODEL_SERVER_URL: http://model_server:8000/infer
+      ADMIN_KEY: dev-admin-key-change-in-prod
+      LOG_LEVEL: debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app  # Hot reload for development
+
+volumes:
+  postgres_data:
