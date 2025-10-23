@@ -22,7 +22,7 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 async def process_rgbd_image(
     rgb: UploadFile = File(..., description="RGB image file"),
     depth: UploadFile = File(None, description="Optional depth image from sensor"),
-    customer_id: str = Depends(validate_customer_api_key),
+    auth_data: tuple = Depends(validate_customer_api_key),  # Changed from customer_id
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """
@@ -32,6 +32,10 @@ async def process_rgbd_image(
     - **depth**: Optional depth image from sensor (PNG, NPY)
     """
     try:
+        # Unpack authentication data
+        api_key, customer = auth_data
+        customer_id = customer.customer_id
+        
         # Read file sizes
         rgb_data = await rgb.read()
         rgb_size_mb = len(rgb_data) / (1024 * 1024)
@@ -67,9 +71,11 @@ async def process_rgbd_image(
         credits_cost = CREDIT_COSTS["image_rgbd_base"] + (total_size_mb * CREDIT_COSTS["per_mb"])
         
         # Deduct credits
+        # Deduct credits
         remaining_credits = deduct_credits(
             db=db,
             customer_id=customer_id,
+            key_id=api_key.key_id,  # Added key_id
             credits_amount=credits_cost,
             usage_type="image_rgbd",
             metadata={
