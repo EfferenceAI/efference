@@ -2,7 +2,7 @@
 
 import logging
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from .base import BaseAdapter
 
@@ -55,6 +55,51 @@ class RGBDAdapter(BaseAdapter):
                     "mean": float(np.mean(depth_corrected)),
                     "has_valid_depth": bool(np.any(depth_corrected > 0))
                 }
+            }
+        except Exception as e:
+            logger.error(f"RGBD inference failed: {str(e)}", exc_info=True)
+            raise
+    def infer_rgbd(self, rgb: np.ndarray, depth: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Run RGBD inference with RGB image and optional depth.
+        
+        Args:
+            rgb: RGB image (H, W, 3), uint8
+            depth: Optional depth image from sensor (H, W), float32
+            
+        Returns:
+            Structured inference result with corrected depth
+        """
+        try:
+            # If no depth provided, use zeros (pure depth estimation mode)
+            if depth is None:
+                depth = np.zeros_like(rgb[:, :, 0], dtype=np.float32)
+            
+            # Ensure depth is float32
+            if depth.dtype != np.float32:
+                depth = depth.astype(np.float32)
+            
+            logger.info(f"RGBD inference - RGB shape: {rgb.shape}, Depth shape: {depth.shape}")
+            
+            # Call model's infer_image method
+            depth_corrected = self.model.infer_image(
+                rgb=rgb,
+                depth=depth,
+                input_size=518,
+                max_depth=25.0
+            )
+            
+            return {
+                "model_type": "rgbd",
+                "output": {
+                    "shape": list(depth_corrected.shape),
+                    "dtype": str(depth_corrected.dtype),
+                    "min": float(np.min(depth_corrected)),
+                    "max": float(np.max(depth_corrected)),
+                    "mean": float(np.mean(depth_corrected)),
+                    "has_valid_depth": bool(np.any(depth_corrected > 0))
+                },
+                "input_depth_provided": depth is not None and np.any(depth > 0)
             }
         except Exception as e:
             logger.error(f"RGBD inference failed: {str(e)}", exc_info=True)

@@ -246,3 +246,70 @@ async def run_inference(video: UploadFile = File(...)) -> Dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inference failed: {str(e)}"
         )
+@app.post("/infer-image", status_code=200)
+async def run_image_inference(
+    rgb: UploadFile = File(..., description="RGB image"),
+    depth: UploadFile = File(None, description="Optional depth image from sensor")
+) -> Dict[str, Any]:
+    """Run inference on a single RGB image with optional depth."""
+    if model_adapter is None:
+        logger.error("Model adapter not loaded")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model is not loaded"
+        )
+    
+    try:
+        # Read RGB image
+        rgb_data = await rgb.read()
+        rgb_array = np.frombuffer(rgb_data, dtype=np.uint8)
+        rgb_image = cv2.imdecode(rgb_array, cv2.IMREAD_COLOR)
+        
+        if rgb_image is None:
+            raise ValueError("Failed to decode RGB image")
+        
+        # Convert BGR to RGB
+        rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
+        
+        # Read optional depth image
+        depth_image = None
+        if depth is not None:
+            depth_data = await depth.read()
+            depth_array = np.frombuffer(depth_data, dtype=np.uint8)
+            depth_image = cv2.imdecode(depth_array, cv2.IMREAD_UNCHANGED)
+            
+            if depth_image is None:
+                raise ValueError("Failed to decode depth image")
+        
+        logger.info(f"Processing RGB image: {rgb.filename}, shape: {rgb_image.shape}")
+        if depth_image is not None:
+            logger.info(f"With depth image: {depth.filename}, shape: {depth_image.shape}")
+        
+        # Run inference using adapter
+        logger.info("Running RGBD inference...")
+        inference_result = model_adapter.infer_rgbd(rgb_image, depth_image)
+        
+        # Return response
+        response = {
+            "status": "success",
+            "rgb_filename": rgb.filename,
+            "depth_filename": depth.filename if depth else None,
+            "model_name": model_name,
+            "inference_result": inference_result
+        }
+        
+        logger.info(f"Successfully processed: {rgb.filename}")
+        return response
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Inference failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )

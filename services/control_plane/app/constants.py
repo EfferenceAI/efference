@@ -1,5 +1,13 @@
 """Constants for credit calculation and other configurations."""
 
+# Credit costs for different operations
+CREDIT_COSTS = {
+    "video_inference": 1.0,  # Base cost per video
+    "per_frame": 0.01,  # Cost per frame processed
+    "per_mb": 0.1,  # Cost per MB of data
+    "image_rgbd_base": 0.5,  # Base cost for single image RGBD
+}
+
 
 def calculate_credits(video_metadata: dict) -> float:
     """

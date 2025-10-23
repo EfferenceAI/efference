@@ -27,4 +27,7 @@ else:
     # PostgreSQL or other databases don't need check_same_thread
     SQLALCHEMY_KWARGS = {}
 
+# Model Server URL
+MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer")
+
 print("Database URL loaded from .env:", DATABASE_URL)

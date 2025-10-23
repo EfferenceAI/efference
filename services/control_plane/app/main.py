@@ -15,6 +15,7 @@ from .routers import (
     api_keys_router,
     credits_router
 )
+from .routers.images import router as images_router
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +40,7 @@ app = FastAPI(
 # Include routers
 app.include_router(health_router)
 app.include_router(videos_router)
+app.include_router(images_router)
 app.include_router(customers_router)
 app.include_router(api_keys_router)
 app.include_router(credits_router)
