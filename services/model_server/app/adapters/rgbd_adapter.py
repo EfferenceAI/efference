@@ -71,6 +71,9 @@ class RGBDAdapter(BaseAdapter):
             Structured inference result with corrected depth
         """
         try:
+            # Check if depth was provided BEFORE we modify it
+            depth_was_provided = depth is not None and bool(np.any(depth > 0))
+            
             # If no depth provided, use zeros (pure depth estimation mode)
             if depth is None:
                 depth = np.zeros_like(rgb[:, :, 0], dtype=np.float32)
@@ -99,7 +102,7 @@ class RGBDAdapter(BaseAdapter):
                     "mean": float(np.mean(depth_corrected)),
                     "has_valid_depth": bool(np.any(depth_corrected > 0))
                 },
-                "input_depth_provided": depth is not None and np.any(depth > 0)
+                "input_depth_provided": depth_was_provided  # Already converted to Python bool
             }
         except Exception as e:
             logger.error(f"RGBD inference failed: {str(e)}", exc_info=True)
