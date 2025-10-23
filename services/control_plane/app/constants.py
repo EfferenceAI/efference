@@ -38,3 +38,7 @@ def calculate_credits(video_metadata: dict) -> float:
     total_credits = base_credits * resolution_factor * duration_factor
     
     return round(total_credits, 2)
+
+
+    ## Frame count * height*width
+    ## $5 per gpu hour used
