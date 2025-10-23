@@ -18,9 +18,13 @@ if not DATABASE_URL:
     DB_DIR.mkdir(exist_ok=True)
     DATABASE_URL = f"sqlite:///{DB_DIR}/control_plane.db"
 
-# SQLAlchemy engine options
-SQLALCHEMY_KWARGS = {
-    "connect_args": {"check_same_thread": False}  # Required for SQLite
-}
+# SQLAlchemy engine options - conditional based on database type
+if DATABASE_URL.startswith("sqlite"):
+    SQLALCHEMY_KWARGS = {
+        "connect_args": {"check_same_thread": False}  # Required for SQLite
+    }
+else:
+    # PostgreSQL or other databases don't need check_same_thread
+    SQLALCHEMY_KWARGS = {}
 
 print("Database URL loaded from .env:", DATABASE_URL)
