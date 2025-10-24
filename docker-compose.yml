@@ -16,7 +16,6 @@ services:
       retries: 5
 
   control_plane:
-    platform: linux/amd64  # ← ADD THIS for production parity
     build:
       context: ./services/control_plane
       dockerfile: Dockerfile
@@ -34,7 +33,6 @@ services:
       - ./services/control_plane/app:/app/app
 
   model_server:
-    platform: linux/amd64  # ← ADD THIS for production parity
     build:
       context: ./services/model_server
       dockerfile: Dockerfile

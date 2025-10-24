@@ -37,10 +37,14 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "httpx>=0.25.0",  # Changed from requests
+    "httpx>=0.25.0",
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
+visualization = [
+    "matplotlib>=3.5.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
