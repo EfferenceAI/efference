@@ -280,6 +280,7 @@ async def run_image_inference(
             
             if depth_image is None:
                 raise ValueError("Failed to decode depth image")
+            depth_image = depth_image.astype(np.float32) / 1000.0  # Convert mm to meters
         
         logger.info(f"Processing RGB image: {rgb.filename}, shape: {rgb_image.shape}")
         if depth_image is not None:
