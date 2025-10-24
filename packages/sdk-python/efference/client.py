@@ -2,12 +2,13 @@
 
 import httpx
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any, BinaryIO, Union
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure SDK logger only (don't interfere with user's logging)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class EfferenceClient:
@@ -15,33 +16,27 @@ class EfferenceClient:
     Official Python client for the Efference ML API.
     
     Example:
-        >>> client = EfferenceClient(
-        ...     api_key="sk_live_your_key",
-        ...     base_url="https://api.efference.ai"
-        ... )
+        >>> client = EfferenceClient(api_key="sk_live_your_key")
         >>> result = client.videos.process("path/to/video.mp4")
         >>> print(result)
     """
     
     DEFAULT_TIMEOUT = 300.0  # 5 minutes
-    DEFAULT_BASE_URL = "https://api.efference.ai"
+    DEFAULT_BASE_URL = os.getenv("EFFERENCE_API_URL", "https://api.efference.ai")
+
     
     def __init__(
         self,
         api_key: str,
-        base_url: Optional[str] = None,
+        base_url: Optional[str] = None,  # Keep for testing, but don't document
         timeout: Optional[float] = None
     ):
         """
         Initialize the Efference API client.
         
         Args:
-            api_key: Your API key for authentication (starts with sk_live_ or sk_test_)
-            base_url: The base URL of the API (defaults to official API)
+            api_key: Your API key (starts with sk_live_ or sk_test_)
             timeout: Request timeout in seconds (defaults to 300)
-            
-        Raises:
-            ValueError: If api_key is empty or None
         """
         if not api_key or not api_key.strip():
             raise ValueError("api_key cannot be empty")
@@ -52,7 +47,8 @@ class EfferenceClient:
         self.videos = self.Videos(self)
         self.images = self.Images(self)
         
-        logger.info(f"Efference client initialized with base_url: {self.base_url}")
+        # Only log in debug mode, not base_url
+        logger.info("Efference client initialized")
     
     class Videos:
         """Video processing operations."""
@@ -215,6 +211,9 @@ class EfferenceClient:
             self,
             rgb_path: Union[str, Path, BinaryIO],
             depth_path: Optional[Union[str, Path, BinaryIO]] = None,
+            depth_scale: float = 1000.0,
+            input_size: int = 518,
+            max_depth: float = 25.0,
             save_visualization: Optional[Union[str, Path]] = None,
             save_3panel: Optional[Union[str, Path]] = None
         ) -> Dict[str, Any]:
@@ -224,6 +223,9 @@ class EfferenceClient:
             Args:
                 rgb_path: Path to RGB image or file-like object
                 depth_path: Optional path to depth image from sensor
+                depth_scale: Depth scale for sensor (default: 1000 for RealSense)
+                input_size: Model input size (default: 518)
+                max_depth: Maximum depth in meters (default: 25.0)
                 save_visualization: Optional path to save single colorized depth PNG
                 save_3panel: Optional path to save 3-panel comparison (RGB|Original|Corrected)
                 
@@ -266,11 +268,18 @@ class EfferenceClient:
                     depth_file_obj = open(depth_path, "rb")
                     files["depth"] = ("depth.png", depth_file_obj, "image/png")
             
+            # Prepare form data for configurable parameters
+            data = {
+                "depth_scale": str(depth_scale),
+                "input_size": str(input_size),
+                "max_depth": str(max_depth)
+            }
+            
             try:
                 logger.info(f"Processing RGBD image...")
                 
                 with httpx.Client(timeout=self.client.timeout) as client:
-                    response = client.post(url, headers=headers, files=files)
+                    response = client.post(url, headers=headers, files=files, data=data)
                     response.raise_for_status()
                 
                 result = response.json()
