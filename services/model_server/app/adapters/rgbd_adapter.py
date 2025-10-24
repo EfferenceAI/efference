@@ -109,18 +109,22 @@ class RGBDAdapter(BaseAdapter):
             
             # Generate visualization using efference-rgbd's built-in functions
             if return_visualization:
-                # 3-panel visualization (RGB + Original + Corrected) - FULL FEATURE!
+                # Use ACTUAL depth range for better visualization
+                actual_min = float(np.min(depth_corrected))
+                actual_max = float(np.max(depth_corrected))
+                
+                # 3-panel visualization (RGB + Original + Corrected)
                 vis_3panel = create_visualization(
                     rgb, depth_orig, depth_corrected, 
-                    image_min, image_max
+                    actual_min, actual_max  # Use actual range!
                 )
                 result["depth_visualization_3panel"] = self._to_base64_png(vis_3panel)
                 
-                # Single colorized corrected depth (simpler)
+                # Single colorized corrected depth
                 depth_colored_single = colorize(
                     depth_corrected,
-                    min_depth=image_min,
-                    max_depth=image_max,
+                    min_depth=actual_min,  # Use actual range!
+                    max_depth=actual_max,  # Use actual range!
                     cmap=cv2.COLORMAP_TURBO
                 )
                 result["depth_visualization"] = self._to_base64_png(depth_colored_single)
