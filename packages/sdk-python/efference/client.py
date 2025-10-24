@@ -50,6 +50,7 @@ class EfferenceClient:
         self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self.videos = self.Videos(self)
+        self.images = self.Images(self)
         
         logger.info(f"Efference client initialized with base_url: {self.base_url}")
     
@@ -202,6 +203,185 @@ class EfferenceClient:
                 logger.error(f"Server error: {status_code}")
             else:
                 logger.error(f"HTTP error: {status_code}")
+    
+    class Images:
+        """Image processing operations."""
+        
+        def __init__(self, client: "EfferenceClient"):
+            """Initialize the Images namespace."""
+            self.client = client
+        
+        def process_rgbd(
+            self,
+            rgb_path: Union[str, Path, BinaryIO],
+            depth_path: Optional[Union[str, Path, BinaryIO]] = None,
+            save_visualization: Optional[Union[str, Path]] = None,
+            save_3panel: Optional[Union[str, Path]] = None
+        ) -> Dict[str, Any]:
+            """
+            Process RGB image with optional depth for depth estimation.
+            
+            Args:
+                rgb_path: Path to RGB image or file-like object
+                depth_path: Optional path to depth image from sensor
+                save_visualization: Optional path to save single colorized depth PNG
+                save_3panel: Optional path to save 3-panel comparison (RGB|Original|Corrected)
+                
+            Returns:
+                Dictionary containing inference results and depth visualizations
+                
+            Example:
+                >>> result = client.images.process_rgbd(
+                ...     "color.png",
+                ...     save_visualization="depth_colored.png",
+                ...     save_3panel="comparison.png"
+                ... )
+                >>> print(f"Depth range: {result['inference_result']['output']['min']:.2f}-{result['inference_result']['output']['max']:.2f}m")
+            """
+            url = f"{self.client.base_url}/v1/images/rgbd"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            # Prepare RGB file
+            rgb_file_obj = None
+            if hasattr(rgb_path, 'read'):
+                rgb_file = ("rgb.png", rgb_path, "image/png")
+            else:
+                rgb_path = Path(rgb_path)
+                if not rgb_path.exists():
+                    raise FileNotFoundError(f"RGB image not found: {rgb_path}")
+                rgb_file_obj = open(rgb_path, "rb")
+                rgb_file = ("rgb.png", rgb_file_obj, "image/png")
+            
+            files = {"rgb": rgb_file}
+            
+            # Prepare optional depth file
+            depth_file_obj = None
+            if depth_path is not None:
+                if hasattr(depth_path, 'read'):
+                    files["depth"] = ("depth.png", depth_path, "image/png")
+                else:
+                    depth_path = Path(depth_path)
+                    if not depth_path.exists():
+                        raise FileNotFoundError(f"Depth image not found: {depth_path}")
+                    depth_file_obj = open(depth_path, "rb")
+                    files["depth"] = ("depth.png", depth_file_obj, "image/png")
+            
+            try:
+                logger.info(f"Processing RGBD image...")
+                
+                with httpx.Client(timeout=self.client.timeout) as client:
+                    response = client.post(url, headers=headers, files=files)
+                    response.raise_for_status()
+                
+                result = response.json()
+                logger.info("RGBD processing completed successfully")
+                
+                # Save single visualization if requested
+                if save_visualization and "inference_result" in result:
+                    viz_data = result["inference_result"].get("depth_visualization")
+                    if viz_data:
+                        self._save_visualization(viz_data, save_visualization)
+                        logger.info(f"Saved depth visualization to: {save_visualization}")
+                
+                # Save 3-panel visualization if requested
+                if save_3panel and "inference_result" in result:
+                    viz_3panel = result["inference_result"].get("depth_visualization_3panel")
+                    if viz_3panel:
+                        self._save_visualization(viz_3panel, save_3panel)
+                        logger.info(f"Saved 3-panel visualization to: {save_3panel}")
+                
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error: {e.response.status_code}")
+                try:
+                    error_detail = e.response.json()
+                    logger.error(f"Error details: {error_detail}")
+                except:
+                    pass
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+            finally:
+                # Close files if we opened them
+                if rgb_file_obj:
+                    rgb_file_obj.close()
+                if depth_file_obj:
+                    depth_file_obj.close()
+        
+        def _save_visualization(self, base64_data: str, output_path: Union[str, Path]):
+            """Decode base64 PNG and save to file."""
+            import base64
+            
+            output_path = Path(output_path)
+            img_data = base64.b64decode(base64_data)
+            
+            with open(output_path, "wb") as f:
+                f.write(img_data)
+        
+        def visualize_depth(self, result: Dict[str, Any], mode: str = "single", show: bool = True):
+            """
+            Display depth visualization using matplotlib.
+            
+            Args:
+                result: API response containing depth_visualization
+                mode: "single" for colorized depth only, "3panel" for RGB|Original|Corrected comparison
+                show: Whether to display the plot immediately
+                
+            Returns:
+                Matplotlib figure object
+                
+            Example:
+                >>> result = client.images.process_rgbd("color.png")
+                >>> client.images.visualize_depth(result, mode="3panel")
+            """
+            try:
+                import matplotlib.pyplot as plt
+                import base64
+                from PIL import Image
+                from io import BytesIO
+            except ImportError:
+                raise ImportError(
+                    "matplotlib and Pillow required for visualization. "
+                    "Install with: pip install efference[visualization]"
+                )
+            
+            # Extract base64 visualization based on mode
+            inference_result = result.get("inference_result", {})
+            
+            if mode == "3panel":
+                depth_viz_b64 = inference_result.get("depth_visualization_3panel")
+                if not depth_viz_b64:
+                    raise ValueError("No 3-panel visualization found. Falling back to single mode.")
+                title = "RGBD Comparison (RGB | Original Depth | Corrected Depth)"
+            else:
+                depth_viz_b64 = inference_result.get("depth_visualization")
+                if not depth_viz_b64:
+                    raise ValueError("No depth_visualization found in result.")
+                title = "Depth Estimation (Blue=Near, Red=Far)"
+            
+            # Decode and display
+            img_data = base64.b64decode(depth_viz_b64)
+            img = Image.open(BytesIO(img_data))
+            
+            fig = plt.figure(figsize=(15, 8) if mode == "3panel" else (10, 8))
+            plt.imshow(img)
+            plt.title(title)
+            plt.axis('off')
+            
+            # Add depth stats for single mode
+            if mode != "3panel":
+                stats = inference_result.get("output", {})
+                stats_text = f"Min: {stats.get('min', 0):.2f}m | Max: {stats.get('max', 0):.2f}m | Mean: {stats.get('mean', 0):.2f}m"
+                plt.text(10, 30, stats_text,
+                        color='white', fontsize=12, 
+                        bbox=dict(facecolor='black', alpha=0.7))
+            
+            if show:
+                plt.show()
+            
+            return fig
 
 
 __all__ = ["EfferenceClient"]
