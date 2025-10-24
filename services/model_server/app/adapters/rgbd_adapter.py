@@ -1,7 +1,11 @@
-"""Adapter for efference-rgbd model."""
+"""Adapter for efference-rgbd model """
 
 import logging
 import numpy as np
+import base64
+import cv2
+from io import BytesIO
+from PIL import Image
 from typing import Dict, Any, Optional
 
 from .base import BaseAdapter
@@ -10,34 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 class RGBDAdapter(BaseAdapter):
-    """Wraps efference-rgbd model."""
+    """Wraps efference-rgbd model with minimal duplication."""
     
     def load_model(self):
         """Load efference-rgbd model with weights."""
         try:
-            # NEW API: Import load_model from utils
             from efference_rgbd.utils import load_model
-            
-            # Load model (returns RGBDDepth instance)
             self.model = load_model(self.weights_path)
-            
             logger.info("✓ RGBD model loaded successfully")
-        except ImportError as e:
-            logger.error(f"efference_rgbd package not installed: {str(e)}")
-            raise
         except Exception as e:
             logger.error(f"Failed to load RGBD model: {str(e)}")
             raise
     
     def infer(self, frame: np.ndarray) -> Dict[str, Any]:
-        """Run RGBD inference."""
+        """Run RGBD inference on video frame."""
         try:
-            # NEW API: Call infer_image as a method on the model
-            # Note: Expects actual depth (not inverse depth)
             depth_placeholder = np.zeros_like(frame[:, :, 0], dtype=np.float32)
-            
-            # Call model's infer_image method
-            # Returns ONLY depth_corrected (not a tuple)
             depth_corrected = self.model.infer_image(
                 rgb=frame,
                 depth=depth_placeholder,
@@ -59,40 +51,50 @@ class RGBDAdapter(BaseAdapter):
         except Exception as e:
             logger.error(f"RGBD inference failed: {str(e)}", exc_info=True)
             raise
-    def infer_rgbd(self, rgb: np.ndarray, depth: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    
+    def infer_rgbd(
+        self, 
+        rgb: np.ndarray, 
+        depth: Optional[np.ndarray] = None,
+        return_visualization: bool = True,
+        image_min: float = 0.1,
+        image_max: float = 5.0
+    ) -> Dict[str, Any]:
         """
         Run RGBD inference with RGB image and optional depth.
+        
+        REUSES: efference-rgbd's colorize() and create_visualization()
         
         Args:
             rgb: RGB image (H, W, 3), uint8
             depth: Optional depth image from sensor (H, W), float32
+            return_visualization: Whether to return base64-encoded visualization
+            image_min: Min depth for colorization (meters)
+            image_max: Max depth for colorization (meters)
             
         Returns:
-            Structured inference result with corrected depth
+            Structured inference result with optional visualizations
         """
         try:
-            # Check if depth was provided BEFORE we modify it
+            from efference_rgbd.utils import colorize, create_visualization
+            
             depth_was_provided = depth is not None and bool(np.any(depth > 0))
+            depth_orig = depth if depth is not None else np.zeros_like(rgb[:, :, 0], dtype=np.float32)
             
-            # If no depth provided, use zeros (pure depth estimation mode)
-            if depth is None:
-                depth = np.zeros_like(rgb[:, :, 0], dtype=np.float32)
+            if depth_orig.dtype != np.float32:
+                depth_orig = depth_orig.astype(np.float32)
             
-            # Ensure depth is float32
-            if depth.dtype != np.float32:
-                depth = depth.astype(np.float32)
+            logger.info(f"RGBD inference - RGB: {rgb.shape}, Depth: {depth_orig.shape}")
             
-            logger.info(f"RGBD inference - RGB shape: {rgb.shape}, Depth shape: {depth.shape}")
-            
-            # Call model's infer_image method
+            # Run inference
             depth_corrected = self.model.infer_image(
                 rgb=rgb,
-                depth=depth,
+                depth=depth_orig,
                 input_size=518,
                 max_depth=25.0
             )
             
-            return {
+            result = {
                 "model_type": "rgbd",
                 "output": {
                     "shape": list(depth_corrected.shape),
@@ -102,8 +104,37 @@ class RGBDAdapter(BaseAdapter):
                     "mean": float(np.mean(depth_corrected)),
                     "has_valid_depth": bool(np.any(depth_corrected > 0))
                 },
-                "input_depth_provided": depth_was_provided  # Already converted to Python bool
+                "input_depth_provided": depth_was_provided
             }
+            
+            # Generate visualization using efference-rgbd's built-in functions
+            if return_visualization:
+                # 3-panel visualization (RGB + Original + Corrected) - FULL FEATURE!
+                vis_3panel = create_visualization(
+                    rgb, depth_orig, depth_corrected, 
+                    image_min, image_max
+                )
+                result["depth_visualization_3panel"] = self._to_base64_png(vis_3panel)
+                
+                # Single colorized corrected depth (simpler)
+                depth_colored_single = colorize(
+                    depth_corrected,
+                    min_depth=image_min,
+                    max_depth=image_max,
+                    cmap=cv2.COLORMAP_TURBO
+                )
+                result["depth_visualization"] = self._to_base64_png(depth_colored_single)
+            
+            return result
+            
         except Exception as e:
             logger.error(f"RGBD inference failed: {str(e)}", exc_info=True)
             raise
+    
+    def _to_base64_png(self, image: np.ndarray) -> str:
+        """Convert numpy image to base64 PNG string."""
+        pil_image = Image.fromarray(image.astype(np.uint8))
+        buffer = BytesIO()
+        pil_image.save(buffer, format="PNG")
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode('utf-8')
