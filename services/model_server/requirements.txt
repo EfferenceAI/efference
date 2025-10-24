@@ -11,10 +11,11 @@ numpy==1.24.0
 
 # Computer vision
 opencv-python==4.8.0.76
+pillow==10.0.0
 
 # AWS SDK for S3 downloads
 boto3==1.28.0
 
 # External model packages - Install from Git
 # NOTE: This will also install its dependencies (einops, open3d, etc.)
-efference-rgbd @ git+https://github.com/EfferenceAI/efference-rgbd.git@v0.1.0
+efference-rgbd @ git+https://github.com/EfferenceAI/efference-rgbd.git@main
