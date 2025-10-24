@@ -8,7 +8,7 @@ from typing import Dict, Any
 
 import numpy as np
 import cv2
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Form
 
 from .adapters import ModelRegistry
 
@@ -249,7 +249,11 @@ async def run_inference(video: UploadFile = File(...)) -> Dict[str, Any]:
 @app.post("/infer-image", status_code=200)
 async def run_image_inference(
     rgb: UploadFile = File(..., description="RGB image"),
-    depth: UploadFile = File(None, description="Optional depth image from sensor")
+    depth: UploadFile = File(None, description="Optional depth image from sensor"),
+    depth_scale: float = Form(1000.0, description="Depth scale for sensor (default: 1000 for RealSense)"),
+    input_size: int = Form(518, description="Model input size"),
+    max_depth: float = Form(25.0, description="Maximum depth in meters"),
+    include_pointcloud: bool = Form(False, description="Generate 3D point cloud")
 ) -> Dict[str, Any]:
     """Run inference on a single RGB image with optional depth."""
     if model_adapter is None:

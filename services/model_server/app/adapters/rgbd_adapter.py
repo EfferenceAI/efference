@@ -56,9 +56,11 @@ class RGBDAdapter(BaseAdapter):
         self, 
         rgb: np.ndarray, 
         depth: Optional[np.ndarray] = None,
+        depth_scale: float = 1000.0,  
+        input_size: int = 518,        
+        max_depth: float = 25.0,      
         return_visualization: bool = True,
-        image_min: float = 0.1,
-        image_max: float = 5.0
+        include_pointcloud: bool = False
     ) -> Dict[str, Any]:
         """
         Run RGBD inference with RGB image and optional depth.
