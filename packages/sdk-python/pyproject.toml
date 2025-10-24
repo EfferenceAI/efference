@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "efference"
+version = "0.1.0"
+description = "Official Python SDK for Efference ML API - Process videos with GPU-accelerated machine learning models"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "EfferenceAI", email = "support@efference.ai"}
+]
+keywords = [
+    "efference",
+    "ml",
+    "machine-learning",
+    "gpu",
+    "video-processing",
+    "inference",
+    "api",
+    "sdk",
+    "depth-estimation",
+    "computer-vision"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.25.0",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+visualization = [
+    "matplotlib>=3.5.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",  # Modern linter, replaces flake8
+    "mypy>=1.0.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://efference.ai"
+Documentation = "https://docs.efference.ai"
+Repository = "https://github.com/EfferenceAI/efference"
+Issues = "https://github.com/EfferenceAI/efference/issues"
+
+[tool.setuptools]
+packages = ["efference"]
+
+[tool.setuptools.package-data]
+efference = ["py.typed"]  # For type checking
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=efference --cov-report=html --cov-report=term"
+asyncio_mode = "auto"

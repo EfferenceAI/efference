@@ -1,0 +1,30 @@
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# HTTP Client for model server communication
+httpx==0.25.0
+
+# File upload handling
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9  # PostgreSQL driver for production
+alembic==1.12.1  # Database migrations
+
+# Data validation
+pydantic==2.5.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Security
+passlib[bcrypt]==1.7.4  # For password hashing
+python-jose[cryptography]==3.3.0  # For JWT tokens (if needed later)
+
+# AWS (if running on Lambda or need S3)
+boto3==1.28.85  # Optional: for S3 access, secrets manager
+
+# Monitoring (optional but recommended)
+prometheus-fastapi-instrumentator==6.1.0  # Metrics
