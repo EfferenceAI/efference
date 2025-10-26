@@ -16,6 +16,7 @@ from .routers import (
     credits_router
 )
 from .routers.images import router as images_router
+from .routers.streaming import router as streaming_router
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +42,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(videos_router)
 app.include_router(images_router)
+app.include_router(streaming_router)
 app.include_router(customers_router)
 app.include_router(api_keys_router)
 app.include_router(credits_router)
