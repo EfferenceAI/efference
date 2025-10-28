@@ -47,6 +47,14 @@ services:
     volumes:
       - ./services/model_server/app:/app/app
       - model_weights:/app/weights
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
 
 secrets:
   github_token:
