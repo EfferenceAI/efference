@@ -71,6 +71,7 @@ async def process_rgbd_image(
         credits_cost = CREDIT_COSTS["image_rgbd_base"] + (total_size_mb * CREDIT_COSTS["per_mb"])
         
         # Deduct credits
+        # Deduct credits
         remaining_credits = deduct_credits(
             db=db,
             customer_id=customer_id,

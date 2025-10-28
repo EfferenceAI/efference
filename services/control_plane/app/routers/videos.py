@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 # Configuration
-MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8080/infer")
+MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))  # 5 minutes default
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "500000000"))  # 500MB default
 
@@ -160,7 +160,7 @@ async def process_video(
                     detail=f"Model server did not respond within {REQUEST_TIMEOUT}s"
                 )
             except httpx.HTTPStatusError as e:
-                logger.error(f"Model server error: {e.status_code}")
+                logger.error(f"Model server error: {e.response.status_code}")
                 try:
                     error_detail = e.response.json().get("detail", str(e))
                 except:
