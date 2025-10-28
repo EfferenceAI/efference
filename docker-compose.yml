@@ -23,7 +23,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://efference:dev_password@postgres:5432/efference
-      MODEL_SERVER_URL: http://model_server:8000
+      MODEL_SERVER_URL: http://model_server:8000/infer
       ADMIN_KEY: dev-admin-key
       LOG_LEVEL: debug
     depends_on:
