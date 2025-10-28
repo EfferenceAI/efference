@@ -2,7 +2,7 @@
 
 import os
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Form
@@ -31,13 +31,15 @@ async def process_video_batch(
     max_frames: Optional[int] = Form(None, description="Maximum frames to process"),
     frame_skip: int = Form(1, description="Process every Nth frame"),
     db: Session = Depends(get_db),
-    customer_id: str = Depends(validate_customer_api_key)
+    auth_data: Tuple = Depends(validate_customer_api_key)
 ) -> Dict[str, Any]:
     """
     Process ALL frames from a video file using batch processing.
     More expensive than single-frame processing but provides complete analysis.
     """
     try:
+        key_record, customer = auth_data
+        customer_id = customer.customer_id
         logger.info(f"Batch processing request from customer {customer_id}")
         
         # Validate file
@@ -83,6 +85,7 @@ async def process_video_batch(
         remaining_credits = deduct_credits(
             db=db,
             customer_id=customer_id,
+            key_id=key_record.key_id,
             credits_amount=credits_cost,
             usage_type="video_batch",
             metadata={
