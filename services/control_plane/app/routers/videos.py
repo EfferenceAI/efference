@@ -160,7 +160,7 @@ async def process_video(
                     detail=f"Model server did not respond within {REQUEST_TIMEOUT}s"
                 )
             except httpx.HTTPStatusError as e:
-                logger.error(f"Model server error: {e.status_code}")
+                logger.error(f"Model server error: {e.response.status_code}")
                 try:
                     error_detail = e.response.json().get("detail", str(e))
                 except:

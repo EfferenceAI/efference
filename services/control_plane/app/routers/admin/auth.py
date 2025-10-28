@@ -1,5 +1,6 @@
 """Admin authentication utilities."""
 
+import os
 import logging
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -7,7 +8,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 logger = logging.getLogger(__name__)
 
 # Simple admin key for securing admin endpoints
-ADMIN_KEY = "admin-secret-key-change-me"
+ADMIN_KEY = os.getenv("ADMIN_KEY", "admin-secret-key-change-me")
 
 security = HTTPBearer()
 
