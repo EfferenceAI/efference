@@ -8,6 +8,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..db.models import UsageType
 from ..services.deps import validate_customer_api_key
 from ..services.security import deduct_credits
 from ..constants import CREDIT_COSTS
@@ -71,13 +72,12 @@ async def process_rgbd_image(
         credits_cost = CREDIT_COSTS["image_rgbd_base"] + (total_size_mb * CREDIT_COSTS["per_mb"])
         
         # Deduct credits
-        # Deduct credits
         remaining_credits = deduct_credits(
             db=db,
             customer_id=customer_id,
-            key_id=api_key.key_id,  # Added key_id
+            key_id=api_key.key_id,
             credits_amount=credits_cost,
-            usage_type="image_rgbd",
+            usage_type=UsageType.IMAGE_RGBD,
             metadata={
                 "rgb_filename": rgb.filename,
                 "depth_filename": depth.filename if depth else None,

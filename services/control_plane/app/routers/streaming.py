@@ -9,6 +9,7 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status,
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..db.models import UsageType
 from ..services.deps import validate_customer_api_key
 from ..services.security import deduct_credits
 
@@ -87,7 +88,7 @@ async def process_video_batch(
             customer_id=customer_id,
             key_id=key_record.key_id,
             credits_amount=credits_cost,
-            usage_type="video_batch",
+            usage_type=UsageType.VIDEO_BATCH,
             metadata={
                 "filename": video.filename,
                 "frames_processed": frames_processed,
@@ -236,13 +237,16 @@ async def start_camera_stream(
 async def get_stream_frame(
     run_inference: bool = False,
     db: Session = Depends(get_db),
-    customer_id: str = Depends(validate_customer_api_key)
+    auth_data: Tuple = Depends(validate_customer_api_key)
 ) -> Dict[str, Any]:
     """
     Get latest frame from active camera stream.
     Optionally run inference on the frame (costs credits).
     """
     try:
+        key_record, customer = auth_data
+        customer_id = customer.customer_id
+        
         # Forward to model server
         params = {"run_inference": run_inference}
         
@@ -261,8 +265,9 @@ async def get_stream_frame(
             remaining_credits = deduct_credits(
                 db=db,
                 customer_id=customer_id,
+                key_id=key_record.key_id,
                 credits_amount=credits_cost,
-                usage_type="stream_inference",
+                usage_type=UsageType.STREAM_INFERENCE,
                 metadata={"frame_count": result.get("frame_data", {}).get("frame_count", 0)}
             )
             

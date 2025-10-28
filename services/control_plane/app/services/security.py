@@ -80,15 +80,15 @@ def deduct_credits(
     key_id: str,
     usage_type: UsageType = UsageType.VIDEO_INFERENCE,
     metadata: dict = None
-) -> bool:
-    """Deduct credits from customer account. Returns True if successful, False if insufficient."""
+) -> float:
+    """Deduct credits from customer account. Returns remaining credits after deduction."""
     customer = get_customer(db, customer_id)
     if not customer:
         raise ValueError(f"Customer {customer_id} not found")
     
     if customer.credits_available < credits_amount:
         logger.warning(f"Insufficient credits for {customer_id}. Available: {customer.credits_available}, Needed: {credits_amount}")
-        return False
+        raise ValueError(f"Insufficient credits. Available: {customer.credits_available}, Needed: {credits_amount}")
     
     customer.credits_available -= credits_amount
     customer.credits_used += credits_amount
@@ -112,7 +112,7 @@ def deduct_credits(
     db.refresh(customer)
     
     logger.info(f"Deducted {credits_amount} credits from {customer_id}. Remaining: {customer.credits_available}")
-    return True
+    return customer.credits_available
 
 
 

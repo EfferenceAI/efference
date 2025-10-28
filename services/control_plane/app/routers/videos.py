@@ -113,8 +113,8 @@ async def process_video(
                             detail=f"Insufficient credits. Need {credits_needed}, have {customer.credits_available}"
                         )
                     
-                    # Deduct credits
-                    success = deduct_credits(
+                    # Deduct credits and get remaining balance
+                    remaining_credits = deduct_credits(
                         db=db,
                         customer_id=customer_id,
                         credits_amount=credits_needed,
@@ -129,24 +129,14 @@ async def process_video(
                         }
                     )
                     
-                    if not success:
-                        logger.error(f"Failed to deduct credits for {customer_id}")
-                        raise HTTPException(
-                            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                            detail="Failed to process payment"
-                        )
-                    
-                    # Get updated customer info for response
-                    updated_customer = get_customer(db, customer_id)
-                    
                     # Add credit info to response
                     inference_result["credits_deducted"] = credits_needed
-                    inference_result["credits_remaining"] = updated_customer.credits_available
+                    inference_result["credits_remaining"] = remaining_credits
                     
                     logger.info(
                         f"Successfully processed video for {customer_id}. "
                         f"Credits deducted: {credits_needed}, "
-                        f"Remaining: {updated_customer.credits_available}"
+                        f"Remaining: {remaining_credits}"
                     )
                 else:
                     logger.warning("No video_metadata in inference result")
