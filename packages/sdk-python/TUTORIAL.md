@@ -571,14 +571,6 @@ class TestEfferenceClient(unittest.TestCase):
 
 ---
 
-## Next Steps
-
-1. Explore the full API reference in [README.md](README.md)
-2. Review examples on [GitHub](https://github.com/EfferenceAI/efference)
-3. Check [API documentation](https://docs.efference.ai)
-4. Join the community
-
----
 
 ## Support
 
