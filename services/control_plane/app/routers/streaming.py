@@ -64,7 +64,7 @@ async def process_video_batch(
         
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{MODEL_SERVER_URL}/infer-batch",
+                f"{MODEL_SERVER_URL.replace('/infer', '/infer-batch')}",
                 files=files,
                 data=data
             )
