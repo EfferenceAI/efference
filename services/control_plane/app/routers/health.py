@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
-MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8080/infer")
+MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer")
 
 
 @router.get("/health", status_code=200)

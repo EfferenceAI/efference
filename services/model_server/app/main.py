@@ -330,7 +330,7 @@ async def run_batch_video_inference(
         )
 
 
-@app.post("/models/switch", status_code=200)
+@app.post("/infer/models/switch", status_code=200)
 async def switch_model(
     new_model_name: str = Form(..., description="Model to switch to (d435, d405, rgbd)")
 ) -> Dict[str, Any]:
@@ -386,7 +386,7 @@ async def switch_model(
         )
 
 
-@app.get("/models/list", status_code=200)
+@app.get("/infer/models/list", status_code=200)
 async def list_available_models() -> Dict[str, Any]:
     """List all available models and their status."""
     return {
@@ -488,7 +488,7 @@ streaming_state = {
 }
 
 
-@app.post("/stream/start", status_code=200)
+@app.post("/infer/stream/start", status_code=200)
 async def start_camera_stream(
     camera_type: str = Form("realsense", description="Camera type (realsense, webcam)"),
     config_path: str = Form(None, description="Optional camera config file"),
@@ -557,7 +557,7 @@ async def start_camera_stream(
         )
 
 
-@app.get("/stream/frame", status_code=200)
+@app.get("/infer/stream/frame", status_code=200)
 async def get_latest_frame(
     run_inference: bool = False,
     format: str = "json"
@@ -631,7 +631,7 @@ async def get_latest_frame(
         )
 
 
-@app.post("/stream/stop", status_code=200)
+@app.post("/infer/stream/stop", status_code=200)
 async def stop_camera_stream() -> Dict[str, Any]:
     """Stop the active camera stream."""
     global streaming_state
@@ -674,7 +674,7 @@ async def stop_camera_stream() -> Dict[str, Any]:
         )
 
 
-@app.get("/stream/status", status_code=200)
+@app.get("/infer/stream/status", status_code=200)
 async def get_stream_status() -> Dict[str, Any]:
     """Get current streaming status and statistics."""
     return {

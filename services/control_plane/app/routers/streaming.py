@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["streaming", "batch", "models"])
 
 # Configuration
-MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8000")
+MODEL_SERVER_BASE = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer").rstrip('/infer')
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
 
 
@@ -66,7 +66,7 @@ async def process_video_batch(
         
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{MODEL_SERVER_URL.replace('/infer', '/infer-batch')}",
+                f"{MODEL_SERVER_BASE}/infer-batch",
                 files=files,
                 data=data
             )
@@ -146,7 +146,7 @@ async def switch_model(
         
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                f"{MODEL_SERVER_URL}/models/switch",
+                f"{MODEL_SERVER_BASE}/infer/models/switch",
                 data=data
             )
             response.raise_for_status()
@@ -176,7 +176,7 @@ async def list_models(
     """List all available models and their status."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{MODEL_SERVER_URL}/models/list")
+            response = await client.get(f"{MODEL_SERVER_BASE}/infer/models/list")
             response.raise_for_status()
             return response.json()
             
@@ -209,7 +209,7 @@ async def start_camera_stream(
         
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                f"{MODEL_SERVER_URL}/stream/start",
+                f"{MODEL_SERVER_BASE}/infer/stream/start",
                 data=data
             )
             response.raise_for_status()
@@ -248,7 +248,7 @@ async def get_stream_frame(
         
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
-                f"{MODEL_SERVER_URL}/stream/frame",
+                f"{MODEL_SERVER_BASE}/infer/stream/frame",
                 params=params
             )
             response.raise_for_status()
@@ -288,7 +288,7 @@ async def stop_camera_stream(
         logger.info(f"Stream stop request from customer {customer_id}")
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(f"{MODEL_SERVER_URL}/stream/stop")
+            response = await client.post(f"{MODEL_SERVER_BASE}/infer/stream/stop")
             response.raise_for_status()
             result = response.json()
         
@@ -310,7 +310,7 @@ async def get_stream_status(
     """Get current streaming status."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{MODEL_SERVER_URL}/stream/status")
+            response = await client.get(f"{MODEL_SERVER_BASE}/infer/stream/status")
             response.raise_for_status()
             return response.json()
             
