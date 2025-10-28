@@ -15,10 +15,23 @@ class EfferenceClient:
     """
     Official Python client for the Efference ML API.
     
+    Provides access to:
+    - Video processing (single frame and batch)
+    - RGBD image processing
+    - Live camera streaming
+    - Model management
+    
     Example:
         >>> client = EfferenceClient(api_key="sk_live_your_key")
+        >>> # Single frame video processing
         >>> result = client.videos.process("path/to/video.mp4")
-        >>> print(result)
+        >>> # Batch processing all frames
+        >>> batch_result = client.videos.process_batch("video.mp4", max_frames=100)
+        >>> # Live streaming
+        >>> client.streaming.start("realsense")
+        >>> frame = client.streaming.get_frame(run_inference=True)
+        >>> # Model management
+        >>> client.models.switch("d405")
     """
     
     DEFAULT_TIMEOUT = 300.0  # 5 minutes
@@ -46,6 +59,8 @@ class EfferenceClient:
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self.videos = self.Videos(self)
         self.images = self.Images(self)
+        self.streaming = self.Streaming(self)
+        self.models = self.Models(self)
         
         # Only log in debug mode, not base_url
         logger.info("Efference client initialized")
@@ -137,6 +152,130 @@ class EfferenceClient:
                 raise
             except httpx.RequestError as e:
                 logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def process_batch(
+            self,
+            file_path: Union[str, Path, BinaryIO],
+            max_frames: Optional[int] = None,
+            frame_skip: int = 1,
+            content_type: Optional[str] = None
+        ) -> Dict[str, Any]:
+            """
+            Process ALL frames from a video file using batch processing.
+            More expensive than single-frame processing but provides complete analysis.
+            
+            Args:
+                file_path: Path to the video file or file-like object
+                max_frames: Maximum frames to process (optional)
+                frame_skip: Process every Nth frame (default: 1)
+                content_type: MIME type of the video (e.g., 'video/mp4'). 
+                             If not provided, will be inferred from file extension.
+            
+            Returns:
+                Dictionary containing the batch processing results with frame-by-frame analysis
+            
+            Raises:
+                FileNotFoundError: If the video file does not exist
+                ValueError: If the file path is invalid or empty
+                httpx.HTTPStatusError: If the API returns an error status
+                httpx.TimeoutException: If the request times out
+                httpx.RequestError: If there's a connection error
+                
+            Example:
+                >>> result = client.videos.process_batch("video.mp4", max_frames=100, frame_skip=2)
+                >>> print(f"Processed {result['frames_processed']} frames")
+                >>> print(f"Credits deducted: {result['credits_deducted']}")
+            """
+            # Handle file-like objects
+            if hasattr(file_path, 'read'):
+                return self._process_batch_file_object(file_path, max_frames, frame_skip, content_type)
+            
+            # Handle file paths
+            if not file_path or not str(file_path).strip():
+                raise ValueError("file_path cannot be empty")
+            
+            file_path = Path(file_path)
+            
+            if not file_path.exists():
+                raise FileNotFoundError(f"Video file not found: {file_path}")
+            
+            if not file_path.is_file():
+                raise ValueError(f"Path is not a file: {file_path}")
+            
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
+            logger.info(f"Batch processing video: {file_path.name} ({file_size_mb:.2f} MB)")
+            
+            # Determine content type
+            if content_type is None:
+                content_type = self._get_content_type(file_path)
+                logger.debug(f"Inferred content type: {content_type}")
+            
+            # Prepare request
+            url = f"{self.client.base_url}/v1/videos/process-batch"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            try:
+                with open(file_path, "rb") as f:
+                    files = {"video": (file_path.name, f, content_type)}
+                    data = {}
+                    
+                    if max_frames is not None:
+                        data["max_frames"] = str(max_frames)
+                    data["frame_skip"] = str(frame_skip)
+                    
+                    logger.debug(f"Sending batch request to {url}")
+                    
+                    with httpx.Client(timeout=self.client.timeout) as client:
+                        response = client.post(url, headers=headers, files=files, data=data)
+                        response.raise_for_status()
+                
+                result = response.json()
+                logger.info(f"Batch processing completed: {result.get('frames_processed', 0)} frames")
+                return result
+                
+            except httpx.TimeoutException:
+                logger.error(f"Request timed out after {self.client.timeout}s")
+                raise
+            except httpx.HTTPStatusError as e:
+                self._handle_http_error(e)
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def _process_batch_file_object(
+            self,
+            file_obj: BinaryIO,
+            max_frames: Optional[int],
+            frame_skip: int,
+            content_type: Optional[str]
+        ) -> Dict[str, Any]:
+            """Process a file-like object for batch processing."""
+            if content_type is None:
+                content_type = "video/mp4"  # Default
+            
+            url = f"{self.client.base_url}/v1/videos/process-batch"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            files = {"video": ("video", file_obj, content_type)}
+            data = {"frame_skip": str(frame_skip)}
+            
+            if max_frames is not None:
+                data["max_frames"] = str(max_frames)
+            
+            try:
+                with httpx.Client(timeout=self.client.timeout) as client:
+                    response = client.post(url, headers=headers, files=files, data=data)
+                    response.raise_for_status()
+                
+                return response.json()
+            
+            except httpx.TimeoutException:
+                logger.error(f"Request timed out after {self.client.timeout}s")
+                raise
+            except httpx.HTTPStatusError as e:
+                self._handle_http_error(e)
                 raise
         
         def _process_file_object(
@@ -391,6 +530,223 @@ class EfferenceClient:
                 plt.show()
             
             return fig
+    
+    class Streaming:
+        """Live camera streaming operations."""
+        
+        def __init__(self, client: "EfferenceClient"):
+            """Initialize the Streaming namespace."""
+            self.client = client
+        
+        def start(self, camera_type: str = "realsense") -> Dict[str, Any]:
+            """
+            Start live camera streaming.
+            Requires compatible hardware (RealSense camera).
+            
+            Args:
+                camera_type: Camera type to use (default: "realsense")
+                
+            Returns:
+                Dictionary containing stream start status
+                
+            Example:
+                >>> result = client.streaming.start("realsense")
+                >>> print(result["status"])
+            """
+            url = f"{self.client.base_url}/v1/stream/start"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            data = {"camera_type": camera_type}
+            
+            try:
+                logger.info(f"Starting camera stream: {camera_type}")
+                
+                with httpx.Client(timeout=60) as client:
+                    response = client.post(url, headers=headers, data=data)
+                    response.raise_for_status()
+                
+                result = response.json()
+                logger.info("Camera stream started successfully")
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to start stream: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def get_frame(self, run_inference: bool = False) -> Dict[str, Any]:
+            """
+            Get latest frame from active camera stream.
+            Optionally run inference on the frame (costs credits).
+            
+            Args:
+                run_inference: Whether to run inference on the frame (costs credits)
+                
+            Returns:
+                Dictionary containing frame data and optional inference results
+                
+            Example:
+                >>> frame = client.streaming.get_frame(run_inference=True)
+                >>> print(frame["frame_data"]["frame_count"])
+                >>> if "inference_result" in frame.get("frame_data", {}):
+                ...     print("Inference completed")
+            """
+            url = f"{self.client.base_url}/v1/stream/frame"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            params = {"run_inference": run_inference}
+            
+            try:
+                with httpx.Client(timeout=30) as client:
+                    response = client.get(url, headers=headers, params=params)
+                    response.raise_for_status()
+                
+                result = response.json()
+                
+                if run_inference and result.get("credits_deducted"):
+                    logger.info(f"Frame inference completed. Credits deducted: {result['credits_deducted']}")
+                
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to get frame: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def stop(self) -> Dict[str, Any]:
+            """
+            Stop the active camera stream.
+            
+            Returns:
+                Dictionary containing stream stop status
+                
+            Example:
+                >>> result = client.streaming.stop()
+                >>> print(result["status"])
+            """
+            url = f"{self.client.base_url}/v1/stream/stop"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            try:
+                logger.info("Stopping camera stream")
+                
+                with httpx.Client(timeout=30) as client:
+                    response = client.post(url, headers=headers)
+                    response.raise_for_status()
+                
+                result = response.json()
+                logger.info("Camera stream stopped successfully")
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to stop stream: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def status(self) -> Dict[str, Any]:
+            """
+            Get current streaming status.
+            
+            Returns:
+                Dictionary containing current stream status
+                
+            Example:
+                >>> status = client.streaming.status()
+                >>> print(f"Stream active: {status.get('active', False)}")
+            """
+            url = f"{self.client.base_url}/v1/stream/status"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            try:
+                with httpx.Client(timeout=30) as client:
+                    response = client.get(url, headers=headers)
+                    response.raise_for_status()
+                
+                return response.json()
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to get stream status: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+    
+    class Models:
+        """Model management operations."""
+        
+        def __init__(self, client: "EfferenceClient"):
+            """Initialize the Models namespace."""
+            self.client = client
+        
+        def switch(self, model_name: str) -> Dict[str, Any]:
+            """
+            Switch the active model on the model server.
+            Allows switching between d435 and d405 variants.
+            
+            Args:
+                model_name: Model to switch to (e.g., "d435", "d405")
+                
+            Returns:
+                Dictionary containing model switch status
+                
+            Example:
+                >>> result = client.models.switch("d405")
+                >>> print(f"Switched to model: {result.get('active_model')}")
+            """
+            url = f"{self.client.base_url}/v1/models/switch"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            data = {"model_name": model_name}
+            
+            try:
+                logger.info(f"Switching to model: {model_name}")
+                
+                with httpx.Client(timeout=60) as client:
+                    response = client.post(url, headers=headers, data=data)
+                    response.raise_for_status()
+                
+                result = response.json()
+                logger.info(f"Model switched successfully to {model_name}")
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to switch model: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
+        
+        def list(self) -> Dict[str, Any]:
+            """
+            List all available models and their status.
+            
+            Returns:
+                Dictionary containing available models and current active model
+                
+            Example:
+                >>> models = client.models.list()
+                >>> print(f"Available models: {models.get('available_models', [])}")
+                >>> print(f"Active model: {models.get('active_model')}")
+            """
+            url = f"{self.client.base_url}/v1/models/list"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+            
+            try:
+                with httpx.Client(timeout=30) as client:
+                    response = client.get(url, headers=headers)
+                    response.raise_for_status()
+                
+                return response.json()
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Failed to list models: {e.response.status_code}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                raise
 
 
 __all__ = ["EfferenceClient"]
