@@ -17,6 +17,10 @@ from ..services.security import deduct_credits
 from ..constants import CREDIT_COSTS
 from ..config import MODEL_SERVER_URL
 
+# File size limits for RGBD advanced endpoint
+MAX_VIDEO_SIZE = 20 * 1024 * 1024  # 20MB for video files
+MAX_ARRAY_SIZE = 50 * 1024 * 1024  # 50MB for numpy arrays
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
@@ -148,19 +152,21 @@ async def process_rgbd_advanced(
     Advanced RGBD processing supporting multiple input formats:
     
     **Format 1**: RGB video + numpy depth
-    - `rgb_video`: Video file (MP4, AVI, etc.)
-    - `depth_numpy`: Corresponding depth data (.npy file)
+    - `rgb_video`: Video file (MP4, AVI, etc.) - Max 20MB
+    - `depth_numpy`: Corresponding depth data (.npy file) - Max 50MB
     
     **Format 2**: RGB video + OpenEXR depth
-    - `rgb_video`: Video file (MP4, AVI, etc.) 
-    - `depth_exr`: Depth data in OpenEXR format (.exr file)
+    - `rgb_video`: Video file (MP4, AVI, etc.) - Max 20MB
+    - `depth_exr`: Depth data in OpenEXR format (.exr file) - Max 50MB
     
     **Format 3**: RGBD numpy array
-    - `rgbd_numpy`: Combined RGBD data as numpy array (.npy file)
+    - `rgbd_numpy`: Combined RGBD data as numpy array (.npy file) - Max 50MB
     
     **Format 4**: RGB numpy array + Depth numpy array
-    - `rgb_numpy`: RGB data as numpy array (.npy file)
-    - `depth_numpy_separate`: Depth data as numpy array (.npy file)
+    - `rgb_numpy`: RGB data as numpy array (.npy file) - Max 50MB
+    - `depth_numpy_separate`: Depth data as numpy array (.npy file) - Max 50MB
+    
+    **File Size Limits**: Video files max 20MB, numpy arrays max 50MB
     
     Returns numpy array of cleaned depth values.
     """
@@ -244,6 +250,19 @@ async def _process_rgb_video_numpy_depth(
     video_data = await rgb_video.read()
     depth_data = await depth_numpy.read()
     
+    # Validate file sizes
+    if len(video_data) > MAX_VIDEO_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Video file too large. Maximum size: {MAX_VIDEO_SIZE / (1024*1024):.0f}MB"
+        )
+    
+    if len(depth_data) > MAX_ARRAY_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Depth array too large. Maximum size: {MAX_ARRAY_SIZE / (1024*1024):.0f}MB"
+        )
+    
     # Load numpy depth data
     depth_array = np.load(io.BytesIO(depth_data))
     
@@ -317,6 +336,19 @@ async def _process_rgb_video_exr_depth(
     video_data = await rgb_video.read()
     exr_data = await depth_exr.read()
     
+    # Validate file sizes
+    if len(video_data) > MAX_VIDEO_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Video file too large. Maximum size: {MAX_VIDEO_SIZE / (1024*1024):.0f}MB"
+        )
+    
+    if len(exr_data) > MAX_ARRAY_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"EXR file too large. Maximum size: {MAX_ARRAY_SIZE / (1024*1024):.0f}MB"
+        )
+    
     # Calculate sizes
     video_size_mb = len(video_data) / (1024 * 1024)
     exr_size_mb = len(exr_data) / (1024 * 1024)
@@ -377,6 +409,13 @@ async def _process_rgbd_numpy(rgbd_numpy, api_key, customer, customer_id, db) ->
     # Read file
     rgbd_data = await rgbd_numpy.read()
     
+    # Validate file size
+    if len(rgbd_data) > MAX_ARRAY_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"RGBD array too large. Maximum size: {MAX_ARRAY_SIZE / (1024*1024):.0f}MB"
+        )
+    
     # Load numpy RGBD data
     rgbd_array = np.load(io.BytesIO(rgbd_data))
     
@@ -436,6 +475,19 @@ async def _process_rgb_numpy_depth_numpy(
     # Read files
     rgb_data = await rgb_numpy.read()
     depth_data = await depth_numpy_separate.read()
+    
+    # Validate file sizes
+    if len(rgb_data) > MAX_ARRAY_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"RGB array too large. Maximum size: {MAX_ARRAY_SIZE / (1024*1024):.0f}MB"
+        )
+    
+    if len(depth_data) > MAX_ARRAY_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Depth array too large. Maximum size: {MAX_ARRAY_SIZE / (1024*1024):.0f}MB"
+        )
     
     # Load numpy arrays
     rgb_array = np.load(io.BytesIO(rgb_data))

@@ -21,7 +21,7 @@ router = APIRouter(prefix="/v1/videos", tags=["videos"])
 # Configuration
 MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))  # 5 minutes default
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "500000000"))  # 500MB default
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20971520"))  # 20MB default (was 500MB)
 
 
 @router.post("/process", status_code=200)
@@ -37,7 +37,7 @@ async def process_video(
     
     **Request**:
     - `Authorization: Bearer <API_KEY>`
-    - `video`: Video file (multipart form data)
+    - `video`: Video file (multipart form data) - Maximum 20MB
     
     **Returns**:
     - JSON response with inference results + credits consumed

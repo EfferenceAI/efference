@@ -489,7 +489,7 @@ async def run_advanced_inference(
     
     # Format 4: RGB numpy + Depth numpy arrays
     rgb_numpy: UploadFile = File(None, description="RGB data as numpy array"),
-    depth_numpy: UploadFile = File(None, description="Separate depth numpy array"),
+    depth_numpy_separate: UploadFile = File(None, description="Separate depth numpy array"),
     
     # Processing parameters
     max_frames: int = Form(None, description="Maximum frames to process for video inputs"),
@@ -526,8 +526,8 @@ async def run_advanced_inference(
             return await _process_video_exr_depth(video, depth_exr, max_frames, frame_skip)
         elif rgbd_numpy:
             return await _process_rgbd_numpy_array(rgbd_numpy, rgbd_shape, rgbd_dtype)
-        elif rgb_numpy and depth_numpy:
-            return await _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy, rgb_shape, rgb_dtype, depth_shape, depth_dtype)
+        elif rgb_numpy and depth_numpy_separate:
+            return await _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy_separate, rgb_shape, rgb_dtype, depth_shape, depth_dtype)
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -684,12 +684,12 @@ async def _process_rgbd_numpy_array(rgbd_numpy, rgbd_shape, rgbd_dtype):
     }
 
 
-async def _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy, rgb_shape, rgb_dtype, depth_shape, depth_dtype):
+async def _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy_separate, rgb_shape, rgb_dtype, depth_shape, depth_dtype):
     """Process RGB numpy array + Depth numpy array format."""
     
     # Read and load both arrays
     rgb_data = await rgb_numpy.read()
-    depth_data = await depth_numpy.read()
+    depth_data = await depth_numpy_separate.read()
     
     rgb_array = np.load(io.BytesIO(rgb_data))
     depth_array = np.load(io.BytesIO(depth_data))
@@ -715,7 +715,7 @@ async def _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy, rgb_shape, rgb
     return {
         "status": "success",
         "rgb_filename": rgb_numpy.filename,
-        "depth_filename": depth_numpy.filename,
+        "depth_filename": depth_numpy_separate.filename,
         "model_name": model_name,
         "input_format": "rgb_depth_numpy",
         "rgb_array_shape": list(rgb_array.shape),

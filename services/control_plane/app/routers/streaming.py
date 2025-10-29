@@ -20,6 +20,7 @@ router = APIRouter(prefix="/v1", tags=["streaming", "batch", "models"])
 # Configuration
 MODEL_SERVER_BASE = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer").rstrip('/infer')
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20971520"))  # 20MB default
 
 
 # ============================================================================
@@ -37,6 +38,8 @@ async def process_video_batch(
     """
     Process ALL frames from a video file using batch processing.
     More expensive than single-frame processing but provides complete analysis.
+    
+    **File Size Limit**: Maximum 20MB video files.
     """
     try:
         key_record, customer = auth_data
@@ -56,6 +59,13 @@ async def process_video_batch(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Video file is empty"
+            )
+        
+        # Check file size limit
+        if len(video_content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Video file too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.0f}MB"
             )
         
         # Forward to model server

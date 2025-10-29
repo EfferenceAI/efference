@@ -433,7 +433,7 @@ def safe_process_video(client, video_path):
         elif status == 402:
             print("Insufficient credits.")
         elif status == 413:
-            print("File too large (max 500MB).")
+            print("File too large (max 20MB).")
         elif status == 429:
             print("Rate limited. Wait before retrying.")
         elif status >= 500:
