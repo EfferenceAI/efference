@@ -127,7 +127,7 @@ class RGBDAdapter(BaseAdapter):
                     depth_corrected,
                     min_depth=actual_min,  # Use actual range!
                     max_depth=actual_max,  # Use actual range!
-                    cmap=cv2.COLORMAP_TURBO
+                    cmap=cv2.COLORMAP_PINK
                 )
                 result["depth_visualization"] = self._to_base64_png(depth_colored_single)
             
