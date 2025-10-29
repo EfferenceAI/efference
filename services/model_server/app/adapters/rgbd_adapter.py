@@ -37,6 +37,12 @@ class RGBDAdapter(BaseAdapter):
                 max_depth=25.0
             )
             
+            # Serialize numpy array to base64 for JSON transport
+            buffer = BytesIO()
+            np.save(buffer, depth_corrected)
+            buffer.seek(0)
+            depth_array_b64 = base64.b64encode(buffer.read()).decode('utf-8')
+            
             return {
                 "model_type": "rgbd",
                 "output": {
@@ -45,7 +51,8 @@ class RGBDAdapter(BaseAdapter):
                     "min": float(np.min(depth_corrected)),
                     "max": float(np.max(depth_corrected)),
                     "mean": float(np.mean(depth_corrected)),
-                    "has_valid_depth": bool(np.any(depth_corrected > 0))
+                    "has_valid_depth": bool(np.any(depth_corrected > 0)),
+                    "depth_array": depth_array_b64
                 }
             }
         except Exception as e:
@@ -96,6 +103,12 @@ class RGBDAdapter(BaseAdapter):
                 max_depth=25.0
             )
             
+            # Serialize numpy array to base64 for JSON transport
+            buffer = BytesIO()
+            np.save(buffer, depth_corrected)
+            buffer.seek(0)
+            depth_array_b64 = base64.b64encode(buffer.read()).decode('utf-8')
+            
             result = {
                 "model_type": "rgbd",
                 "output": {
@@ -104,7 +117,8 @@ class RGBDAdapter(BaseAdapter):
                     "min": float(np.min(depth_corrected)),
                     "max": float(np.max(depth_corrected)),
                     "mean": float(np.mean(depth_corrected)),
-                    "has_valid_depth": bool(np.any(depth_corrected > 0))
+                    "has_valid_depth": bool(np.any(depth_corrected > 0)),
+                    "depth_array": depth_array_b64
                 },
                 "input_depth_provided": depth_was_provided
             }
