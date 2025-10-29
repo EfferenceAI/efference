@@ -406,57 +406,124 @@ class EfferenceClient:
                         raise FileNotFoundError(f"Depth image not found: {depth_path}")
                     depth_file_obj = open(depth_path, "rb")
                     files["depth"] = ("depth.png", depth_file_obj, "image/png")
-            
-            # Prepare form data for configurable parameters
-            data = {
-                "depth_scale": str(depth_scale),
-                "input_size": str(input_size),
-                "max_depth": str(max_depth)
-            }
-            
             try:
-                logger.info(f"Processing RGBD image...")
-                
+                logger.info("Processing RGBD image...")
                 with httpx.Client(timeout=self.client.timeout) as client:
-                    response = client.post(url, headers=headers, files=files, data=data)
+                    response = client.post(url, headers=headers, files=files)
                     response.raise_for_status()
-                
+
                 result = response.json()
                 logger.info("RGBD processing completed successfully")
-                
-                # Save single visualization if requested
+
                 if save_visualization and "inference_result" in result:
                     viz_data = result["inference_result"].get("depth_visualization")
                     if viz_data:
                         self._save_visualization(viz_data, save_visualization)
-                        logger.info(f"Saved depth visualization to: {save_visualization}")
-                
-                # Save 3-panel visualization if requested
+
                 if save_3panel and "inference_result" in result:
                     viz_3panel = result["inference_result"].get("depth_visualization_3panel")
                     if viz_3panel:
                         self._save_visualization(viz_3panel, save_3panel)
-                        logger.info(f"Saved 3-panel visualization to: {save_3panel}")
-                
+
                 return result
-                
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error: {e.response.status_code}")
-                try:
-                    error_detail = e.response.json()
-                    logger.error(f"Error details: {error_detail}")
-                except:
-                    pass
-                raise
-            except httpx.RequestError as e:
-                logger.error(f"Request failed: {str(e)}")
-                raise
+
             finally:
-                # Close files if we opened them
                 if rgb_file_obj:
                     rgb_file_obj.close()
                 if depth_file_obj:
                     depth_file_obj.close()
+                    
+        def process_rgbd_advanced(
+            self,
+            *,
+            rgb_video: Optional[Union[str, Path, BinaryIO]] = None,
+            depth_numpy: Optional[Union[str, Path, BinaryIO]] = None,
+            depth_exr: Optional[Union[str, Path, BinaryIO]] = None,
+            rgbd_numpy: Optional[Union[str, Path, BinaryIO]] = None,
+            rgb_numpy: Optional[Union[str, Path, BinaryIO]] = None,
+            depth_numpy_separate: Optional[Union[str, Path, BinaryIO]] = None,
+            max_frames: Optional[int] = None,
+            frame_skip: int = 1,
+        ) -> Dict[str, Any]:
+            """
+            Advanced RGBD processing supporting multiple input formats.
+            
+            Formats:
+            1. rgb_video + depth_numpy: RGB video with numpy depth array
+            2. rgb_video + depth_exr: RGB video with OpenEXR depth
+            3. rgbd_numpy: Combined RGBD numpy array
+            4. rgb_numpy + depth_numpy_separate: Separate RGB and depth numpy arrays
+            
+            Example:
+                >>> result = client.images.process_rgbd_advanced(
+                ...     rgb_video="video.mp4",
+                ...     depth_numpy="depth.npy",
+                ...     max_frames=10
+                ... )
+            """
+            url = f"{self.client.base_url}/v1/images/rgbd-advanced"
+            headers = {"Authorization": f"Bearer {self.client.api_key}"}
+
+            def _open_if_path(x, filename, content_type):
+                if x is None: 
+                    return None, None
+                if hasattr(x, "read"): 
+                    return None, (filename, x, content_type)
+                p = Path(x)
+                if not p.exists(): 
+                    raise FileNotFoundError(f"File not found: {p}")
+                f = open(p, "rb")
+                return f, (filename, f, content_type)
+
+            files = {}
+            open_files = []
+
+            for var, key, fname, ctype in [
+                (rgb_video, "rgb_video", "video.mp4", "video/mp4"),
+                (depth_numpy, "depth_numpy", "depth.npy", "application/octet-stream"),
+                (depth_exr, "depth_exr", "depth.exr", "image/x-exr"),
+                (rgbd_numpy, "rgbd_numpy", "rgbd.npy", "application/octet-stream"),
+                (rgb_numpy, "rgb_numpy", "rgb.npy", "application/octet-stream"),
+                (depth_numpy_separate, "depth_numpy_separate", "depth.npy", "application/octet-stream"),
+            ]:
+                if var is not None:
+                    f, spec = _open_if_path(var, fname, ctype)
+                    if f: 
+                        open_files.append(f)
+                    if spec:
+                        files[key] = spec
+
+            combos = [
+                {"rgb_video", "depth_numpy"},
+                {"rgb_video", "depth_exr"},
+                {"rgbd_numpy"},
+                {"rgb_numpy", "depth_numpy_separate"},
+            ]
+            provided = set(files.keys())
+            if not any(c == provided for c in combos):
+                for f in open_files:
+                    try: f.close()
+                    except: pass
+                raise ValueError(
+                    "Invalid input combination. Provide one of: "
+                    "(rgb_video + depth_numpy), (rgb_video + depth_exr), "
+                    "(rgbd_numpy), (rgb_numpy + depth_numpy_separate)"
+                )
+
+            data = {}
+            if max_frames is not None:
+                data["max_frames"] = str(max_frames)
+            data["frame_skip"] = str(frame_skip)
+
+            try:
+                with httpx.Client(timeout=self.client.timeout) as client:
+                    resp = client.post(url, headers=headers, files=files, data=data)
+                    resp.raise_for_status()
+                    return resp.json()
+            finally:
+                for f in open_files:
+                    try: f.close()
+                    except: pass
         
         def _save_visualization(self, base64_data: str, output_path: Union[str, Path]):
             """Decode base64 PNG and save to file."""
