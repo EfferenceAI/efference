@@ -278,15 +278,20 @@ async def run_inference(video: UploadFile = File(...)) -> Dict[str, Any]:
         
         logger.info(f"Processing: {video.filename} ({len(video_data) / 1e6:.1f}MB)")
         
-        # Extract frames
-        frames, video_metadata = extract_frames_from_video(video_data, max_frames=1)
+        # Use streaming to extract just the first frame (memory safe)
+        video_metadata = None
+        inference_result = None
         
-        if not frames:
+        for frame_index, frame, metadata in stream_video_frames(video_data, max_frames=1):
+            if video_metadata is None:
+                video_metadata = metadata
+            
+            logger.info("Running inference on first frame...")
+            inference_result = model_adapter.infer(frame)
+            break  # Only process the first frame
+        
+        if inference_result is None:
             raise ValueError("No frames could be extracted from video")
-        
-        # Run inference using adapter
-        logger.info("Running inference...")
-        inference_result = model_adapter.infer(frames[0])
         
         # Return response
         response = {
