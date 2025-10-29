@@ -137,6 +137,72 @@ def extract_frames_from_video(
             os.remove(tmp_path)
 
 
+def stream_video_frames(
+    video_data: bytes,
+    max_frames: int = 10,
+    frame_skip: int = 1,
+    target_size: tuple = (518, 518)
+):
+    """
+    Generator that yields video frames one at a time to reduce memory usage.
+    
+    Args:
+        video_data: Raw video file bytes
+        max_frames: Maximum number of frames to process
+        frame_skip: Process every Nth frame
+        target_size: Target frame size (height, width)
+        
+    Yields:
+        Tuple of (frame_index, frame_array, metadata)
+    """
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        tmp.write(video_data)
+        tmp_path = tmp.name
+    
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("Failed to open video file")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        metadata = {
+            "fps": fps,
+            "frame_count": frame_count,
+            "width": width,
+            "height": height
+        }
+        
+        logger.info(f"Video info: {frame_count} frames @ {fps}fps, {width}x{height}")
+        logger.info(f"Processing max {max_frames} frames with skip={frame_skip}")
+        
+        frame_index = 0
+        processed_count = 0
+        
+        while processed_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Apply frame skipping
+            if frame_index % frame_skip == 0:
+                frame = cv2.resize(frame, target_size)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                yield frame_index, frame_rgb, metadata
+                processed_count += 1
+            
+            frame_index += 1
+        
+        cap.release()
+        
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown."""
@@ -272,30 +338,42 @@ async def run_batch_video_inference(
         
         logger.info(f"Batch processing: {video.filename} ({len(video_data) / 1e6:.1f}MB)")
         
-        # Extract ALL frames (or up to max_frames)
-        frames, video_metadata = extract_frames_from_video(
-            video_data, 
-            max_frames=max_frames or 9999,  # Process all if not specified
-            target_size=target_size
-        )
-        
-        if not frames:
-            raise ValueError("No frames could be extracted from video")
-        
-        # Apply frame skipping
-        frames = frames[::frame_skip]
-        
-        logger.info(f"Processing {len(frames)} frames...")
-        
-        # Process each frame through the model
+        # Stream process frames to reduce memory usage
+        max_frames = max_frames or 10  # Reduced from 9999 to 10 for memory safety
         frame_results = []
-        for i, frame in enumerate(frames):
-            logger.info(f"Processing frame {i+1}/{len(frames)}")
+        video_metadata = None
+        frames_processed = 0
+        
+        logger.info(f"Starting streaming processing of max {max_frames} frames...")
+        
+        # Process frames one at a time using generator
+        for frame_index, frame, metadata in stream_video_frames(
+            video_data, 
+            max_frames=max_frames,
+            frame_skip=frame_skip,
+            target_size=target_size
+        ):
+            if video_metadata is None:
+                video_metadata = metadata
+            
+            logger.info(f"Processing frame {frames_processed+1}/{max_frames} (original index: {frame_index})")
+            
+            # Run inference on single frame
             result = model_adapter.infer(frame)
             frame_results.append({
-                "frame_index": i * frame_skip,
+                "frame_index": frame_index,
                 "inference_result": result
             })
+            
+            frames_processed += 1
+            
+            # Force garbage collection every 5 frames to free memory
+            if frames_processed % 5 == 0:
+                import gc
+                gc.collect()
+        
+        if not frame_results:
+            raise ValueError("No frames could be processed from video")
         
         # Return batch results
         response = {
@@ -304,13 +382,13 @@ async def run_batch_video_inference(
             "file_size_bytes": len(video_data),
             "model_name": model_name,
             "video_metadata": video_metadata,
-            "frames_processed": len(frames),
+            "frames_processed": frames_processed,
             "frame_skip": frame_skip,
             "batch_results": frame_results,
             "processing_summary": {
                 "total_frames_in_video": video_metadata["frame_count"],
-                "frames_extracted": len(frames),
-                "frames_processed": len(frame_results)
+                "frames_processed": frames_processed,
+                "max_frames_limit": max_frames
             }
         }
         
