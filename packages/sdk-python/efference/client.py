@@ -445,52 +445,62 @@ class EfferenceClient:
             max_frames: Optional[int] = None,
             frame_skip: int = 1,
         ) -> Dict[str, Any]:
+            """
+            Advanced RGBD processing supporting multiple input formats.
+            
+            Formats:
+            1. rgb_video + depth_numpy: RGB video with numpy depth array
+            2. rgb_video + depth_exr: RGB video with OpenEXR depth
+            3. rgbd_numpy: Combined RGBD numpy array
+            4. rgb_numpy + depth_numpy_separate: Separate RGB and depth numpy arrays
+            
+            Example:
+                >>> result = client.images.process_rgbd_advanced(
+                ...     rgb_video="video.mp4",
+                ...     depth_numpy="depth.npy",
+                ...     max_frames=10
+                ... )
+            """
             url = f"{self.client.base_url}/v1/images/rgbd-advanced"
             headers = {"Authorization": f"Bearer {self.client.api_key}"}
 
             def _open_if_path(x, filename, content_type):
-                if x is None: return None, None
-                if hasattr(x, "read"): return None, (filename, x, content_type)
+                if x is None: 
+                    return None, None
+                if hasattr(x, "read"): 
+                    return None, (filename, x, content_type)
                 p = Path(x)
-                if not p.exists(): raise FileNotFoundError(f"File not found: {p}")
+                if not p.exists(): 
+                    raise FileNotFoundError(f"File not found: {p}")
                 f = open(p, "rb")
                 return f, (filename, f, content_type)
 
             files = {}
             open_files = []
 
-            if rgb_video is not None:
-                f, spec = _open_if_path(rgb_video, "video.mp4", "video/mp4")
-                if f: open_files.append(f); files["rgb_video"] = spec
-
-            if depth_numpy is not None:
-                f, spec = _open_if_path(depth_numpy, "depth.npy", "application/octet-stream")
-                if f: open_files.append(f); files["depth_numpy"] = spec
-
-            if depth_exr is not None:
-                f, spec = _open_if_path(depth_exr, "depth.exr", "image/x-exr")
-                if f: open_files.append(f); files["depth_exr"] = spec
-
-            if rgbd_numpy is not None:
-                f, spec = _open_if_path(rgbd_numpy, "rgbd.npy", "application/octet-stream")
-                if f: open_files.append(f); files["rgbd_numpy"] = spec
-
-            if rgb_numpy is not None:
-                f, spec = _open_if_path(rgb_numpy, "rgb.npy", "application/octet-stream")
-                if f: open_files.append(f); files["rgb_numpy"] = spec
-
-            if depth_numpy_separate is not None:
-                f, spec = _open_if_path(depth_numpy_separate, "depth.npy", "application/octet-stream")
-                if f: open_files.append(f); files["depth_numpy_separate"] = spec
+            for var, key, fname, ctype in [
+                (rgb_video, "rgb_video", "video.mp4", "video/mp4"),
+                (depth_numpy, "depth_numpy", "depth.npy", "application/octet-stream"),
+                (depth_exr, "depth_exr", "depth.exr", "image/x-exr"),
+                (rgbd_numpy, "rgbd_numpy", "rgbd.npy", "application/octet-stream"),
+                (rgb_numpy, "rgb_numpy", "rgb.npy", "application/octet-stream"),
+                (depth_numpy_separate, "depth_numpy_separate", "depth.npy", "application/octet-stream"),
+            ]:
+                if var is not None:
+                    f, spec = _open_if_path(var, fname, ctype)
+                    if f: 
+                        open_files.append(f)
+                    if spec:
+                        files[key] = spec
 
             combos = [
-                ("rgb_video", "depth_numpy"),
-                ("rgb_video", "depth_exr"),
-                ("rgbd_numpy",),
-                ("rgb_numpy", "depth_numpy_separate"),
+                {"rgb_video", "depth_numpy"},
+                {"rgb_video", "depth_exr"},
+                {"rgbd_numpy"},
+                {"rgb_numpy", "depth_numpy_separate"},
             ]
             provided = set(files.keys())
-            if not any(set(c).issubset(provided) and len(provided) == len(c) for c in combos):
+            if not any(c == provided for c in combos):
                 for f in open_files:
                     try: f.close()
                     except: pass
