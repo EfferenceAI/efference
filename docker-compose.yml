@@ -47,7 +47,7 @@ services:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       MALLOC_ARENA_MAX: "2"
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True, max_split_size_mb:128"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
     volumes:
       - ./services/model_server/app:/app/app
       - model_weights:/app/weights
