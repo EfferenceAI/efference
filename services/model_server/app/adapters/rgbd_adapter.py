@@ -37,13 +37,41 @@ class RGBDAdapter(BaseAdapter):
             
             # Run model inference - this is likely where it crashes
             logger.info("Calling model.infer_image...")
-            depth_corrected = self.model.infer_image(
-                rgb=frame,
-                depth=depth_placeholder,
-                input_size=518,
-                max_depth=25.0
-            )
-            logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
+            
+            # Clear GPU cache before inference to prevent OOM
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info("GPU cache cleared")
+            except Exception as e:
+                logger.warning(f"Could not clear GPU cache: {e}")
+            
+            # Try inference with memory protection
+            try:
+                depth_corrected = self.model.infer_image(
+                    rgb=frame,
+                    depth=depth_placeholder,
+                    input_size=256,  # Reduced from 518 to 256 for GPU memory
+                    max_depth=25.0
+                )
+                logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.error(f"GPU out of memory during inference: {e}")
+                    # Try to clear cache and raise a more helpful error
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except:
+                        pass
+                    raise RuntimeError("GPU out of memory during model inference. Try with smaller input or reduce batch size.")
+                else:
+                    logger.error(f"Runtime error during inference: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error during model inference: {e}")
+                raise
         
             return {
                 "model_type": "rgbd",

@@ -141,7 +141,7 @@ def stream_video_frames(
     video_data: bytes,
     max_frames: int = 10,
     frame_skip: int = 1,
-    target_size: tuple = (518, 518)
+    target_size: tuple = (256, 256)  # Reduced from 518 to 256 for GPU memory
 ):
     """
     Generator that yields video frames one at a time to reduce memory usage.
