@@ -44,6 +44,10 @@ services:
       # Model variant: 'd435'
       MODEL_NAME: d435
       MODEL_S3_URI: https://efference-weights.s3.us-west-1.amazonaws.com/public/d435.pth
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      MALLOC_ARENA_MAX: "2"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True, max_split_size_mb:128"
     volumes:
       - ./services/model_server/app:/app/app
       - model_weights:/app/weights
