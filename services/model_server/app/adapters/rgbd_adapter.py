@@ -29,13 +29,21 @@ class RGBDAdapter(BaseAdapter):
     def infer(self, frame: np.ndarray) -> Dict[str, Any]:
         """Run RGBD inference on video frame."""
         try:
+            logger.info(f"Starting inference on frame shape: {frame.shape}")
+            
+            # Create depth placeholder
             depth_placeholder = np.zeros_like(frame[:, :, 0], dtype=np.float32)
+            logger.info(f"Created depth placeholder shape: {depth_placeholder.shape}")
+            
+            # Run model inference - this is likely where it crashes
+            logger.info("Calling model.infer_image...")
             depth_corrected = self.model.infer_image(
                 rgb=frame,
                 depth=depth_placeholder,
                 input_size=518,
                 max_depth=25.0
             )
+            logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
         
             return {
                 "model_type": "rgbd",
