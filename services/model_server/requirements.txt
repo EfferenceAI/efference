@@ -7,7 +7,7 @@ python-multipart==0.0.6
 # PyTorch
 torch==2.8  
 torchvision 
-numpy==1.24.0
+numpy==1.26.4
 
 # Computer vision
 opencv-python==4.8.0.76
