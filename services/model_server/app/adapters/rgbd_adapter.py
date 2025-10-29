@@ -49,19 +49,13 @@ class RGBDAdapter(BaseAdapter):
             
             # Try inference with memory protection
             try:
-                # TEMPORARY: Use mock inference to test pipeline
-                logger.info("USING MOCK INFERENCE - bypassing actual model")
-                depth_corrected = np.random.rand(256, 256).astype(np.float32)
-                logger.info(f"Mock inference completed, output shape: {depth_corrected.shape}")
-                
-                # UNCOMMENT BELOW TO RE-ENABLE REAL MODEL:
-                # depth_corrected = self.model.infer_image(
-                #     rgb=frame,
-                #     depth=depth_placeholder,
-                #     input_size=256,  # Reduced from 518 to 256 for GPU memory
-                #     max_depth=25.0
-                # )
-                # logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
+                depth_corrected = self.model.infer_image(
+                    rgb=frame,
+                    depth=depth_placeholder,
+                    input_size=256,  # Start with 256, can increase later if stable
+                    max_depth=25.0
+                )
+                logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     logger.error(f"GPU out of memory during inference: {e}")
