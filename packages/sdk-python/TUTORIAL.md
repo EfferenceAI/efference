@@ -210,8 +210,7 @@ Depth scale converts raw sensor values to meters:
 | Sensor | Scale | Notes |
 |--------|-------|-------|
 | RealSense | 1000.0 | Raw values in mm |
-| Kinect | 1000.0 | Raw values in mm |
-| Custom | Varies | ?? |
+
 
 ### Configurable Parameters
 
