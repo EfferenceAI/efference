@@ -3,6 +3,7 @@
 # Credit costs for different operations
 CREDIT_COSTS = {
     "video_inference": 1.0,  # Base cost per video
+    "video_batch_base": 2.0,  # Base cost for batch video processing
     "per_frame": 0.01,  # Cost per frame processed
     "per_mb": 0.1,  # Cost per MB of data
     "image_rgbd_base": 0.5,  # Base cost for single image RGBD

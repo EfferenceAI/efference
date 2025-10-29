@@ -3,6 +3,7 @@
 import os
 import logging
 import tempfile
+import io
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
@@ -472,6 +473,259 @@ async def run_image_inference(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@app.post("/infer-advanced", status_code=200)
+async def run_advanced_inference(
+    # Format 1: RGB video + numpy depth
+    video: UploadFile = File(None, description="RGB video file"),
+    depth_numpy: UploadFile = File(None, description="Depth data as numpy array"),
+    
+    # Format 2: RGB video + OpenEXR depth
+    depth_exr: UploadFile = File(None, description="Depth data as OpenEXR file"),
+    
+    # Format 3: RGBD numpy array
+    rgbd_numpy: UploadFile = File(None, description="Combined RGBD data as numpy array"),
+    
+    # Format 4: RGB numpy + Depth numpy arrays
+    rgb_numpy: UploadFile = File(None, description="RGB data as numpy array"),
+    depth_numpy: UploadFile = File(None, description="Separate depth numpy array"),
+    
+    # Processing parameters
+    max_frames: int = Form(None, description="Maximum frames to process for video inputs"),
+    frame_skip: int = Form(1, description="Process every Nth frame"),
+    depth_format: str = Form("auto", description="Depth data format (numpy, exr, auto)"),
+    data_format: str = Form("auto", description="Overall data format"),
+    
+    # Array metadata (passed as strings from control plane)
+    depth_shape: str = Form(None, description="Depth array shape"),
+    depth_dtype: str = Form(None, description="Depth array data type"),
+    rgbd_shape: str = Form(None, description="RGBD array shape"),
+    rgbd_dtype: str = Form(None, description="RGBD array data type"),
+    rgb_shape: str = Form(None, description="RGB array shape"),
+    rgb_dtype: str = Form(None, description="RGB array data type")
+) -> Dict[str, Any]:
+    """
+    Advanced inference supporting multiple input formats:
+    1. RGB video + numpy depth
+    2. RGB video + OpenEXR depth  
+    3. RGBD numpy array
+    4. RGB numpy array + Depth numpy array
+    """
+    if model_adapter is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model is not loaded"
+        )
+    
+    try:
+        # Determine processing format
+        if video and depth_numpy:
+            return await _process_video_numpy_depth(video, depth_numpy, max_frames, frame_skip)
+        elif video and depth_exr:
+            return await _process_video_exr_depth(video, depth_exr, max_frames, frame_skip)
+        elif rgbd_numpy:
+            return await _process_rgbd_numpy_array(rgbd_numpy, rgbd_shape, rgbd_dtype)
+        elif rgb_numpy and depth_numpy:
+            return await _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy, rgb_shape, rgb_dtype, depth_shape, depth_dtype)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid input combination for advanced processing"
+            )
+            
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Advanced inference failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+async def _process_video_numpy_depth(video, depth_numpy, max_frames, frame_skip):
+    """Process RGB video + numpy depth format."""
+    
+    # Read video and extract frames
+    video_data = await video.read()
+    frames, video_metadata = extract_frames_from_video(
+        video_data, 
+        max_frames=max_frames or 10,  # Default limit
+        target_size=(518, 518)
+    )
+    
+    # Read and load depth numpy data
+    depth_data = await depth_numpy.read()
+    depth_array = np.load(io.BytesIO(depth_data))
+    
+    logger.info(f"Processing {len(frames)} video frames with depth array shape: {depth_array.shape}")
+    
+    # Process frames with corresponding depth data
+    frame_results = []
+    for i, frame in enumerate(frames[::frame_skip]):
+        frame_idx = i * frame_skip
+        
+        # Get corresponding depth frame (if depth has temporal dimension)
+        if len(depth_array.shape) == 3:  # (frames, height, width)
+            if frame_idx < depth_array.shape[0]:
+                depth_frame = depth_array[frame_idx]
+            else:
+                depth_frame = depth_array[-1]  # Use last depth frame if video is longer
+        else:  # Single depth image for all frames
+            depth_frame = depth_array
+        
+        # Run RGBD inference
+        result = model_adapter.infer_rgbd(frame, depth_frame.astype(np.float32))
+        
+        frame_results.append({
+            "frame_index": frame_idx,
+            "inference_result": result
+        })
+    
+    return {
+        "status": "success",
+        "filename": video.filename,
+        "model_name": model_name,
+        "video_metadata": video_metadata,
+        "frames_processed": len(frame_results),
+        "frame_skip": frame_skip,
+        "batch_results": frame_results,
+        "depth_array_shape": list(depth_array.shape),
+        "depth_array_dtype": str(depth_array.dtype)
+    }
+
+
+async def _process_video_exr_depth(video, depth_exr, max_frames, frame_skip):
+    """Process RGB video + OpenEXR depth format."""
+    
+    # Read video and extract frames
+    video_data = await video.read()
+    frames, video_metadata = extract_frames_from_video(
+        video_data, 
+        max_frames=max_frames or 10,
+        target_size=(518, 518)
+    )
+    
+    # Read EXR depth data
+    exr_data = await depth_exr.read()
+    
+    # Use imageio to read EXR (requires imageio-plugin)
+    try:
+        import imageio
+        depth_array = imageio.imread(io.BytesIO(exr_data))
+    except Exception as e:
+        raise ValueError(f"Failed to read EXR depth data: {e}")
+    
+    logger.info(f"Processing {len(frames)} video frames with EXR depth shape: {depth_array.shape}")
+    
+    # Process frames
+    frame_results = []
+    for i, frame in enumerate(frames[::frame_skip]):
+        frame_idx = i * frame_skip
+        
+        # Use single depth for all frames (EXR typically single image)
+        result = model_adapter.infer_rgbd(frame, depth_array.astype(np.float32))
+        
+        frame_results.append({
+            "frame_index": frame_idx,
+            "inference_result": result
+        })
+    
+    return {
+        "status": "success",
+        "filename": video.filename,
+        "model_name": model_name,
+        "video_metadata": video_metadata,
+        "frames_processed": len(frame_results),
+        "frame_skip": frame_skip,
+        "batch_results": frame_results,
+        "depth_format": "exr",
+        "depth_array_shape": list(depth_array.shape)
+    }
+
+
+async def _process_rgbd_numpy_array(rgbd_numpy, rgbd_shape, rgbd_dtype):
+    """Process RGBD numpy array format."""
+    
+    # Read and load RGBD numpy data
+    rgbd_data = await rgbd_numpy.read()
+    rgbd_array = np.load(io.BytesIO(rgbd_data))
+    
+    logger.info(f"Processing RGBD numpy array with shape: {rgbd_array.shape}")
+    
+    # Split RGBD array into RGB and Depth
+    if len(rgbd_array.shape) == 3 and rgbd_array.shape[2] == 4:
+        # Format: (height, width, 4) - RGB + D
+        rgb = (rgbd_array[:, :, :3] * 255).astype(np.uint8)  # Denormalize RGB
+        depth = rgbd_array[:, :, 3].astype(np.float32)
+    else:
+        raise ValueError(f"Invalid RGBD array shape: {rgbd_array.shape}. Expected (H, W, 4)")
+    
+    # Run RGBD inference
+    result = model_adapter.infer_rgbd(rgb, depth)
+    
+    return {
+        "status": "success",
+        "filename": rgbd_numpy.filename,
+        "model_name": model_name,
+        "input_format": "rgbd_numpy",
+        "rgbd_array_shape": list(rgbd_array.shape),
+        "rgbd_array_dtype": str(rgbd_array.dtype),
+        "batch_results": [{
+            "frame_index": 0,
+            "inference_result": result
+        }],
+        "frames_processed": 1
+    }
+
+
+async def _process_rgb_depth_numpy_arrays(rgb_numpy, depth_numpy, rgb_shape, rgb_dtype, depth_shape, depth_dtype):
+    """Process RGB numpy array + Depth numpy array format."""
+    
+    # Read and load both arrays
+    rgb_data = await rgb_numpy.read()
+    depth_data = await depth_numpy.read()
+    
+    rgb_array = np.load(io.BytesIO(rgb_data))
+    depth_array = np.load(io.BytesIO(depth_data))
+    
+    logger.info(f"Processing RGB array: {rgb_array.shape}, Depth array: {depth_array.shape}")
+    
+    # Validate and prepare arrays
+    if len(rgb_array.shape) != 3 or rgb_array.shape[2] != 3:
+        raise ValueError(f"Invalid RGB array shape: {rgb_array.shape}. Expected (H, W, 3)")
+    
+    if len(depth_array.shape) != 2:
+        raise ValueError(f"Invalid depth array shape: {depth_array.shape}. Expected (H, W)")
+    
+    # Ensure correct data types
+    if rgb_array.dtype != np.uint8:
+        rgb_array = (rgb_array * 255).astype(np.uint8) if rgb_array.max() <= 1.0 else rgb_array.astype(np.uint8)
+    
+    depth_array = depth_array.astype(np.float32)
+    
+    # Run RGBD inference
+    result = model_adapter.infer_rgbd(rgb_array, depth_array)
+    
+    return {
+        "status": "success",
+        "rgb_filename": rgb_numpy.filename,
+        "depth_filename": depth_numpy.filename,
+        "model_name": model_name,
+        "input_format": "rgb_depth_numpy",
+        "rgb_array_shape": list(rgb_array.shape),
+        "depth_array_shape": list(depth_array.shape),
+        "batch_results": [{
+            "frame_index": 0,
+            "inference_result": result
+        }],
+        "frames_processed": 1
+    }
 
 
 # ============================================================================
