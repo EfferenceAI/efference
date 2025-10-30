@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "efference"
-version = "0.1.1"
+version = "0.1.2"
 description = "Official Python SDK for Efference ML API - Process videos with GPU-accelerated machine learning models"
 readme = "README.md"
 license = {text = "MIT"}
