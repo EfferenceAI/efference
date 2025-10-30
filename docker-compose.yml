@@ -26,6 +26,7 @@ services:
       MODEL_SERVER_URL: http://model_server:8000/infer
       ADMIN_KEY: dev-admin-key
       LOG_LEVEL: debug
+      REQUEST_TIMEOUT: 1800  # 30 minutes
     depends_on:
       postgres:
         condition: service_healthy
