@@ -131,14 +131,17 @@ class EfferenceClient:
             headers = {"Authorization": f"Bearer {self.client.api_key}"}
             
             try:
+                # Read file content first to avoid file handle issues
                 with open(file_path, "rb") as f:
-                    files = {"video": (file_path.name, f, content_type)}
-                    
-                    logger.debug(f"Sending request to {url}")
-                    
-                    with httpx.Client(timeout=self.client.timeout) as client:
-                        response = client.post(url, headers=headers, files=files)
-                        response.raise_for_status()
+                    file_content = f.read()
+                
+                files = {"video": (file_path.name, file_content, content_type)}
+                
+                logger.debug(f"Sending request to {url}")
+                
+                with httpx.Client(timeout=self.client.timeout) as client:
+                    response = client.post(url, headers=headers, files=files)
+                    response.raise_for_status()
                 
                 result = response.json()
                 logger.info("Video processed successfully")
@@ -216,19 +219,22 @@ class EfferenceClient:
             headers = {"Authorization": f"Bearer {self.client.api_key}"}
             
             try:
+                # Read file content first to avoid file handle issues
                 with open(file_path, "rb") as f:
-                    files = {"video": (file_path.name, f, content_type)}
-                    data = {}
-                    
-                    if max_frames is not None:
-                        data["max_frames"] = str(max_frames)
-                    data["frame_skip"] = str(frame_skip)
-                    
-                    logger.debug(f"Sending batch request to {url}")
-                    
-                    with httpx.Client(timeout=self.client.timeout) as client:
-                        response = client.post(url, headers=headers, files=files, data=data)
-                        response.raise_for_status()
+                    file_content = f.read()
+                
+                files = {"video": (file_path.name, file_content, content_type)}
+                data = {}
+                
+                if max_frames is not None:
+                    data["max_frames"] = str(max_frames)
+                data["frame_skip"] = str(frame_skip)
+                
+                logger.debug(f"Sending batch request to {url}")
+                
+                with httpx.Client(timeout=self.client.timeout) as client:
+                    response = client.post(url, headers=headers, files=files, data=data)
+                    response.raise_for_status()
                 
                 result = response.json()
                 logger.info(f"Batch processing completed: {result.get('frames_processed', 0)} frames")
