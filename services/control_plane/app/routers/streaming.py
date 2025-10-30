@@ -20,7 +20,7 @@ router = APIRouter(prefix="/v1", tags=["streaming", "batch", "models"])
 
 # Configuration
 MODEL_SERVER_BASE = os.getenv("MODEL_SERVER_URL", "http://model_server:8000/infer").rstrip('/infer')
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))  # 30 minutes default
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "20971520"))  # 20MB default
 
 
@@ -41,10 +41,23 @@ async def process_video_batch(
     More expensive than single-frame processing but provides complete analysis.
     
     **File Size Limit**: Maximum 20MB video files.
+    **Frame Limit**: maximum 600 frames per request for now. 
     """
     try:
         key_record, customer = auth_data
         customer_id = customer.customer_id
+
+        MAX_FRAMES_LIMIT = 600
+        if max_frames is not None and max_frames > MAX_FRAMES_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"max_frames cannot exceed {MAX_FRAMES_LIMIT}. For larger batches, use frame_skip or contact support."
+            )
+
+        # cap to 600 if not specified
+        if max_frames is None or max_frames > MAX_FRAMES_LIMIT:
+            max_frames = MAX_FRAMES_LIMIT
+            
         logger.info(f"Batch processing request from customer {customer_id}")
         
         # Validate file

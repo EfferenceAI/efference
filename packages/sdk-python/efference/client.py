@@ -190,6 +190,10 @@ class EfferenceClient:
                 >>> print(f"Processed {result['frames_processed']} frames")
                 >>> print(f"Credits deducted: {result['credits_deducted']}")
             """
+            # add validation
+            if max_frames and max_frames>600:
+                logger.warning(f"max_frames capped at 600, you provided {max_frames}")
+                max_frames=600
             # Handle file-like objects
             if hasattr(file_path, 'read'):
                 return self._process_batch_file_object(file_path, max_frames, frame_skip, content_type)
