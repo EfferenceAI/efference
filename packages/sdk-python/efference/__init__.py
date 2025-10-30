@@ -2,7 +2,7 @@
 
 from .client import EfferenceClient
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 __author__ = "EfferenceAI"
 __license__ = "MIT"
 
