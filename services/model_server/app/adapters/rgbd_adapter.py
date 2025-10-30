@@ -35,7 +35,7 @@ class RGBDAdapter(BaseAdapter):
             depth_placeholder = np.zeros_like(frame[:, :, 0], dtype=np.float32)
             logger.info(f"Created depth placeholder shape: {depth_placeholder.shape}")
             
-            # Run model inference - this is likely where it crashes
+            # Run model inference 
             logger.info("Calling model.infer_image...")
             
             # Clear GPU cache before inference to prevent OOM
@@ -50,11 +50,11 @@ class RGBDAdapter(BaseAdapter):
             # Try inference with memory protection
             try:
                 depth_corrected = self.model.infer_image(
-                    rgb=frame,
-                    depth=depth_placeholder,
-                    input_size=256,  # Start with 256, can increase later if stable
+                    rgb=frame[np.newaxis, ...],  # Add batch dimension: (256,256,3) -> (1,256,256,3)
+                    depth=depth_placeholder[np.newaxis, ...],  
+                    input_size=256,
                     max_depth=25.0
-                )
+                )[0]  
                 logger.info(f"Model inference completed, output shape: {depth_corrected.shape}")
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -126,11 +126,11 @@ class RGBDAdapter(BaseAdapter):
             
             # Run inference
             depth_corrected = self.model.infer_image(
-                rgb=rgb,
-                depth=depth_orig,
+                rgb=rgb[np.newaxis, ...],  # Add batch dimension
+                depth=depth_orig[np.newaxis, ...],  # Add batch dimension
                 input_size=518,
                 max_depth=25.0
-            )
+            )[0]  
             
             
             result = {
