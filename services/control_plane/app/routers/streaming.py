@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Form
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -140,9 +141,19 @@ async def process_video_batch(
 # Model Management
 # ============================================================================
 
+class SwitchModelForm(BaseModel):
+    """Form model to switch active model (suppresses pydantic protected namespace warning)."""
+    model_name: str = Field(..., description="Model to switch to (d435, d405)")
+    # Allow fields starting with 'model_' to avoid warning
+    model_config = {"protected_namespaces": ()}
+
+    @classmethod
+    def as_form(cls, model_name: str = Form(..., description="Model to switch to (d435, d405)")):
+        return cls(model_name=model_name)
+
 @router.post("/models/switch", status_code=200)
 async def switch_model(
-    model_name: str = Form(..., description="Model to switch to (d435, d405)"),
+    form: SwitchModelForm = Depends(SwitchModelForm.as_form),
     customer_id: str = Depends(validate_customer_api_key)
 ) -> Dict[str, Any]:
     """
@@ -150,6 +161,7 @@ async def switch_model(
     Allows switching between d435 and d405 variants.
     """
     try:
+        model_name = form.model_name
         logger.info(f"Model switch request from customer {customer_id}: {model_name}")
         
         # Forward to model server
