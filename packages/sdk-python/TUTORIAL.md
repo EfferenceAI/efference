@@ -291,7 +291,133 @@ except Exception as e:
 
 ---
 
-## Step 5: Visualization
+## Step 5: Advanced RGBD Processing
+
+Process RGBD data in multiple formats including videos with depth arrays, OpenEXR files, and numpy arrays.
+
+### Supported Input Formats
+
+The `process_rgbd_advanced()` method supports four different input combinations:
+
+1. **RGB Video + Numpy Depth Array**
+2. **RGB Video + OpenEXR Depth**
+3. **Combined RGBD Numpy Array**
+4. **Separate RGB and Depth Numpy Arrays**
+
+### Format 1: RGB Video + Numpy Depth Array
+
+Process a video with a corresponding numpy depth array:
+
+```python
+import numpy as np
+
+# Assume you have depth data as numpy array
+# depth_array shape: (num_frames, height, width)
+depth_data = np.load("depth_sequence.npy")
+np.save("depth.npy", depth_data)
+
+result = client.images.process_rgbd_advanced(
+    rgb_video="video.mp4",
+    depth_numpy="depth.npy",
+    max_frames=50,
+    frame_skip=1
+)
+
+print(f"Processed {result['frames_processed']} frames")
+print(f"Credits used: {result['credits_deducted']:.2f}")
+```
+
+### Format 2: RGB Video + OpenEXR Depth
+
+Process video with OpenEXR depth data (common in 3D rendering pipelines):
+
+```python
+result = client.images.process_rgbd_advanced(
+    rgb_video="rendered_video.mp4",
+    depth_exr="depth_sequence.exr",
+    max_frames=100,
+    frame_skip=2
+)
+```
+
+### Format 3: Combined RGBD Numpy Array
+
+Process a single numpy array containing both RGB and depth:
+
+```python
+# RGBD array shape: (height, width, 4) where channels are R,G,B,D
+rgbd_array = np.load("combined_rgbd.npy")
+
+result = client.images.process_rgbd_advanced(
+    rgbd_numpy="combined_rgbd.npy"
+)
+```
+
+### Format 4: Separate RGB and Depth Numpy Arrays
+
+Process separate numpy arrays for RGB and depth:
+
+```python
+result = client.images.process_rgbd_advanced(
+    rgb_numpy="rgb_frames.npy",
+    depth_numpy_separate="depth_frames.npy"
+)
+```
+
+### Parameters
+
+- `rgb_video`: Path to RGB video file (MP4, AVI, etc.)
+- `depth_numpy`: Path to numpy depth array (.npy file)
+- `depth_exr`: Path to OpenEXR depth file (.exr)
+- `rgbd_numpy`: Path to combined RGBD numpy array (.npy)
+- `rgb_numpy`: Path to RGB numpy array (.npy)
+- `depth_numpy_separate`: Path to separate depth numpy array (.npy)
+- `max_frames`: Maximum number of frames to process (optional)
+- `frame_skip`: Process every Nth frame (default: 1)
+
+### Complete Advanced Processing Example
+
+```python
+from efference import EfferenceClient
+import numpy as np
+
+client = EfferenceClient(api_key="sk_live_your_key")
+
+try:
+    # Example: Process video with numpy depth
+    result = client.images.process_rgbd_advanced(
+        rgb_video="capture.mp4",
+        depth_numpy="sensor_depth.npy",
+        max_frames=30,
+        frame_skip=1
+    )
+    
+    print("Advanced RGBD Processing Results")
+    print("=================================")
+    print(f"Input format: {result['input_format']}")
+    print(f"Frames processed: {result.get('frames_processed', 1)}")
+    print(f"Credits used: {result['credits_deducted']:.2f}")
+    print(f"Credits remaining: {result['credits_remaining']:.2f}")
+    
+    # Access depth statistics if available
+    if 'inference_result' in result:
+        output = result['inference_result']['output']
+        print(f"\nDepth statistics:")
+        print(f"  Min: {output['min']:.2f}m")
+        print(f"  Max: {output['max']:.2f}m")
+        print(f"  Mean: {output['mean']:.2f}m")
+        
+except FileNotFoundError as e:
+    print(f"File not found: {e}")
+except ValueError as e:
+    print(f"Invalid input combination: {e}")
+except Exception as e:
+    print(f"Error: {e}")
+```
+
+---
+
+## Step 6: Visualization
 
 Display depth results using matplotlib.
 
@@ -359,7 +485,7 @@ print("Visualizations saved!")
 
 ---
 
-## Step 6: Error Handling
+## Step 7: Error Handling
 
 Properly handle errors for robust applications.
 
@@ -456,7 +582,7 @@ result = safe_process_video(client, "video.mp4")
 
 ---
 
-## Step 7: Production Patterns
+## Step 8: Production Patterns
 
 Patterns for production-ready applications.
 
