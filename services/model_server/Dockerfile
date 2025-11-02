@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y \
     wget \
     # Build tools (needed for some Python packages)
     build-essential \
+    # USB and RealSense camera support
+    libusb-1.0-0-dev \
+    libudev-dev \
+    pkg-config \
+    libgtk-3-dev \
+    libglfw3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Reset to default
@@ -51,7 +57,8 @@ RUN --mount=type=secret,id=github_token \
 # Verify installations
 RUN python3 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
     python3 -c "import efference_rgbd; print('efference-rgbd: installed')" && \
-    python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+    python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')" && \
+    python3 -c "import pyrealsense2; print(f'pyrealsense2: {pyrealsense2.__version__}')"
 
 # Copy application code
 COPY app/ ./app/

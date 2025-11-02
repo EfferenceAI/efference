@@ -23,3 +23,7 @@ boto3==1.28.0
 # External model packages - Install from Git
 # NOTE: This will also install its dependencies (einops, open3d, etc.)
 efference-rgbd @ git+https://github.com/EfferenceAI/efference-rgbd.git@main
+
+# RealSense camera support (for live streaming)
+# NOTE: Requires hardware access in Docker (--device flag)
+pyrealsense2==2.55.1.6486

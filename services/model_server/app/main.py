@@ -850,6 +850,18 @@ async def start_camera_stream(
         # Import camera class from efference-rgbd
         try:
             if camera_type == "realsense":
+                # Check if pyrealsense2 is available first
+                try:
+                    import pyrealsense2 as rs
+                    if rs is None:
+                        raise ImportError("pyrealsense2 module is None")
+                except ImportError:
+                    raise HTTPException(
+                        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                        detail="pyrealsense2 library is not installed. Live RealSense camera streaming is not available. "
+                               "To enable it, install: pip install pyrealsense2"
+                    )
+                
                 from efference_rgbd.camera import RealSenseCamera
                 # RealSenseCamera expects config_paths as a list, not a single string
                 config_paths = [config_path] if config_path else None

@@ -54,6 +54,11 @@ services:
     volumes:
       - ./services/model_server/app:/app/app
       - model_weights:/app/weights
+    # USB device access for RealSense cameras (for live streaming)
+    # NOTE: This gives access to all USB devices. 
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    privileged: true  # Required for USB device access
     deploy:
       resources:
         reservations:
