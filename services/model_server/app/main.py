@@ -851,7 +851,9 @@ async def start_camera_stream(
         try:
             if camera_type == "realsense":
                 from efference_rgbd.camera import RealSenseCamera
-                camera = RealSenseCamera(config_path=config_path, live=True)
+                # RealSenseCamera expects config_paths as a list, not a single string
+                config_paths = [config_path] if config_path else None
+                camera = RealSenseCamera(config_paths=config_paths, live=True)
             else:
                 raise ValueError(f"Unsupported camera type: {camera_type}")
         except ImportError as e:
