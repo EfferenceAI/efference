@@ -900,6 +900,24 @@ async def start_camera_stream(
             }
         }
         
+    except HTTPException:
+        # Re-raise HTTP exceptions (already have proper status codes)
+        raise
+    except RuntimeError as e:
+        # Handle camera-specific errors (e.g., "No RealSense device detected")
+        error_msg = str(e)
+        logger.error(f"Camera runtime error: {error_msg}")
+        
+        if "No RealSense device" in error_msg or "device detected" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No RealSense camera detected. Please ensure a RealSense camera is connected via USB. Error: {error_msg}"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Camera error: {error_msg}"
+            )
     except Exception as e:
         logger.error(f"Failed to start stream: {str(e)}")
         raise HTTPException(
