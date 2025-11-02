@@ -58,7 +58,7 @@ RUN --mount=type=secret,id=github_token \
 RUN python3 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
     python3 -c "import efference_rgbd; print('efference-rgbd: installed')" && \
     python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')" && \
-    python3 -c "import pyrealsense2; print(f'pyrealsense2: {pyrealsense2.__version__}')"
+    python3 -c "import pyrealsense2; print('pyrealsense2: installed')"
 
 # Copy application code
 COPY app/ ./app/
