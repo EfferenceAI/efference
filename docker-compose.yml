@@ -42,9 +42,11 @@ services:
     ports:
       - "8001:8000"
     environment:
-      # Model variant: 'd435'
+      # Initial model to load: 'd435' or 'd405'
+      # All model weights (d435.pth, d405.pth) will be downloaded at startup
       MODEL_NAME: d435
-      MODEL_S3_URI: https://efference-weights.s3.us-west-1.amazonaws.com/public/d435.pth
+      # Base URL for model weights (not a specific file)
+      MODEL_S3_URI: https://efference-weights.s3.us-west-1.amazonaws.com/public
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       MALLOC_ARENA_MAX: "2"
