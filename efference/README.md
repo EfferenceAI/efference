@@ -32,15 +32,24 @@ For the camera, we have:
 
 what else?
 
+### Data Packing and Formatting (`.packer`)
+* **`.format`** *(str)*: Format of the data being recorded (mcap, ...).
+* **`.segments`** *(int)*: ms per segment recorded, 0 for continuous stream.
+
+### USB Communications (`.usb`)
+* **`.log_level`** *(int)*: Logging level of telemetry sent over this interface (0-7).
+
 emmc, ddr4, soc?
 
 ### Wi-Fi (`.wifi`)
 * **`.ssid`** *(str)*: Connected network name.
 * **`.ip_address`** *(str)*: Local IP address for wireless streaming/SSH.
+* **`.log_level`** *(int)*: Logging level of telemetry sent over this interface (0-7).
 
 ### Bluetooth (`.bt`)
 * **`.mac_address`** *(str)*: Device BT MAC address.
 * **`.paired_state`** *(bool)*: Useful for triggering remote data collection.
+* **`.log_level`** *(int)*: Logging level of telemetry sent over this interface (0-7).
 
 what else?
 
