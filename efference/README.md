@@ -41,6 +41,9 @@ what else?
 
 emmc, ddr4, soc?
 
+### eMMC Storage (`.emmc`)
+* **`.backup`** *(bool)*: Record data to device eMMC storage as backup for livestream.
+
 ### Wi-Fi (`.wifi`)
 * **`.ssid`** *(str)*: Connected network name.
 * **`.ip_address`** *(str)*: Local IP address for wireless streaming/SSH.
