@@ -3,7 +3,7 @@ import efference.ef as ef
 def main():
     device = ef.device()
 
-    init_params = ef.init_parameter()
+    init_params = ef.init_parameters()
     init_params.verbose = 0
 
     status = device.open(init_params)

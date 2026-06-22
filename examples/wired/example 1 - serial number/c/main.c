@@ -14,10 +14,10 @@ int main(int argc, char** argv) {
     }
 
     struct ef_init_parameters init_params;
-    init_params.camera_fps = 30;
-    init_params.resolution = EF_RESOLUTION_FULL;
+    init_params.camera.fps = 30;
+    init_params.camera.resolution = EF_RESOLUTION_FULL;
     init_params.device_id = device_id;
-    init_params.camera_image_flip = EF_FLIP_MODE_AUTO;
+    init_params.camera.image_flip = EF_FLIP_MODE_AUTO;
     init_params.verbose = 0;
     // TODO: IMU (dynamic range, frequency)
     // TODO: eMMC (recording / not recording)
