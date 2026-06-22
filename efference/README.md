@@ -24,6 +24,7 @@ For the camera, we have:
 * **`.accelerometer_range`** *(int)*: e.g., ±4g or ±8g.
 * **`.gyroscope_range`** *(int)*: e.g., ±250 dps.
 * **`.sampling_rate`** *(int)*: e.g., 500 or 1000.
+* **`.enabled`** *(bool)*: IMU sampling enablement status.
 
 ### Noise & Calibration (`.imu.calibration`)
 * **`.accel_noise_density` / `.gyro_noise_density`** *(float)*
@@ -34,6 +35,7 @@ what else?
 
 ### Data Packing and Formatting (`.packer`)
 * **`.format`** *(str)*: Format of the data being recorded (mcap, ...).
+* **`.topics`** *(str)*: List of topics recorded into mcap format if enabled.
 * **`.segments`** *(int)*: ms per segment recorded, 0 for continuous stream.
 
 ### USB Communications (`.usb`)
