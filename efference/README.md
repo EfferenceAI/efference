@@ -15,12 +15,16 @@ For the camera, we have:
 * *Double Sphere Model attributes:* `fx`, `fy` (focal lengths), `cx`, `cy` (principal points), `xi` (first sphere parameter), and `alpha` (second sphere parameter).
 * *Camera Extrinsics:* `tx`, `ty`, `tz` (translations), `rw`, `rx`, `ry`, `rz` (rotation quaternion). 
 * **`.camera.auto_exposure_mode`** *(enum)*: Exposure mode (e.g. Manual, Auto).
+* **`.camera.manual_exposure_time`** *(float)*: Manual exposure time in microseconds (e.g. 20.0f to 166000.0f). Exposure caps applied depending on FPS selected (e.g. 166000.0f limit at 60 FPS, 8000.0f limit at 120 FPS)
 * **`.camera.iso_limit`** *(float)*: Maximum gain limit (e.g. 1.0x - 16.0x).
 * **`.camera.white_balance_mode`** *(enum)*: White balance mode (e.g. Manual, Auto).
+* **`.camera.manual_white_balance_temperature`** *(float)*: Manual white balance temperature in Kelvin (e.g. 2800.0f to 6500.0f).
 * **`.camera.gamma_mode`** *(enum)*: Gamma curve (e.g Linear, sRGB, HDR).
 * **`.camera.noise_reduction_mode`** *(enum)*: Noise reduction mode (e.g. Disabled, Spatial, Spatiotemporal).
-* **`.camera.noise_reduction_strength`** *(float)*: Strength of noise reduction from no filtering to aggressive filtering (e.g. 0.0 to 1.0).
+* **`.camera.noise_reduction_strength`** *(float)*: Strength of noise reduction from no filtering to aggressive filtering (e.g. 0.0f to 1.0f).
+* **`.camera.sharpening_strentgh`** *(float)*: Strength of sharpening filter (e.g. 0.0f to 1.0f).
 * **`.camera.distortion_mode`** *(enum)*: Lens distortion correction mode (e.g. Bypass, Hardware_LUT, Software_CAL).
+
 
 ### Encoding (`.encoding`)
 * **`camera.codec`** *(ef.CODEC)*: Active compression codec (e.g., `H265`, `H264`, `RAW`, `mjpeg`).
