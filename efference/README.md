@@ -16,9 +16,9 @@ For the camera, we have:
 * ISP params?
 
 ### Encoding (`.encoding`)
-* **`camera.codec`** *(ef.CODEC)*: Active compression codec (e.g., `H265`, `H264`, `RAW`).
+* **`camera.codec`** *(ef.CODEC)*: Active compression codec (e.g., `H265`, `H264`, `RAW`, `mjpeg`).
 * **`camera.bitrate`** *(float)*: Target bitrate for the hardware encoder.
-* **`camera.rate_control`** *(str)*: `CBR` (Constant Bitrate) or `VBR` (Variable Bitrate).
+* **`camera.rate_control`** *(str)*: `CBR` (Constant Bitrate), `VBR` (Variable Bitrate) or `FQP` (Fixed Quantization Parameter).
 
 ### IMU Configuration (`.imu`)
 * **`.accelerometer_range`** *(int)*: e.g., ±4g or ±8g.
