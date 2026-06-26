@@ -17,8 +17,13 @@ constexpr uint8_t  kIfSubClass   = 0xEF;
 constexpr uint8_t  kIfProtoSdk   = 0x03;
 constexpr unsigned kTimeoutMs    = 2000;
 
-// Locate the FF/EF/03 interface + its bulk OUT/IN endpoint addresses.
-int find_sdk_iface(libusb_device* dev, int* iface, uint8_t* ep_out, uint8_t* ep_in) {
+// Locate the FF/EF/03 interface + its bulk endpoint addresses. The control IN
+// (ep2) is the FIRST bulk IN; the MCAP stream IN (ep3, M0+) is the SECOND, in
+// descriptor order — matching the firmware's descriptor layout. ep_stream is 0
+// on pre-M0 firmware that exposes only the control IN. Addresses are read from
+// the descriptors (they shift when ADB also enumerates), never hard-coded.
+int find_sdk_iface(libusb_device* dev, int* iface, uint8_t* ep_out,
+                   uint8_t* ep_in, uint8_t* ep_stream) {
     libusb_config_descriptor* cfg = nullptr;
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) return -1;
     int found = -1;
@@ -30,18 +35,23 @@ int find_sdk_iface(libusb_device* dev, int* iface, uint8_t* ep_out, uint8_t* ep_
                 id.bInterfaceSubClass != kIfSubClass ||
                 id.bInterfaceProtocol != kIfProtoSdk)
                 continue;
-            uint8_t o = 0, in = 0;
+            uint8_t o = 0, in = 0, strm = 0;
             for (int e = 0; e < id.bNumEndpoints; e++) {
                 const libusb_endpoint_descriptor& ep = id.endpoint[e];
                 if ((ep.bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_BULK) continue;
-                if (ep.bEndpointAddress & LIBUSB_ENDPOINT_IN) in = ep.bEndpointAddress;
-                else                                          o  = ep.bEndpointAddress;
+                if (ep.bEndpointAddress & LIBUSB_ENDPOINT_IN) {
+                    if      (!in)   in   = ep.bEndpointAddress;  // 1st IN = control
+                    else if (!strm) strm = ep.bEndpointAddress;  // 2nd IN = stream
+                } else {
+                    o = ep.bEndpointAddress;
+                }
             }
             if (o && in) {
-                *iface  = id.bInterfaceNumber;
-                *ep_out = o;
-                *ep_in  = in;
-                found   = 0;
+                *iface     = id.bInterfaceNumber;
+                *ep_out    = o;
+                *ep_in     = in;
+                *ep_stream = strm;
+                found      = 0;
             }
         }
     }
@@ -96,13 +106,15 @@ ERROR_CODE UsbTransport::open(int device_index, int verbose) {
                                            : ERROR_CODE::USB_ERROR;
     }
 
-    if (find_sdk_iface(libusb_get_device(handle_), &iface_, &ep_out_, &ep_in_) != 0) {
+    if (find_sdk_iface(libusb_get_device(handle_), &iface_, &ep_out_, &ep_in_,
+                       &ep_stream_) != 0) {
         close();
         return ERROR_CODE::INTERFACE_NOT_FOUND;
     }
     if (verbose_)
-        fprintf(stderr, "[ef] SDK iface=%d ep_out=0x%02x ep_in=0x%02x serial=\"%s\"\n",
-                iface_, ep_out_, ep_in_, serial_.c_str());
+        fprintf(stderr,
+                "[ef] SDK iface=%d ep_out=0x%02x ep_in=0x%02x ep_stream=0x%02x serial=\"%s\"\n",
+                iface_, ep_out_, ep_in_, ep_stream_, serial_.c_str());
 
     libusb_set_auto_detach_kernel_driver(handle_, 1);
     rc = libusb_claim_interface(handle_, iface_);
@@ -123,7 +135,16 @@ void UsbTransport::close() {
     }
     if (ctx_) { libusb_exit(ctx_); ctx_ = nullptr; }
     iface_  = -1;
-    ep_out_ = ep_in_ = 0;
+    ep_out_ = ep_in_ = ep_stream_ = 0;
+}
+
+int UsbTransport::read_stream(uint8_t* buf, int len, unsigned timeout_ms, int* got) {
+    *got = 0;
+    if (!handle_ || !ep_stream_) return LIBUSB_ERROR_NOT_FOUND;
+    int rc = libusb_bulk_transfer(handle_, ep_stream_, buf, len, got, timeout_ms);
+    // A timeout with bytes already received is success for our drain loop.
+    if (rc == LIBUSB_ERROR_TIMEOUT) return 0;
+    return rc;
 }
 
 std::string UsbTransport::request(const std::string& req, const std::string& args) {

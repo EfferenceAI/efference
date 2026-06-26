@@ -1,7 +1,11 @@
 #include "ef/device.hpp"
 
+#include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 #include "json.hpp"
 #include "usb_transport.hpp"
@@ -73,6 +77,17 @@ DISTORTION_MODE distortion_from(const std::string& s) {
     if (s == "Hardware_LUT") return DISTORTION_MODE::HARDWARE_LUT;
     if (s == "Software_CAL") return DISTORTION_MODE::SOFTWARE_CAL;
     return DISTORTION_MODE::BYPASS;
+}
+
+// Map the firmware's stream last_end string onto a STREAM_END. The non-terminal
+// states (the stream is healthy or cleanly stopped) all collapse to STOPPED;
+// only the genuine abnormal ends are terminal (mcap-streaming.md §7).
+STREAM_END stream_end_from(const std::string& s) {
+    if (s == "dropped")          return STREAM_END::DROPPED;
+    if (s == "producer_restart") return STREAM_END::PRODUCER_RESTART;
+    if (s == "host_gone")        return STREAM_END::HOST_GONE;
+    if (s == "error")            return STREAM_END::ERROR;
+    return STREAM_END::STOPPED;  // none | streaming | finalizing | stopped
 }
 
 // ---- nested-block parsers (each is a no-op if the key is absent) ------------
@@ -167,24 +182,20 @@ void parse_capabilities(const Json& c, Capabilities& caps) {
     strvec("pixel_formats", caps.pixel_formats);
     strvec("containers",    caps.containers);
 
-    const Json& f = c["framerates_fps"];
-    if (f.is_array())
-        for (const auto& e : f.arr)
-            if (e.is_number()) caps.framerates_fps.push_back((int)e.num);
-
-    const Json& r = c["resolutions"];
-    if (r.is_array())
-        for (const auto& e : r.arr) {
-            Capabilities::Resolution res;
-            if (e.is_object()) {
-                res.name    = e["name"].as_string();
-                res.binning = e["binning"].as_string();
-            } else if (e.is_string()) {
-                res.name = e.str;
-            } else {
-                continue;
-            }
-            caps.resolutions.push_back(res);
+    // Enriched schema: an explicit per-mode array (width/height/fps/binning +
+    // usable flag), generated from the firmware's CAPS[]. Replaces the older
+    // coarse resolutions[] + framerates_fps[].
+    const Json& m = c["modes"];
+    if (m.is_array())
+        for (const auto& e : m.arr) {
+            if (!e.is_object()) continue;
+            Capabilities::Mode mode;
+            mode.width   = e["width"].as_int();
+            mode.height  = e["height"].as_int();
+            mode.fps     = e["fps"].as_int();
+            mode.binning = e["binning"].as_string();
+            mode.usable  = e["usable"].as_bool();
+            caps.modes.push_back(mode);
         }
 }
 
@@ -267,6 +278,221 @@ DeviceInformation Device::get_device_information() {
     return di;
 }
 
+// ---- configuration (control plane) -----------------------------------------
+
+namespace {
+
+std::string to_lower(std::string s) {
+    for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
+    return s;
+}
+
+// Build the set_config request body from only the fields the caller set, so an
+// absent field keeps the device's current value (partial update). Codec /
+// container go lowercase to match the device's enum tokens.
+std::string build_config_body(const Configuration& cfg) {
+    std::string b = "{";
+    const char* sep = "";
+    auto add_int = [&](const char* key, int v) {
+        if (v <= 0) return;
+        b += sep; sep = ",";
+        b += '"'; b += key; b += "\":"; b += std::to_string(v);
+    };
+    auto add_str = [&](const char* key, const std::string& v, bool lower) {
+        if (v.empty()) return;
+        b += sep; sep = ",";
+        b += '"'; b += key; b += "\":\""; b += (lower ? to_lower(v) : v); b += '"';
+    };
+    add_int("width",           cfg.width);
+    add_int("height",          cfg.height);
+    add_int("fps",             cfg.fps);
+    add_str("codec",           cfg.codec,        true);
+    add_str("container",       cfg.container,    true);
+    add_int("segment_seconds", cfg.segment_seconds);
+    add_str("capture_mode",    cfg.capture_mode, false);
+    b += "}";
+    return b;
+}
+
+}  // namespace
+
+ConfigureResult Device::configure(const Configuration& cfg) {
+    if (!impl_->open) throw Exception("device not open");
+
+    std::string body    = build_config_body(cfg);
+    std::string payload = impl_->usb.request("set_config", body);
+
+    Json j;
+    try {
+        j = Json::parse(payload);
+    } catch (const std::exception& e) {
+        throw Exception(std::string("failed to parse configure reply: ") + e.what());
+    }
+    if (!j.is_object())
+        throw Exception("configure reply is not a JSON object");
+
+    ConfigureResult r;
+    r.raw_json = payload;
+
+    // set_config returns the orchestrator's varlink envelope: success
+    // {"parameters":{"config_version":N,"applied":true}}, rejection
+    // {"error":"...InvalidState","parameters":{"reason":"..."}}. The endpoint's
+    // own failure (e.g. unreachable orchestrator) is {"error":"unreachable",...}.
+    // Fall back to the top-level object if there is no "parameters" wrapper.
+    const Json& p = j["parameters"].is_object() ? j["parameters"] : j;
+
+    if (j.contains("error")) {
+        r.applied = false;
+        r.reason  = p["reason"].as_string("");
+        if (r.reason.empty()) r.reason = j["error"].as_string("error");
+        return r;
+    }
+
+    r.applied        = p["applied"].as_bool(false);
+    r.config_version = p["config_version"].as_int(0);
+    if (!r.applied && r.reason.empty()) r.reason = p["reason"].as_string("");
+    return r;
+}
+
+// ---- MCAP data plane (M3) --------------------------------------------------
+
+namespace {
+constexpr int      kStreamBuf      = 64 * 1024;  // == ring slot size
+constexpr unsigned kReadTimeoutMs  = 300;        // ep3 poll while streaming
+constexpr unsigned kFooterQuietMs  = 400;        // ep3 poll while draining footer
+constexpr int      kFooterIdleStop = 4;          // ~1.6s quiet => footer done
+constexpr auto     kStatusPoll     = std::chrono::milliseconds(1000);
+}  // namespace
+
+// Core: drain ep3 -> `sink` at line rate, with the two-phase clean stop +
+// terminal-end semantics. The file overloads wrap this with a fwrite sink.
+StreamResult Device::stream_mcap(const StreamSink& sink,
+                                 const std::function<bool()>& should_stop,
+                                 const StreamEndCallback& on_end) {
+    using clock = std::chrono::steady_clock;
+    StreamResult r;
+
+    auto finish = [&](STREAM_END end, const std::string& detail) -> StreamResult {
+        r.end = end;
+        r.detail = detail;
+        if (on_end) on_end(r);
+        return r;
+    };
+
+    if (!impl_->open)              return finish(STREAM_END::ERROR, "device not open");
+    if (!impl_->usb.has_stream())
+        return finish(STREAM_END::NO_STREAM_ENDPOINT, "firmware exposes no stream endpoint (ep3)");
+
+    // Poll the device's own drain counters on the control channel. Returns false
+    // on a transport error; otherwise fills out the mapped end + raw counters.
+    auto poll_status = [&](STREAM_END* mapped, std::string* last_end) -> bool {
+        std::string reply;
+        try { reply = impl_->usb.request("get_stream_status", "{}"); }
+        catch (const std::exception&) { return false; }
+        Json s;
+        try { s = Json::parse(reply); } catch (const std::exception&) { return false; }
+        if (!s.is_object()) return false;
+        r.dropped  = (uint64_t)s["dropped"].as_int((int)r.dropped);
+        r.restarts = (uint32_t)s["restarts"].as_int((int)r.restarts);
+        std::string le = s["last_end"].as_string("");
+        if (last_end) *last_end = le;
+        if (mapped)   *mapped   = stream_end_from(le);
+        return true;
+    };
+
+    // ---- arm the stream (start_stream drives capture into usb_sdk COLLECT) ----
+    std::string sreply;
+    try { sreply = impl_->usb.request("start_stream", "{}"); }
+    catch (const std::exception& e) {
+        return finish(STREAM_END::ERROR, std::string("start_stream failed: ") + e.what());
+    }
+    {
+        Json sj;
+        try { sj = Json::parse(sreply); } catch (const std::exception&) {}
+        if (!sj.is_object() || !sj["streaming"].as_bool(false))
+            return finish(STREAM_END::START_FAILED, sreply);
+    }
+
+    std::vector<uint8_t> buf(kStreamBuf);
+
+    // ---- drain ep3 -> sink at line rate (NOT coupled to any viewer, §8) ------
+    STREAM_END  end    = STREAM_END::STOPPED;
+    std::string detail = "stopped";
+    auto last_poll = clock::now();
+    for (;;) {
+        if (should_stop && should_stop()) { end = STREAM_END::STOPPED; detail = "stopped"; break; }
+
+        int got = 0;
+        int rc  = impl_->usb.read_stream(buf.data(), (int)buf.size(), kReadTimeoutMs, &got);
+        if (rc != 0) { end = STREAM_END::HOST_GONE; detail = "host_gone"; break; }
+        if (got > 0) { if (sink) sink(buf.data(), (size_t)got); r.bytes += (uint64_t)got; }
+
+        // Terminal-condition watch (drop / producer restart) via the control
+        // channel — the device stopped its drain and the user must be told.
+        if (clock::now() - last_poll >= kStatusPoll) {
+            last_poll = clock::now();
+            STREAM_END t = STREAM_END::STOPPED;
+            std::string le;
+            if (poll_status(&t, &le) && t != STREAM_END::STOPPED) { end = t; detail = le; break; }
+        }
+    }
+
+    const bool clean = (end == STREAM_END::STOPPED);
+
+    // ---- two-phase stop (mcap-streaming.md §footer fix) ---------------------
+    // Phase 1: StopCollect — capture finalizes, pushing the MCAP footer+magic
+    // into the ring; the device keeps forwarding it out ep3 ("finalizing").
+    try { impl_->usb.request("stop_stream", "{}"); } catch (const std::exception&) {}
+    if (clean) {
+        // Drain the footer tail off ep3 until quiet -> a complete .mcap.
+        int idle = 0;
+        for (;;) {
+            int got = 0;
+            int rc  = impl_->usb.read_stream(buf.data(), (int)buf.size(), kFooterQuietMs, &got);
+            if (rc != 0) break;
+            if (got == 0) { if (++idle >= kFooterIdleStop) break; continue; }
+            idle = 0;
+            if (sink) sink(buf.data(), (size_t)got);
+            r.bytes += (uint64_t)got;
+        }
+    }
+    // Phase 2: teardown — reclaim the device drain / ep3 / ring.
+    try { impl_->usb.request("stop_stream", "{}"); } catch (const std::exception&) {}
+
+    return finish(end, detail);
+}
+
+StreamResult Device::stream_mcap(const std::string& path,
+                                 const std::function<bool()>& should_stop,
+                                 const StreamEndCallback& on_end) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        StreamResult r;
+        r.end = STREAM_END::ERROR;
+        r.detail = "cannot open output file: " + path;
+        if (on_end) on_end(r);
+        return r;
+    }
+    // on_end fires AFTER the file is closed (pass {} to the core, call it here).
+    StreamResult r = stream_mcap(
+        [f](const uint8_t* d, size_t n) { std::fwrite(d, 1, n, f); },
+        should_stop, StreamEndCallback{});
+    std::fclose(f);
+    if (on_end) on_end(r);
+    return r;
+}
+
+StreamResult Device::stream_mcap(const std::string& path, double seconds,
+                                 const StreamEndCallback& on_end) {
+    if (seconds <= 0.0)  // stream until a terminal end
+        return stream_mcap(path, std::function<bool()>(), on_end);
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds((long long)(seconds * 1e6));
+    return stream_mcap(path,
+                       [deadline]() { return std::chrono::steady_clock::now() >= deadline; },
+                       on_end);
+}
+
 // ---- enum -> string --------------------------------------------------------
 
 const char* to_string(ERROR_CODE e) {
@@ -281,6 +507,19 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::NOT_OPEN:            return "NOT_OPEN";
     }
     return "UNKNOWN";
+}
+
+const char* to_string(STREAM_END e) {
+    switch (e) {
+        case STREAM_END::STOPPED:            return "STOPPED";
+        case STREAM_END::PRODUCER_RESTART:   return "PRODUCER_RESTART";
+        case STREAM_END::DROPPED:            return "DROPPED";
+        case STREAM_END::HOST_GONE:          return "HOST_GONE";
+        case STREAM_END::START_FAILED:       return "START_FAILED";
+        case STREAM_END::NO_STREAM_ENDPOINT: return "NO_STREAM_ENDPOINT";
+        case STREAM_END::ERROR:              return "ERROR";
+    }
+    return "ERROR";
 }
 
 const char* to_string(MODEL m) {

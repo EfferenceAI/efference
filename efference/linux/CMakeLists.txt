@@ -43,6 +43,27 @@ target_compile_options(ef PRIVATE -Wall -Wextra)
 add_executable(ef-info tools/ef_info.cpp)
 target_link_libraries(ef-info PRIVATE ef::ef)
 
+# ---- ef-config: list caps / set the session configuration -------------------
+add_executable(ef-config tools/ef_config.cpp)
+target_link_libraries(ef-config PRIVATE ef::ef)
+
+# ---- ef-stream: capture the MCAP data plane to a .mcap (M3) -----------------
+add_executable(ef-stream tools/ef_stream.cpp)
+target_link_libraries(ef-stream PRIVATE ef::ef)
+
+# ---- ef-view: live viewer (video + IMU). OPTIONAL — only built when SDL2 +
+#      ffmpeg (libavcodec/libavutil) are present, so the core SDK stays
+#      libusb-only. Install: apt install libsdl2-dev libavcodec-dev libavutil-dev
+pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
+pkg_check_modules(AVCODEC IMPORTED_TARGET libavcodec libavutil libswscale)
+if(SDL2_FOUND AND AVCODEC_FOUND)
+    add_executable(ef-view tools/ef_view.cpp)
+    target_link_libraries(ef-view PRIVATE ef::ef PkgConfig::SDL2 PkgConfig::AVCODEC)
+    message(STATUS "ef-view: enabled (SDL2 + libavcodec found)")
+else()
+    message(STATUS "ef-view: skipped (need libsdl2-dev + libavcodec-dev/libavutil-dev)")
+endif()
+
 # ---- examples (shared sources live at the repo-level examples/ dir) ---------
 if(EF_BUILD_EXAMPLES)
     set(EX_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../examples)

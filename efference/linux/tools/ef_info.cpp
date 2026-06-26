@@ -87,12 +87,11 @@ int main(int argc, char** argv) {
         for (auto& s : cap.pixel_formats) std::cout << s << " ";
         std::cout << "\n    containers    : ";
         for (auto& s : cap.containers)    std::cout << s << " ";
-        std::cout << "\n    framerates    : ";
-        for (auto  f : cap.framerates_fps) std::cout << f << " ";
-        std::cout << "\n    resolutions   : ";
-        for (auto& r : cap.resolutions)
-            std::cout << r.name << "(" << (r.binning.empty() ? "-" : r.binning) << ") ";
-        std::cout << "\n";
+        std::cout << "\n    modes         : " << cap.modes.size() << "\n";
+        for (auto& m : cap.modes)
+            std::cout << "      " << m.width << "x" << m.height << "@" << m.fps
+                      << " binning=" << (m.binning.empty() ? "-" : m.binning)
+                      << (m.usable ? "" : "  (advertised, NOT usable)") << "\n";
 
         std::cout << "\n  [live]\n";
         std::cout << "    orchestrator_reachable : " << (i.orchestrator_reachable ? "true" : "false") << "\n";
