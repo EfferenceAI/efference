@@ -39,10 +39,11 @@ RESOLUTION resolution_from(const std::string& s) {
 }
 
 CODEC codec_from(const std::string& s) {
-    if (s == "RAW")                    return CODEC::RAW;
+    // Accept both the caps spelling (UPPER) and the wire-config spelling (lower).
+    if (s == "RAW"  || s == "raw")     return CODEC::RAW;
     if (s == "mjpeg" || s == "MJPEG")  return CODEC::MJPEG;
-    if (s == "H264")                   return CODEC::H264;
-    if (s == "H265")                   return CODEC::H265;
+    if (s == "H264" || s == "h264")    return CODEC::H264;
+    if (s == "H265" || s == "h265")    return CODEC::H265;
     return CODEC::UNKNOWN;
 }
 
