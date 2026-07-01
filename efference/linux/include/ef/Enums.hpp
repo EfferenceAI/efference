@@ -78,21 +78,23 @@ enum class ERROR_CODE : int {
 };
 
 enum class MODEL {  
-    M1,
+    M1, // Support for 1 device right now, H1 later
 };
 
 enum class INPUT_TYPE {  
-    USB,
+    USB, // USB input mode
     STREAM, // WiFi or BT
-    MCAP, // our standard for recording data
+    MCAP, // our standard for recording data - this is for replaying data
 };
 enum class RESOLUTION  { 
-    HD1200,
-    HD1080,
-    SVGA,
-    AUTO
+    HD1200, // 1920*1200, Available FPS: 15, 30, 60 (we worry about 5, 1 later)
+    HD1080, // 960*1080, Available FPS: 15, 30, 60, 120 (we worry about 5, 1 later)
+    SVGA, // 960*600, Available FPS: 15, 30, 60, 120 (we worry about 5, 1 later)
+    AUTO // Select best resolution
 };
 
+// We want to offer 5 standard settings here
+// H265 lossless versus not lossless would probably be crf 22 versus 18
 enum class COMPRESSION_MODE { 
     LOSSLESS,
     H264,
@@ -114,9 +116,61 @@ enum class SENSORS_UNIT {
 };
 
 enum class LENS_DISTORTION_MODEL {
-    DS
+    DS // Double sphere camera model
 };
 
+enum class FLIP_MODE {
+    ON, // flip image
+    OFF, // don't flip
+    AUTO // look at IMU accel and flip based on acceleromter direction
+}
+
+// TODO: add later after Olivia takes a look and we do ISP. See docs.
+enum class VIDEO_SETTINGS {}
+
+// TODO: add later based on what we choose to pass over the wire/wifi as options. See docs.
+enum class VIEW {}
+
+// For IMU. Set based on whether or not we can read. Use during health_check()
+enum class SENSOR_STATE {
+    AVAILABLE,
+    NOT_AVAILABLE
+}
+
+// For Camera. Set based on whether or not we can read. Use during health_check()
+enum class CAMERA_STATE {
+    AVAILABLE,
+    NOT_AVAILABLE
+}
+
+enum class TIME_REFERENCE {
+    IMAGE, // The requested timestamp or data will be at the time of the frame extraction (time stamp on device)
+    CURRENT // The requested timestamp or data will be at the time of the function call (time stamp on host)
+}
+
+// These are transformations. Need to encode for pose.
+enum class COORDINATE_SYSTEM {
+    IMAGE,
+    LEFT_HANDED_Y_UP,
+    RIGHT_HANDED_Y_UP,
+    RIGHT_HANDED_Z_UP,
+    LEFT_HANDED_Z_UP,
+    RIGHT_HANDED_Z_UP_X_FWD
+}
+
+// which memory location we write to.
+enum class MEM {
+    CPU,
+    GPU,
+    BOTH
+}
+
+// IMU automatic detection. ZUPT updates and free-fall detection.
+enum class MOTION_STATE {
+    STATIC,
+    MOVING,
+    FALLING
+}
 
 } // namespace ef
 
