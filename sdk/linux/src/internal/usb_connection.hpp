@@ -60,9 +60,9 @@ public:
     // Pre-M0 firmware has only the control IN, so streaming is unavailable.
     bool has_stream() const override { return ep_stream_ != 0; }
 
-    // Read up to `len` raw bytes off the stream IN (ep3). Returns the libusb rc
-    // (0 on success or timeout); *got holds the byte count (0 on timeout). Does
-    // NOT throw. The stream drain loop interprets timeouts vs errors itself.
+    // Read up to `len` raw bytes off the stream IN (ep3). Returns the libusb rc (0 on
+    // success or timeout), *got the byte count (0 on timeout). No throw; the drain loop
+    // interprets timeouts vs errors itself.
     int read_stream(uint8_t* buf, int len, unsigned timeout_ms, int* got) override;
 
     // USB iSerialNumber string descriptor (empty if none). Used as a fallback

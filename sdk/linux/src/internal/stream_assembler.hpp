@@ -37,13 +37,11 @@
 namespace ef {
 namespace internal {
 
-// The ef_stream reassembly + consumer state, shared by every data-plane reader
-// (USB isoc StreamReader, WiFi UdpStreamReader). It owns the wire-format parse
-// (on_packet), the video quad buffer (latest-wins), and the IMU ring, plus the
-// consumer API (grab / current_video / drain_imu). A concrete reader feeds bytes
-// via on_packet() from whatever transport it runs, and implements start()/stop()
-// for its own transport lifecycle. Keeping the wire format in exactly one place
-// means USB and UDP can never drift.
+// ef_stream reassembly + consumer state, shared by every data-plane reader (USB isoc
+// StreamReader, WiFi UdpStreamReader). Owns the wire-format parse (on_packet), the
+// latest-wins video quad buffer, the IMU ring, and the consumer API (grab /
+// current_video / drain_imu). A concrete reader feeds on_packet() from its transport
+// and implements start()/stop(); one wire-format home means USB and UDP can't drift.
 class StreamAssembler {
 public:
     StreamAssembler() = default;
@@ -78,16 +76,14 @@ public:
     // *dropped (optional) gets the ring-overrun count.
     void drain_imu(std::vector<ImuSample>& out, bool latest_only, uint64_t* dropped);
 
-    // Copy the newest IMU sample's acceleration WITHOUT consuming the queue, so
-    // an image-only consumer can resolve FLIP_MODE::AUTO from gravity without
-    // stealing samples a later drain_imu() owes the recorder / retrieve_imu().
-    // Returns false if no sample has arrived yet.
+    // Copy the newest IMU sample's acceleration WITHOUT consuming the queue, so an
+    // image-only consumer can resolve FLIP_MODE::AUTO from gravity without stealing
+    // samples a later drain_imu() owes the recorder. False if none yet.
     bool peek_latest_accel(float out[3]);
 
-    // Tell the reassembler which codec the video stream carries so the drop-
-    // until-IDR resync gate can classify keyframes. 0 = RAW/MJPEG (intra /
-    // independent frames, never gated), 1 = H264, 2 = H265. Set once by the
-    // Device before the stream flows; ignored (no gate) for codec 0.
+    // Codec of the video stream, so the drop-until-IDR gate can classify keyframes.
+    // 0 = RAW/MJPEG (intra, never gated), 1 = H264, 2 = H265. Set once by the Device
+    // before the stream flows.
     void set_video_codec(int codec) {
         vcodec_.store(codec, std::memory_order_relaxed);
     }
@@ -101,10 +97,9 @@ protected:
     // closed / fatal error). After this, grab() returns END_OF_STREAM.
     void mark_ended();
 
-    // Called (on the transport thread, no lock held) when on_packet() detects a
-    // video packet seq gap, i.e. loss on the wire. A lossy transport with a back
-    // channel (UDP) overrides this to request a keyframe (PLI). Default no-op
-    // (USB isoc has no back channel; loss recovers at the next GOP IDR).
+    // Called (transport thread, no lock) when on_packet() detects a video seq gap
+    // (wire loss). A transport with a back channel (UDP) overrides this to request a
+    // keyframe (PLI); default no-op (USB isoc recovers at the next GOP IDR).
     virtual void on_loss() {}
 
     int  free_vbuf() const;    // a slot not held by consumer/ready/reassembly
@@ -136,11 +131,10 @@ protected:
     uint32_t last_vseq_ = 0;
     bool     have_vseq_ = false;
 
-    // Drop-until-IDR resync gate (encoded streams only). Set on wire loss or a
-    // consumer-supersede; while set, on_packet withholds every complete frame
-    // from the consumer until an IDR/IRAP arrives (which resets the decoder's
-    // reference chain cleanly). Starts true so the first delivered frame is
-    // always a keyframe. Transport-thread only, like last_vseq_ (no lock).
+    // Drop-until-IDR resync gate (encoded streams only). Set on wire loss or consumer
+    // supersede; while set, on_packet withholds every complete frame until an IDR/IRAP
+    // resets the decoder reference chain. Starts true so the first delivered frame is a
+    // keyframe. Transport-thread only, no lock.
     bool     resync_pending_ = true;
     // Video codec for keyframe classification (0=RAW/MJPEG, 1=H264, 2=H265).
     // Written by the Device before streaming, read on the transport thread.

@@ -20,10 +20,10 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-// MUST stay byte-compatible with the firmware's frame header. A frame is a
-// 12-byte little-endian header followed by `len` bytes of payload. The payload
-// is a serialized protobuf ef.v1.Request/Response on the primary control plane;
-// the legacy request() path instead carries UTF-8 JSON in the same frame.
+// MUST stay byte-compatible with the firmware's frame header: a 12-byte
+// little-endian header + `len` payload bytes. Payload is a serialized protobuf
+// ef.v1.Request/Response (primary control plane); the legacy request() path
+// carries UTF-8 JSON in the same frame.
 //
 //   off sz field
 //   0   1  magic    0xEF

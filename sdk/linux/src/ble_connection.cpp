@@ -45,10 +45,9 @@ constexpr unsigned    REQUEST_MS  = 5000;
 constexpr unsigned    DISCOVER_MS = 25000;  // wait for the advert if BlueZ doesn't know it
 constexpr int         CONNECT_TRIES = 4;    // Connect retries (races other BLE agents)
 
-// BlueZ caps one GattCharacteristic1.WriteValue at the 512-byte GATT attribute
-// limit (org.bluez.Error.InvalidValueLength). Control frames can be far larger
-// (an OtaPushChunk request is ~7.2 KB), so request_raw slices the frame into
-// writes of at most this size; the device reassembles by the 12-byte header's
+// BlueZ caps WriteValue at the 512-byte GATT attribute limit (InvalidValueLength),
+// but control frames can be far larger (an OtaPushChunk request is ~7.2 KB), so
+// request_raw slices into <=this-size writes; the device reassembles by the header
 // len field.
 constexpr size_t WRITE_MAX = 512;
 
@@ -59,9 +58,8 @@ std::string device_path(const std::string& adapter, const std::string& addr) {
     return p;
 }
 
-// First org.bluez.Adapter1 object path BlueZ knows about, or the hci0 fallback.
-// Hosts usually have exactly one adapter, but it is not always hci0 (USB dongles,
-// multiple radios), so resolve it instead of hardcoding the path.
+// First org.bluez.Adapter1 path BlueZ knows about (else hci0 fallback). Resolve it
+// rather than hardcode: the sole adapter isn't always hci0 (USB dongles, multi-radio).
 std::string first_adapter_path(GDBusConnection* conn) {
     if (!conn) return ADAPTER_FALLBACK;
     GError* e = nullptr;
@@ -97,14 +95,11 @@ GVariant* empty_opts() {
     return g_variant_builder_end(&b);
 }
 
-// Scoped thread-default push. GDBus latches the thread-default main context at
-// g_bus_get_sync() and g_dbus_connection_signal_subscribe() time, which is how
-// the Response notifications get delivered to the private ctx_ that
-// pump_until() iterates. The push must NOT outlive open(): the pop is
-// thread-affine (popping from another thread corrupts GLib's thread-default
-// stack), and while pushed it hijacks the caller thread's default context, so
-// any of the app's own GIO async work would silently attach to the private,
-// rarely-pumped context.
+// Scoped thread-default push. GDBus latches the thread-default context at
+// g_bus_get_sync()/signal_subscribe(), routing Response notifications to the private
+// ctx_ that pump_until() iterates. Must not outlive open(): the pop is thread-affine
+// (cross-thread pop corrupts GLib's stack), and while pushed it hijacks the caller's
+// default context, silently capturing the app's own GIO async work.
 struct CtxGuard {
     GMainContext* c;
     explicit CtxGuard(GMainContext* ctx) : c(ctx) { g_main_context_push_thread_default(c); }
@@ -142,10 +137,9 @@ static void on_props_changed(GDBusConnection*, const gchar*, const gchar*,
 template <typename Pred>
 bool BleConnection::pump_until(Pred pred, unsigned timeout_ms) {
     gint64 deadline = g_get_monotonic_time() + (gint64)timeout_ms * 1000;
-    // Attach a periodic timer so g_main_context_iteration() wakes even when no
-    // D-Bus signal is pending. Predicates like ServicesResolved are POLLED via a
-    // sync Get (not signal-driven); without a ticking source the blocking
-    // iteration would sleep forever and never re-check the predicate.
+    // Periodic timer so g_main_context_iteration() wakes even with no D-Bus signal
+    // pending: polled predicates (e.g. ServicesResolved via sync Get) would otherwise
+    // block forever, never re-checking.
     GSource* tick = g_timeout_source_new(50);
     g_source_set_callback(tick, +[](gpointer) -> gboolean { return TRUE; },
                           nullptr, nullptr);
@@ -230,22 +224,17 @@ bool BleConnection::device_connected() const {
     return res;
 }
 
-// Best-effort StartDiscovery/StopDiscovery on the adapter. Errors are ignored:
-// the desktop Bluetooth agent may already be discovering, which is fine.
-//
-// Before StartDiscovery the scan is pinned to Transport="le". Without a filter
-// BlueZ defaults to "auto", which interleaves BR/EDR inquiry with the LE scan
-// and makes capturing a BLE-only device's connectable advert slow and
-// unreliable. An LE-only filter scans continuously for adverts, so the M1
-// shows up promptly.
+// Best-effort StartDiscovery/StopDiscovery (errors ignored: the desktop agent may
+// already be scanning). Pins Transport="le" first: BlueZ's default "auto" interleaves
+// BR/EDR inquiry with the LE scan, making a BLE-only advert slow/unreliable to catch;
+// an LE-only filter scans adverts continuously so the M1 shows up promptly.
 void BleConnection::set_discovery(bool on) {
     if (!conn_) return;
     GError* e = nullptr;
 
     if (on) {
-        // SetDiscoveryFilter({ "Transport": "le" }). Best-effort: if another
-        // client already set a conflicting filter this may fail, but the plain
-        // StartDiscovery below still runs.
+        // SetDiscoveryFilter Transport=le. Best-effort: a conflicting filter from
+        // another client may fail this, but the StartDiscovery below still runs.
         GVariantBuilder fb;
         g_variant_builder_init(&fb, G_VARIANT_TYPE("a{sv}"));
         g_variant_builder_add(&fb, "{sv}", "Transport", g_variant_new_string("le"));
@@ -273,9 +262,8 @@ void BleConnection::set_discovery(bool on) {
     }
 }
 
-// Connect with backoff. Already-connected (or an in-progress connect that
-// completes) counts as success, so a racing desktop BLE agent does not block
-// the open.
+// Connect with backoff. Already-connected (or an in-progress connect that completes)
+// counts as success, so a racing desktop BLE agent doesn't block the open.
 bool BleConnection::connect_with_retry() {
     for (int attempt = 0; attempt < CONNECT_TRIES; ++attempt) {
         if (device_connected()) return true;
@@ -313,9 +301,8 @@ Status BleConnection::open(const std::string& address) {
                                 return s; };
 
     ctx_ = g_main_context_new();
-    // Pushed for the duration of open() only (see CtxGuard): the bus connection
-    // and the Response signal subscription both latch ctx_ here; afterwards
-    // pump_until() iterates ctx_ explicitly, no thread-default needed.
+    // Pushed for open() only (see CtxGuard): the bus connection and Response signal
+    // subscription latch ctx_ here; afterwards pump_until() iterates ctx_ directly.
     CtxGuard guard(ctx_);
 
     GError* e = nullptr;
@@ -328,9 +315,8 @@ Status BleConnection::open(const std::string& address) {
     adapter_  = first_adapter_path(conn_);
     dev_path_ = device_path(adapter_, address);
 
-    // If BlueZ doesn't know the device yet (no prior scan), discover it. This is
-    // what lets `ef-ctl --addr` self-connect from a cold state instead of needing
-    // a manual `bluetoothctl connect` first.
+    // If BlueZ doesn't know the device yet (no prior scan), discover it, so
+    // `ef-ctl --addr` self-connects cold without a manual `bluetoothctl connect`.
     if (!device_known()) {
         if (verbose_) fprintf(stderr, "[ble] %s unknown; discovering...\n",
                               address.c_str());
@@ -346,8 +332,8 @@ Status BleConnection::open(const std::string& address) {
     }
 
     // Connect with retry/backoff; already-connected counts as success (agent races).
-    // The device advertises at BlueZ's default ~1280 ms interval, so establishing
-    // the LE link can take a few seconds, so emit progress so it doesn't look hung.
+    // Advertises at BlueZ's ~1280 ms default, so the link can take seconds: emit
+    // progress so it doesn't look hung.
     if (verbose_) fprintf(stderr, "[ble] %s known; connecting (may take a few seconds)...\n",
                           address.c_str());
     if (!connect_with_retry()) return Status::DEVICE_NOT_FOUND;
@@ -408,16 +394,13 @@ Status BleConnection::request_raw(const std::string& payload, std::string& out,
     if (!payload.empty())
         std::memcpy(&frame[proto::HDR_LEN], payload.data(), payload.size());
 
-    // Fresh accumulator for this exchange (single in-flight, like USB). A late
-    // reply to a PREVIOUS request can still land after this clear; the
-    // corr_id match below discards it instead of returning it as the current reply.
+    // Fresh accumulator for this exchange (single in-flight, like USB). A late reply
+    // to a PREVIOUS request may still land; the corr_id match below discards it.
     rx_.clear();
 
-    // WriteValue(ay value, a{sv} options) in <= WRITE_MAX slices: BlueZ rejects
-    // a single write above the 512-byte GATT attribute limit with
-    // InvalidValueLength, and OTA sideload / upload-URL frames are far larger.
-    // The device reassembles the REQUEST by the 12-byte header's len field;
-    // the sequential sync calls keep the slices ordered.
+    // WriteValue in <=WRITE_MAX slices: BlueZ rejects writes past the 512-byte GATT
+    // limit (InvalidValueLength) and OTA/upload-URL frames are far larger. The device
+    // reassembles by the header len field; sequential sync calls keep slices ordered.
     for (size_t off = 0; off < frame.size(); off += WRITE_MAX) {
         size_t n = frame.size() - off;
         if (n > WRITE_MAX) n = WRITE_MAX;
@@ -436,10 +419,9 @@ Status BleConnection::request_raw(const std::string& payload, std::string& out,
         g_variant_unref(r);
     }
 
-    // Reassemble frames from notifications (header carries len) and accept only
-    // the RESPONSE/ERROR whose corr_id matches THIS request, the same stale
-    // reply / EVENT skipping the USB path does (usb_connection.cpp). Complete
-    // non-matching frames are dropped from the front of the accumulator.
+    // Reassemble frames from notifications (header carries len); accept only the
+    // RESPONSE/ERROR whose corr_id matches THIS request (same stale-reply/EVENT
+    // skipping as the USB path). Non-matching complete frames are dropped up front.
     bool bad = false;
     auto have_match = [&]() -> bool {
         for (;;) {
@@ -471,12 +453,9 @@ Status BleConnection::request_raw(const std::string& payload, std::string& out,
     return Status::SUCCESS;
 }
 
-// One-shot LE scan for M1 peripherals: StartDiscovery on the default adapter,
-// wait, then walk ObjectManager for Device1 objects advertising the Efference
-// Control Service UUID. Static: needs no open connection (used by
-// Device::get_device_list). The system Bluetooth daemon does the scanning; only
-// sync calls are needed here, so no main-context pumping (and no thread-default
-// push) is required.
+// One-shot LE scan for M1 peripherals: StartDiscovery, wait, then walk ObjectManager
+// for Device1 objects advertising the Control Service UUID. Static, no open connection
+// (Device::get_device_list). The bluez daemon scans, so sync calls only, no pumping.
 std::vector<BleScanEntry> BleConnection::scan(uint32_t scan_ms, int verbose) {
     std::vector<BleScanEntry> found;
     GError* e = nullptr;

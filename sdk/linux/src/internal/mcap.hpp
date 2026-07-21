@@ -21,18 +21,17 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 //
-// The wire/topic layout deliberately mirrors the on-device recorder, so a
-// host-side recording and a device-local recording are the same file format:
+// Wire/topic layout mirrors the on-device recorder, so host and device-local
+// recordings share one file format:
 //
 //   /camera/color/0/image        foxglove.CompressedVideo (protobuf)
 //   /camera/color/0/image_raw    foxglove.RawImage        (protobuf, nv12)
 //   /camera/imu/0/accel/sample   foxglove.PoseInFrame     (position = m/s^2)
 //   /camera/imu/0/gyro/sample    foxglove.PoseInFrame     (position = rad/s)
 //
-// Files are written unchunked / uncompressed with no summary section, exactly
-// like the device recorder (which sets noChunking + Compression::None), which
-// is what keeps the reader below small: it only has to walk top-level
-// Schema/Channel/Message records (plus uncompressed Chunk records for safety).
+// Written unchunked/uncompressed with no summary (device uses noChunking +
+// Compression::None), so the reader only walks top-level Schema/Channel/Message
+// records (plus uncompressed Chunk records for safety).
 //
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -94,9 +93,9 @@ private:
 };
 
 // ---- reader -------------------------------------------------------------------
-// Sequential top-level record walker; uncompressed Chunk records are unpacked
-// in place, compressed ones fail the read (the device/host writers never emit
-// them). next() returns false at Footer/EOF/parse error.
+// Sequential top-level record walker: uncompressed Chunks unpacked in place,
+// compressed ones fail the read (writers never emit them). next() returns false
+// at Footer/EOF/parse error.
 class Reader {
 public:
     ~Reader() { close(); }
@@ -114,8 +113,8 @@ public:
 
 private:
     std::FILE*           fp_ = nullptr;
-    // Current uncompressed chunk, parsed lazily one sub-record per next() so a
-    // large chunk isn't duplicated whole into a separate record list.
+    // Current uncompressed chunk, parsed lazily one sub-record per next() (never
+    // duplicated whole into a separate record list).
     std::vector<uint8_t> chunk_;
     size_t               chunk_pos_ = 0;   // cursor into chunk_ (next sub-record)
     size_t               chunk_end_ = 0;   // end of the sub-record stream in chunk_

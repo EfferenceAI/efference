@@ -95,10 +95,9 @@ Status StreamReader::start(int device_index, bool want_video, bool want_imu,
     int imu_iso_sz = 0;
     if (iface_ >= 0) {
         iso_sz_ = libusb_get_max_iso_packet_size(dev, video_ep_);
-        // The IMU endpoint's isoc packet is tiny (~1 KB/interval, one ef_stream
-        // IMU batch). It MUST get its own size; reusing the video endpoint's
-        // 32 KB packet size makes every IMU transfer exceed ep4's max packet, so
-        // the host controller never completes them (timeouts, imu=0).
+        // The IMU endpoint's isoc packet is tiny (~1 KB, one ef_stream IMU batch) and
+        // MUST get its own size: reusing the video ep's 32 KB size overruns ep4's max
+        // packet, so the host controller never completes IMU transfers (timeouts, imu=0).
         if (imu_ep_) imu_iso_sz = libusb_get_max_iso_packet_size(dev, imu_ep_);
     }
     libusb_free_config_descriptor(cfg);

@@ -32,13 +32,12 @@
 namespace ef {
 namespace internal {
 
-// Replays a recording (host HostRecorder file or a downloaded device-local
-// session, same format, see mcap.hpp) through the shared StreamAssembler so
-// grab()/retrieve_image()/retrieve_imu() behave exactly as on a live session.
-// A playback thread walks the Message records, paces them by log_time, and
-// feeds synthesized ef_stream packets into on_packet(); accel/gyro
-// PoseInFrame pairs are re-joined into ImuSamples. End of file surfaces as
-// END_OF_STREAM from grab() (mark_ended), like a transport loss on a live run.
+// Replays a recording (host or downloaded device-local session, same format;
+// see mcap.hpp) through the shared StreamAssembler so grab()/retrieve_*()
+// behave as on a live session. A playback thread walks Message records, paces
+// them by log_time, and feeds synthesized ef_stream packets into on_packet();
+// accel/gyro PoseInFrame pairs are re-joined into ImuSamples. EOF surfaces as
+// END_OF_STREAM from grab() (mark_ended), like transport loss on a live run.
 class McapReplayReader : public StreamAssembler {
 public:
     McapReplayReader() = default;

@@ -51,12 +51,10 @@ uint64_t rd64(const uint8_t* p) {
 float rdf(const uint8_t* p) { float f; std::memcpy(&f, p, 4); return f; }
 
 // Does this encoded access unit begin an IDR/IRAP keyframe? Walks the leading
-// Annex-B NAL units (this encoder prepends VPS/SPS/PPS to every IDR) and returns
-// true on the first keyframe-class NAL. codec: 1 = H264, 2 = H265. Bounded scan
-// (a handful of byte comparisons): only the first few NAL headers are inspected,
-// never the frame body, so the cost is negligible even at 60 fps. Handles both
-// 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes. The 4-byte form
-// contains the 3-byte pattern one byte in, which the scan lands on.
+// Annex-B NAL units (encoder prepends VPS/SPS/PPS to every IDR), returns true on the
+// first keyframe-class NAL. codec: 1=H264, 2=H265. Bounded scan of the first few NAL
+// headers only (negligible at 60 fps). Handles 3- and 4-byte start codes (the 4-byte
+// form contains the 3-byte pattern one byte in, which the scan lands on).
 bool is_keyframe(const uint8_t* d, size_t n, int codec) {
     int scanned = 0;
     for (size_t i = 0; i + 3 < n && scanned < 16; ) {
@@ -103,11 +101,10 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
 
     if (type == kTypeVideo) {
         if (len < kVidHdr) return;
-        // Wire loss detection: the common header seq (b+4) is a per-stream
-        // monotonic packet counter. A gap means a video packet was dropped in
-        // transit -> tell the transport (it may request a keyframe / PLI). This
-        // runs on the single transport thread, so last_vseq_ needs no lock; call
-        // on_loss() BEFORE taking vmtx_ so the override never runs under the video mutex.
+        // Wire loss detection: header seq (b+4) is a per-stream monotonic packet
+        // counter; a gap means a dropped video packet -> tell the transport (may
+        // request a keyframe/PLI). Single transport thread, so last_vseq_ needs no
+        // lock; call on_loss() BEFORE vmtx_ so the override never runs under it.
         uint32_t seq = rd32(b + 4);
         if (have_vseq_ && seq != (uint32_t)(last_vseq_ + 1)) {
             resync_pending_ = true;   // withhold P-frames until the next IDR
@@ -155,17 +152,16 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
                     vmeta_[reasm_].size     = cur_size_;
                     vmeta_[reasm_].complete = (cur_accum_ == cur_size_);
 
-                    // A supersede (consumer never grabbed the last ready_, e.g.
-                    // vsync-throttled while a consumer stalled) breaks the reference
-                    // chain for whatever it grabs next, so enter resync.
+                    // A supersede (consumer never grabbed the last ready_, e.g. vsync
+                    // throttled while stalled) breaks the reference chain for whatever
+                    // it grabs next, so enter resync.
                     if (ready_ != -1) { superseded = true; resync_pending_ = true; }
 
-                    // Drop-until-IDR gate (encoded streams only). While resync is
-                    // pending, withhold every frame from the consumer until an
-                    // IDR/IRAP arrives, never feed the decoder an orphaned
-                    // P-frame (the source of the "Could not find ref with POC"
-                    // spam). An incomplete frame never clears the gate. RAW/MJPEG
-                    // (codec 0) is intra/independent → never gated.
+                    // Drop-until-IDR gate (encoded streams only). While resync pending,
+                    // withhold every frame until an IDR/IRAP arrives, never feed the
+                    // decoder an orphaned P-frame ("Could not find ref with POC" spam).
+                    // Incomplete frames never clear it; RAW/MJPEG (codec 0) is intra,
+                    // never gated.
                     int  codec = vcodec_.load(std::memory_order_relaxed);
                     bool gated = false;
                     if (codec != 0 && resync_pending_) {
@@ -190,10 +186,9 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
                 in_frame_ = false;
             }
         }
-        // Request a fresh keyframe (PLI) after a supersede or while gated, so the
-        // decoder resyncs quickly. Called OUTSIDE the video mutex; UDP overrides
-        // on_loss(), USB isoc (no back channel) leaves it a no-op. need_pli keeps
-        // the request flowing on every withheld frame until the IDR lands.
+        // Request a fresh keyframe (PLI) after a supersede or while gated. Called
+        // OUTSIDE the video mutex; UDP overrides on_loss(), USB isoc (no back channel)
+        // is a no-op. need_pli keeps requesting on every withheld frame until the IDR.
         if (superseded || need_pli) on_loss();
     } else if (type == kTypeImu) {
         if (len < kImuHdr) return;

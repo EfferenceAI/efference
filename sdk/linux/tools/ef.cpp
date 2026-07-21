@@ -90,9 +90,8 @@ int fail(ERROR_CODE ec, const char* what) {
 
 void print_info(const DeviceInformation& i) {
     std::printf("serial           : %s\n", i.serial.c_str());
-    // serial_number is only the numeric convenience form of `serial`; it is 0
-    // for any non-decimal serial (e.g. "M1BENCH002"). Show it only when it
-    // actually carries information, so it isn't mistaken for a second identity.
+    // serial_number is the numeric form of `serial`, 0 for non-decimal serials
+    // (e.g. "M1BENCH002"). Show it only when set, so it reads as one identity.
     if (i.serial_number != 0)
         std::printf("serial_number    : %u\n", i.serial_number);
     std::printf("model            : %s\n", to_string(i.model));
@@ -148,9 +147,8 @@ bool parse_location(const std::string& s, Location& loc) {
     return true;
 }
 
-// show_target: print the DEVICE_LOCAL/HOST_FILE column. Meaningful for
-// `record status` (a live host recording reads HOST_FILE); pointless for
-// `record list`, whose entries are always DEVICE_LOCAL.
+// show_target: print the DEVICE_LOCAL/HOST_FILE column. Meaningful for `record
+// status`; pointless for `record list` (entries are always DEVICE_LOCAL).
 void print_recording(const RecordingStatus& r, bool show_target = true) {
     std::printf("%-24s ", r.name.c_str());
     if (show_target) std::printf("%-12s ", to_string(r.target));
@@ -456,9 +454,8 @@ int main(int argc, char** argv) {
                 else
                     std::puts("connecting...");
             } else if (w.wifi_state == "connected" || w.wifi_connected) {
-                // Append only the detail the device actually reported, older
-                // firmware leaves security/freq/link_speed/rssi at ""/0, and those
-                // just drop out of the line (no wire-format dependency).
+                // Append only the detail the device reported; older firmware
+                // leaves security/freq/link_speed/rssi at ""/0, which drop out.
                 std::string x;
                 if (!w.wifi_security.empty()) x += ", " + w.wifi_security;
                 if (w.wifi_freq_mhz > 0)

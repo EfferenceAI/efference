@@ -71,9 +71,8 @@ enum class ERROR_CODE : int {
     UNKNOWN_FAILURE = 100               // Unclassified failure.
 };
 
-// Explicit values on every public enum below: consumers persist and serialize
-// these (recordings, config files, IPC), so the numbering is ABI and must stay
-// stable; append new members, never renumber or reorder existing ones.
+// Explicit values: consumers persist/serialize these (recordings, config, IPC),
+// so the numbering is ABI. Append new members; never renumber or reorder.
 
 enum class MODEL {
     M1 = 0,
@@ -131,9 +130,8 @@ enum class VIEW {
     NV12 = 5,  // NV12
 };
 
-// Device lifecycle state. There is no UNKNOWN state: an unreadable state
-// surfaces as an ERROR_CODE on the call that hit it, and get_state() keeps
-// returning the last known value.
+// Device lifecycle state. No UNKNOWN: an unreadable state surfaces as an
+// ERROR_CODE on the call that hit it; get_state() keeps the last known value.
 enum class DEVICE_STATE {
     CLOSED    = 0,  // Device is detected but not open.
     IDLE      = 1,  // Device is open but not moving data.

@@ -25,10 +25,9 @@
 
 namespace ef {
 
-// The transport / reader internals return ef::Status, the fine-grained internal
-// result set. Status left the public headers when the API became ERROR_CODE-only,
-// so it lives here and device.cpp translates it to ERROR_CODE; nothing above that
-// layer speaks Status.
+// Fine-grained internal result set for transport/reader internals. Left the
+// public headers when the API became ERROR_CODE-only; device.cpp translates it
+// to ERROR_CODE and nothing above that layer speaks Status.
 enum class Status : int {
     SUCCESS             = 0,
     DEVICE_NOT_FOUND    = 1,

@@ -39,11 +39,10 @@ constexpr uint8_t  kIfSubClass   = 0xEF;
 constexpr uint8_t  kIfProtoSdk   = 0x03;
 constexpr unsigned kTimeoutMs    = 2000;
 
-// Locate the FF/EF/03 interface + its bulk endpoint addresses. The control IN
-// (ep2) is the FIRST bulk IN; the MCAP stream IN (ep3, M0+) is the SECOND, in
-// descriptor order, matching the firmware's descriptor layout. ep_stream is 0
-// on pre-M0 firmware that exposes only the control IN. Addresses are read from
-// the descriptors (they shift when ADB also enumerates), never hard-coded.
+// Locate the FF/EF/03 interface + its bulk endpoint addresses. In descriptor order
+// the 1st bulk IN is control (ep2), the 2nd is the MCAP stream (ep3, M0+); ep_stream
+// stays 0 on pre-M0 firmware. Read from descriptors (they shift when ADB enumerates),
+// never hard-coded.
 int find_sdk_iface(libusb_device* dev, int* iface, uint8_t* ep_out,
                    uint8_t* ep_in, uint8_t* ep_stream) {
     libusb_config_descriptor* cfg = nullptr;
@@ -147,11 +146,10 @@ Status UsbConnection::open(int device_index, int verbose) {
         return ec;
     }
 
-    // Drain any bytes the endpoint left queued from a previous process (a reply
-    // that was never read, or a stale EVENT). Our per-connection corr counter
-    // restarts at 0 each open, so a leftover frame could otherwise collide with
-    // a fresh request's corr id and be mistaken for its reply. Short-timeout
-    // reads until the pipe is empty.
+    // Drain bytes the endpoint left queued from a previous process (unread reply or
+    // stale EVENT): corr restarts at 0 each open, so a leftover frame could collide
+    // with a fresh request's corr id and be mistaken for its reply. Short-timeout
+    // reads until empty.
     {
         uint8_t sink[4096];
         for (int i = 0; i < 64; ++i) {
@@ -206,11 +204,10 @@ Status UsbConnection::request_raw(const std::string& payload, std::string& out,
     if (rc < 0) return Status::USB_ERROR;
     if (verbose_) fprintf(stderr, "[ef] sent %d B (corr=%u)\n", sent, corr);
 
-    // Read frames until we get the RESPONSE/ERROR whose corr_id matches THIS
-    // request. The endpoint may leave a stale reply in the pipe (a prior call
-    // that timed out) or push an unsolicited EVENT frame; without matching, a
-    // control call can return the wrong frame's payload. `acc` may hold more
-    // than one coalesced frame, so we frame-extract from it before reading more.
+    // Read frames until the RESPONSE/ERROR whose corr_id matches THIS request. A
+    // stale reply (prior timed-out call) or unsolicited EVENT could otherwise return
+    // the wrong payload. `acc` may hold multiple coalesced frames, so extract from it
+    // before reading more.
     std::vector<uint8_t> acc;
     acc.reserve(proto::MAX_FRAME);
     uint8_t chunk[4096];

@@ -331,9 +331,8 @@ bool Reader::next(Record* out) {
             uint64_t rlen = rd64(p);
             p += 8; left -= 8;
             if (rlen > left || !uncompressed) return false;   // zstd/lz4: unsupported
-            // Keep the chunk body and remember the sub-record window; next()
-            // parses one sub-record at a time from it (no bulk duplication).
-            // Capture the offset before the move invalidates `p`.
+            // Keep the chunk body; next() serves one sub-record at a time from
+            // [rec_off, rec_off+rlen). Grab the offset before move invalidates p.
             const size_t rec_off = (size_t)(p - r.body.data());
             chunk_     = std::move(r.body);
             chunk_pos_ = rec_off;

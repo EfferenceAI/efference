@@ -144,17 +144,16 @@ struct DeviceInformation {
 };
 
 
-// One frame of image data plus the metadata needed to interpret it. Fields are
-// private so the buffer's layout invariants (step/size vs resolution/type) always
-// hold; the SDK (Device) is a friend and the sole producer, while consumers read
-// through the accessors. Owns its buffer; copy and assignment are deep.
+// One frame of image data plus the metadata to interpret it. Owns its buffer
+// (deep copy/assign). Fields are private to preserve layout invariants; Device
+// is the sole producer, consumers read through the accessors.
 class Mat {
 public:
     Mat() = default;
 
-    // Allocate a CPU buffer for (width x height) of the given layout, computing
-    // step and size from the type. MEM::GPU returns UNSUPPORTED; a zero/negative
-    // extent returns INVALID_FUNCTION_CALL.
+    // Allocate a CPU buffer for (width x height) of the given layout (step/size
+    // derived from type). MEM::GPU returns UNSUPPORTED; a zero/negative extent
+    // returns INVALID_FUNCTION_CALL.
     ERROR_CODE alloc(int width, int height, MAT_TYPE type, MEM mem = MEM::CPU);
 
     // Release the buffer; the Mat becomes uninitialised (isInit() == false).

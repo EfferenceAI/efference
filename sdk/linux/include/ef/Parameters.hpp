@@ -31,9 +31,9 @@
 
 namespace ef {
 
-// Passed to open(): transport + the session configuration. Validated against
-// the device's advertised capabilities at open(); an unsupported combination
-// fails with INVALID_RESOLUTION / INVALID_FPS / UNSUPPORTED_COMPRESSION.
+// Passed to open(): transport + session configuration. Validated against the
+// device's capabilities; unsupported combos fail with INVALID_RESOLUTION /
+// INVALID_FPS / UNSUPPORTED_COMPRESSION.
 class InitParameters {
 public:
     // ---- transport ----------------------------------------------------------
@@ -42,10 +42,9 @@ public:
     std::string mcap_path;      // required when input_type == MCAP (replay)
     int device_id = 0;  // which M1 when several are attached over USB
 
-    // STREAM only: BLE carries control while the device pushes video+IMU to
-    // this host over WiFi/UDP. udp_host is this machine's IP as the device can
-    // reach it (the device cannot infer it over BLE). Leave udp_host empty for
-    // a control-only BLE session (device sits in IDLE).
+    // STREAM only: BLE carries control while the device pushes video+IMU over
+    // WiFi/UDP to udp_host (this machine's IP as the device sees it; it can't
+    // infer it over BLE). Empty udp_host = control-only BLE session (stays IDLE).
     std::string udp_host;
     uint16_t    udp_port = 5005;
     std::string ble_password = "123456";   // BLE control password (factory default)
@@ -86,10 +85,9 @@ public:
     // "rec_<utc>_<seq>"). The recording survives host disconnect.
     std::string name;
 
-    // Optional per-session location override: when set, this recording's
-    // LocationFix uses `location` instead of the device's persistent/default
-    // location. Does not change the persistent default (use Device::set_location
-    // for that).
+    // Optional per-session location override: when set, this recording uses
+    // `location` instead of the persistent/default. Does not change the default
+    // (use Device::set_location for that).
     bool     has_location = false;
     Location location;
 };

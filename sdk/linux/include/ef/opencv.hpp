@@ -20,14 +20,12 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-// OpenCV interop (OPTIONAL, header-only). The core SDK (libef) does NOT depend
-// on OpenCV; include this header only in code that already links OpenCV. It lets
-// you hand a grabbed frame straight to OpenCV for display (cv::imshow) or
-// processing.
+// OpenCV interop (OPTIONAL, header-only). The core SDK (libef) does NOT depend on
+// OpenCV; include this only in code that already links it. Lets you hand a grabbed
+// frame straight to OpenCV for display or processing.
 //
-// Ask retrieve_image() for VIEW::BGR (or VIEW::BGRA) and the returned cv::Mat is
-// display-ready with no color conversion; the SDK already color-converts on
-// the decode path, and BGR is OpenCV's native channel order.
+// Ask retrieve_image() for VIEW::BGR (or BGRA) and the returned cv::Mat is
+// display-ready: the SDK color-converts on decode, and BGR is OpenCV's native order.
 //
 //   ef::Mat frame;
 //   dev.retrieve_image(frame, ef::VIEW::BGR);
@@ -43,9 +41,8 @@
 
 namespace ef {
 
-// Map an ef::Mat pixel layout to the matching OpenCV type code.
-// NV12 is a single 8-bit plane (Y) followed by interleaved UV at half height, so
-// it is wrapped as CV_8UC1 with 1.5x the rows (see toCvMat below).
+// Map an ef::Mat pixel layout to the matching OpenCV type code. NV12 (Y plane +
+// interleaved UV at half height) is wrapped as CV_8UC1 with 1.5x rows (see toCvMat).
 inline int cvTypeOf(MAT_TYPE type) {
     switch (type) {
         case MAT_TYPE::U8_C1: return CV_8UC1;
@@ -56,10 +53,9 @@ inline int cvTypeOf(MAT_TYPE type) {
     return CV_8UC1;
 }
 
-// Zero-copy cv::Mat view over an ef::Mat: both share the SAME pixel buffer, so
-// this is O(1) with no allocation. The returned cv::Mat is valid only while `m`
-// (and its buffer) stays alive and unmodified; call .clone() if you need to own
-// the pixels beyond the next grab().
+// Zero-copy cv::Mat view over an ef::Mat: both share the SAME buffer (O(1), no
+// alloc). Valid only while `m` stays alive and unmodified; .clone() to keep the
+// pixels beyond the next grab().
 //
 // VIEW::BGR  -> CV_8UC3, ready for cv::imshow.
 // VIEW::BGRA -> CV_8UC4, ready for cv::imshow.

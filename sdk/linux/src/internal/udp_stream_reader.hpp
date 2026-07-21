@@ -32,11 +32,10 @@
 namespace ef {
 namespace internal {
 
-// WiFi data-plane reader. Binds a UDP socket and feeds each received datagram to
-// the shared StreamAssembler. The device multiplexes video + IMU onto one UDP
-// flow (it demuxes by the ef_stream packet type), so a single bound port carries
-// both. The control plane (which told the device to stream here) is USB or BLE
-// and is independent of this reader.
+// WiFi data-plane reader. Binds a UDP socket and feeds each datagram to the shared
+// StreamAssembler. The device muxes video + IMU onto one flow (demuxed by ef_stream
+// packet type), so one bound port carries both. The control plane (which pointed the
+// device here) is USB or BLE, independent of this reader.
 class UdpStreamReader : public StreamAssembler {
 public:
     UdpStreamReader() = default;

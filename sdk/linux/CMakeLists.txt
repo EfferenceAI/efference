@@ -28,6 +28,11 @@ set(EF_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../proto)
 set(EF_NANOPB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb)
 add_library(ef
     src/device.cpp
+    src/device_stream.cpp
+    src/device_recording.cpp
+    src/device_ota.cpp
+    src/device_system.cpp
+    src/enums.cpp
     src/mat.cpp
     src/usb_connection.cpp
     src/stream_assembler.cpp
@@ -45,7 +50,9 @@ add_library(ef::ef ALIAS ef)
 target_include_directories(ef
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:include>
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${EF_PROTO_DIR} ${EF_NANOPB_DIR}
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/internal
+            ${EF_PROTO_DIR} ${EF_NANOPB_DIR}
 )
 target_link_libraries(ef PRIVATE PkgConfig::LIBUSB)
 target_compile_features(ef PUBLIC cxx_std_17)

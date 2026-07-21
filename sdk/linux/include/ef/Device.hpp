@@ -21,18 +21,16 @@
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Contract:
-//   - open() claims the device, validates the requested config, and aligns the
-//     device clock with the host (sync_time()). The data plane then starts
-//     lazily on the first grab() for a live transport (USB, or STREAM = BLE
-//     control + WiFi/UDP data when InitParameters::udp_host is set), so grab()
-//     works immediately after open(); MCAP replay uses the file as the source.
-//     Over Bluetooth without udp_host (control plane only) the device stays
-//     IDLE and there is no data plane to grab().
-//   - Calls that touch the wire return ERROR_CODE; data comes back through
-//     `out` parameters. get_* methods without an ERROR_CODE never block:
-//     they return values cached at open() or after the last completed call.
-//   - Illegal calls for the current DEVICE_STATE return
-//     ERROR_CODE::INVALID_FUNCTION_CALL without touching the device.
+//   - open() claims the device, validates the config, and syncs the device clock
+//     to the host. The data plane starts lazily on the first grab() for a live
+//     transport (USB, or STREAM = BLE control + WiFi/UDP data when udp_host is
+//     set); MCAP replay reads from the file. Control-only BLE (no udp_host) stays
+//     IDLE with no data plane to grab().
+//   - Calls that touch the wire return ERROR_CODE; data comes back via `out`
+//     params. get_* methods without an ERROR_CODE never block, returning values
+//     cached at open() or the last completed call.
+//   - Illegal calls for the current DEVICE_STATE return INVALID_FUNCTION_CALL
+//     without touching the device.
 //
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -84,9 +82,8 @@ public:
     HealthStatus get_health_status() const;
 
     ERROR_CODE enable_recording(RecordingParameters params);
-    // Stops the active recording. A host-file recording always stops cleanly
-    // (SUCCESS). For a device-local recording this returns the device's result:
-    // INVALID_FUNCTION_CALL if nothing was recording (stop-when-idle).
+    // Stops the active recording. Host-file always stops cleanly (SUCCESS);
+    // device-local returns the device's result (INVALID_FUNCTION_CALL if idle).
     ERROR_CODE disable_recording();
     RecordingParameters get_recording_parameters() const;
 
@@ -129,9 +126,9 @@ public:
     // returned Timestamp is the device CLOCK_REALTIME at the time of the reply.
     ERROR_CODE get_device_time(Timestamp& out);
 
-    // Persist the device's geographic location to session_meta.json (replaces the
-    // built-in default). Every subsequent recording's LocationFix uses it until
-    // changed. For a one-off, use RecordingParameters::location instead.
+    // Persist the device location to session_meta.json (replaces the default);
+    // every subsequent recording uses it until changed. For a one-off, use
+    // RecordingParameters::location instead.
     ERROR_CODE set_location(double latitude, double longitude,
                             double altitude = 0.0, double covariance_diag = 0.0);
     // Read the device's current effective location (session_meta.json if present,
@@ -140,11 +137,10 @@ public:
 
     ERROR_CODE reboot();
 
-    // Persist the device's capture configuration (resolution/fps/codec). Applied
-    // in IDLE only; the device refuses it while streaming/recording, so it never
-    // disrupts a live session. A rejected value reports INVALID_RESOLUTION,
-    // INVALID_FPS, or UNSUPPORTED_COMPRESSION; the enabled modes come from
-    // get_device_information().capabilities.
+    // Persist the capture config (resolution/fps/codec). IDLE only; refused while
+    // streaming/recording, so it never disrupts a live session. Rejected values
+    // report INVALID_RESOLUTION/INVALID_FPS/UNSUPPORTED_COMPRESSION; enabled modes
+    // come from get_device_information().capabilities.
     ERROR_CODE set_configuration(int width, int height, int fps,
                                  COMPRESSION_MODE codec);
 

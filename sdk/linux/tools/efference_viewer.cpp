@@ -129,10 +129,9 @@ int main(int argc, char** argv) {
         cv::Mat frame = ef::toCvMat(image);
         if (frame.empty()) continue;
 
-        // Status bar ABOVE the video (so text never covers the image): a dark
-        // strip the width of the frame, with the live frame + IMU readout
-        // centered in it. vconcat copies into a fresh canvas, so the SDK's frame
-        // buffer is left untouched.
+        // Status bar ABOVE the video (never covers the image): a dark strip the
+        // frame's width with the frame + IMU readout centered. vconcat copies to
+        // a fresh canvas, so the SDK's frame buffer is untouched.
         char hud[256];
         std::snprintf(hud, sizeof hud,
                       "frame %u    accel[%+.2f %+.2f %+.2f] m/s^2    gyro[%+.2f %+.2f %+.2f] rad/s",
@@ -168,10 +167,9 @@ int main(int argc, char** argv) {
         // makes the window actually paint, so it must run every frame.
         int key = cv::waitKey(1);
         if (key == 27 || key == 'q' || key == 'Q') break;
-        // Detect the window being closed via its title-bar button, but only
-        // AFTER it has mapped once. The compositor may report the window not-yet
-        // visible on the first frame(s) (a startup race, esp. Wayland/XWayland),
-        // so latch on the first VISIBLE>=1 before trusting a later <1 as a close.
+        // Detect a title-bar close, but only AFTER the window maps once: the
+        // compositor may report not-yet-visible on the first frames (startup
+        // race, esp. Wayland), so latch VISIBLE>=1 before trusting a later <1.
         if (cv::getWindowProperty(kWindow, cv::WND_PROP_VISIBLE) >= 1) window_shown = true;
         else if (window_shown) break;
     }
