@@ -1,0 +1,2 @@
+# ef-smoke-test.sh capture artifacts (regenerated each run, fixed names)
+efsmoke_grab.*

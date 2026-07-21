@@ -1,0 +1,381 @@
+// ef.proto: Efference SDK control protocol (v1)
+//
+// Single source of truth for the control plane. Generated to:
+//   - device: nanopb (static, no malloc), vendored runtime + nanopb_generator
+//   - host:   protobuf C++ (and later Python)
+// Carried as the payload AFTER the 12-byte wire header
+//   (magic=0xEF, version, type{1=REQ,2=RESP,3=ERR,4=EVENT-reserved}, flags, corr_id u32, len u32).
+//
+// Evolution: ADDITIVE ONLY, new field numbers only, never renumber/reuse, `reserved`
+// for removals; `protocol_version` (DeviceInformation) negotiates. type=4 EVENT is
+// reserved (skip-don't-crash); v1 is strictly request/response (Start* -> poll Get*Status).
+
+syntax = "proto3";
+package ef.v1;
+
+// ============================ Envelope ============================
+message Request {
+  uint32 corr_id = 1;
+  oneof body {
+    // device / stream core
+    GetDeviceInformation get_device_information = 10;
+    Configure            configure              = 11;
+    StartStream          start_stream           = 12;
+    StopStream           stop_stream            = 13;
+    SelectTransfer       select_transfer        = 14;
+    GetStreamStatus      get_stream_status      = 15;
+    SetSetting           set_setting            = 16;
+    GetSetting           get_setting            = 17;
+    // recording
+    StartRecording       start_recording        = 20;
+    StopRecording        stop_recording         = 21;
+    GetRecordingStatus   get_recording_status   = 22;
+    ListRecordings       list_recordings        = 23;
+    DeleteRecording      delete_recording       = 24;
+    DownloadRecording    download_recording     = 25;  // pull a recorded .mcap to the host over the control plane (USB/BLE, no WiFi)
+    // upload
+    StartUpload          start_upload           = 30;
+    StopUpload           stop_upload            = 31;
+    GetUploadStatus      get_upload_status      = 32;
+    // chunked upload (option b: app orchestrates via mTLS, device is a PUT-worker)
+    GetSessionManifest   get_session_manifest    = 33;
+    PutChunks            put_chunks              = 34;
+    GetChunkUploadStatus get_chunk_upload_status = 35;
+    // OTA (mirrors the real download/apply phases; wraps the device OTA)
+    OtaCheck             ota_check              = 40;
+    OtaDownload          ota_download           = 41;
+    OtaApply             ota_apply              = 42;
+    OtaAbort             ota_abort              = 43;
+    GetOtaStatus         get_ota_status         = 44;
+    SetOtaConfig         set_ota_config         = 45;
+    // OTA push (host -> device relay of a self-contained .eff, for no-WiFi updates)
+    OtaPushBegin         ota_push_begin         = 46;  // announce {name,total}; open + storage pre-check
+    OtaPushChunk         ota_push_chunk         = 47;  // BLE path: {offset,data<=7KB,eof}
+    OtaPushEnd           ota_push_end           = 48;  // USB path: raw bulk-ep stream complete
+    // health
+    StartHealthCheck     start_health_check     = 50;
+    GetHealthStatus      get_health_status      = 51;
+    // wifi
+    WifiScan             wifi_scan              = 60;
+    WifiAdd              wifi_add               = 61;
+    WifiRemove           wifi_remove            = 62;
+    WifiList             wifi_list              = 63;
+    StartWifiCheck       start_wifi_check       = 64;
+    GetWifiStatus        get_wifi_status        = 65;
+    WifiSelect           wifi_select            = 66;
+    // time / system
+    SetTime              set_time               = 70;
+    TimeSync             time_sync              = 71;
+    Heartbeat            heartbeat              = 72;
+    Reboot               reboot                 = 73;
+    GetStorage           get_storage            = 74;
+    GetState             get_state              = 75;
+    SetLocation          set_location           = 76;  // persist device location on the device
+    GetLocation          get_location           = 77;  // read current effective device location
+    // auth / access control (BLE password is user-facing)
+    GetAuthChallenge     get_auth_challenge     = 92;  // device -> nonce (BLE auth handshake)
+    Authenticate         authenticate           = 93;  // prove the BLE password (HMAC over nonce)
+    SetBlePassword       set_ble_password       = 94;  // set/rekey; USB path may reset w/o old
+  }
+  reserved 90, 91, 95;
+}
+
+message Response {
+  uint32    corr_id = 1;
+  ErrorCode code    = 2;
+  string    message = 3;
+  oneof body {
+    DeviceInformation device_information = 10;
+    StreamStatus      stream_status      = 12;
+    SettingValue      setting_value      = 17;
+    RecordingStatus   recording_status   = 20;
+    RecordingList     recording_list     = 23;
+    RecordingChunk    recording_chunk    = 25;  // reply to DownloadRecording (file bytes at offset)
+    UploadStatus      upload_status      = 30;
+    SessionManifest   session_manifest    = 33;
+    ChunkUploadStatus chunk_upload_status = 34;
+    OtaStatus         ota_status         = 40;
+    HealthStatus      health_status      = 50;
+    WifiScanResult    wifi_scan_result   = 60;
+    WifiListResult    wifi_list_result   = 63;
+    WifiStatus        wifi_status        = 65;
+    TimeSyncReply     time_sync_reply    = 71;
+    StorageInfo       storage_info       = 74;
+    StateInfo         state_info         = 75;
+    Location          location           = 76;  // reply to GetLocation
+    AuthChallenge     auth_challenge     = 92;  // reply to GetAuthChallenge
+  }
+  reserved 95;
+}
+
+// ============================ Errors (shared device<->host; need-basis) ============================
+enum ErrorCode {
+  SUCCESS                  = 0;
+  FAILURE                  = 1;
+  NOT_OPENED               = 2;
+  INVALID_PARAMETER        = 3;
+  CAMERA_UNAVAILABLE       = 4;
+  BANDWIDTH_EXCEEDED       = 5;
+  UNSUPPORTED              = 6;
+  BUSY                     = 7;
+  TIMEOUT                  = 8;
+  NOT_SUPERSPEED           = 9;
+  CORRUPTED_FRAME          = 10;
+  ORCHESTRATOR_UNREACHABLE = 11;
+  INVALID_STATE            = 12;
+  WIFI_NOT_CONNECTED       = 13;
+  NOT_FOUND                = 14;
+  STORAGE_FULL             = 15;
+  AUTH_REQUIRED            = 16;  // BLE: authenticate before this verb is honored
+  AUTH_FAILED              = 17;  // wrong password / bad challenge signature
+  ALREADY_EXISTS           = 18;  // name conflict (e.g. start a recording whose name already exists)
+}
+
+// ============================ Enums ============================
+enum Mode            { MODE_UNKNOWN = 0; ISO_LIVE = 1; BULK_COLLECT = 2; UVC = 3; }
+enum Transfer        { TRANSFER_UNKNOWN = 0; ISOC = 1; BULK = 2; }
+enum PixelFormat     { PIXFMT_UNKNOWN = 0; NV12 = 1; YUV422 = 2; }
+enum Codec           { CODEC_RAW = 0; H264 = 1; H265 = 2; MJPEG = 3; }
+enum StreamType      { STREAM_UNKNOWN = 0; VIDEO = 1; IMU = 2; }   // matches packet header `type`
+enum Protocol        { PROTO_UNKNOWN = 0; UDP = 1; TCP = 2; }
+enum RecordingTarget { REC_HOST_FILE = 0; REC_DEVICE_LOCAL = 1; }  // device-local writes an MCAP on the device
+enum UploadDest      { UPLOAD_DEST_UNKNOWN = 0; UPLOAD_CLOUD_URL = 1; UPLOAD_TO_HOST = 2; }
+enum UploadMode      { UPLOAD_AFTER_STOP = 0; UPLOAD_STREAMING = 1; }
+enum UploadState     { UPLOAD_IDLE = 0; UPLOAD_RUNNING = 1; UPLOAD_DONE = 2; UPLOAD_FAILED = 3; }
+enum HealthVerdict   { HV_UNKNOWN = 0; HV_PASS = 1; HV_FAIL = 2; HV_SKIP = 3; }
+enum Slot            { SLOT_UNKNOWN = 0; SLOT_A = 1; SLOT_B = 2; }
+enum OtaPhase {  // mirrors the device OTA phase codes (1-12)
+  OTA_UNKNOWN = 0; OTA_CHECKING = 1; OTA_AVAILABLE = 2; OTA_UPTODATE = 3;
+  OTA_DOWNLOADING = 4; OTA_VERIFYING = 5; OTA_READY = 6; OTA_APPLYING = 7;
+  OTA_REBOOTING = 8; OTA_SUCCESS = 9; OTA_ROLLEDBACK = 10; OTA_ERROR = 11; OTA_WARN = 12;
+}
+enum Setting {  // declared-but-stubbed v1
+  SETTING_UNKNOWN = 0; EXPOSURE = 1; GAIN = 2; WHITE_BALANCE = 3;
+  GAMMA = 4; NOISE_REDUCTION = 5; DISTORTION = 6; RATE_CONTROL = 7;
+}
+enum RateControl { RC_UNKNOWN = 0; RC_CBR = 1; RC_VBR = 2; RC_FIXQP = 3; }
+
+// ============================ Config ============================
+message VideoConfig {
+  uint32 width = 1; uint32 height = 2; uint32 fps = 3;   // 1920x1080x60
+  PixelFormat pixel_format = 4;                          // NV12 v1
+  Codec codec = 5;                                       // only meaningful in BULK_COLLECT
+  uint32 quality = 6;                                    // encoder quality 1-100 (0 = device default); HQ presets use a high value
+}
+message ImuConfig { bool enabled = 1; uint32 rate_hz = 2; uint32 accel_range_g = 3; uint32 gyro_range_dps = 4; }
+message Configure { Mode mode = 1; VideoConfig video = 2; ImuConfig imu = 3; }
+
+// ============================ Stream control ============================
+message StartStream  { Mode mode = 1; StreamTarget target = 2; }   // LOCAL (default) or ONLINE
+message StreamTarget {
+  enum Kind { LOCAL = 0; ONLINE = 1; }                             // LOCAL = back to host over USB
+  Kind     kind      = 1;
+  string   dest_host = 2;                                          // ONLINE: the SDK consumer host
+  uint32   dest_port = 3;
+  Protocol protocol  = 4;                                          // UDP for ONLINE live
+}
+message StopStream      {}
+message SelectTransfer  { Transfer transfer = 1; }                 // flip ep2 alt-setting (ISO<->BULK)
+message GetStreamStatus {}
+message StreamStatus {
+  Mode mode = 1; bool streaming = 2; Transfer transfer = 3; StreamTarget.Kind target = 4;
+  uint64 frames = 5; uint64 dropped = 6; uint32 fps_actual = 7; bool superspeed = 8;
+}
+
+// ============================ Settings (stubbed v1) ============================
+message SetSetting   { Setting setting = 1; double value = 2; }
+message GetSetting   { Setting setting = 1; }
+message SettingValue { Setting setting = 1; double value = 2; bool supported = 3; }
+
+// ============================ Recording ============================
+message StartRecording {
+  string name = 1;                          // empty => default "rec_<utc>_<seq>"
+  RecordingTarget target = 2;               // REC_HOST_FILE | REC_DEVICE_LOCAL
+  UploadSpec upload = 3;                     // optional auto-upload policy
+  Location location = 4;                     // optional per-session location override (this MCAP only)
+}
+message StopRecording      { string name = 1; }   // empty => current
+message GetRecordingStatus { string name = 1; }
+message RecordingStatus {
+  string name = 1; bool recording = 2; RecordingTarget target = 3;
+  uint64 bytes = 4; uint64 frames = 5; uint64 duration_ms = 6;
+}
+message ListRecordings  {}
+message RecordingList   { repeated RecordingStatus recordings = 1; }
+message DeleteRecording { string name = 1; }
+// Pull a device-local recording to the host over the control plane, mirroring the
+// OTA push (chunk-over-transport, no networking). Host loops offset->EOF; each reply
+// carries up to 7168 B of the .mcap plus the total size and an eof flag.
+message DownloadRecording { string name = 1; uint64 offset = 2; uint32 len = 3; }
+message RecordingChunk    { bytes  data = 1; uint64 total = 2; bool   eof = 3; }
+
+// ============================ Upload (device-driven) ============================
+message UploadSpec {
+  UploadDest dest          = 1;             // CLOUD_URL | TO_HOST
+  string     presigned_url = 2;             // when dest = CLOUD_URL
+  UploadMode mode          = 3;             // AFTER_STOP | STREAMING
+}
+message StartUpload     { string recording_name = 1; UploadSpec spec = 2; }
+message StopUpload      { string recording_name = 1; }
+message GetUploadStatus { string recording_name = 1; }
+message UploadStatus {
+  string recording_name = 1; UploadState state = 2;
+  uint64 bytes_sent = 3; uint64 bytes_total = 4; ErrorCode last_error = 5;
+}
+
+// ============================ Chunked upload (option b) ============================
+// The APP (BLE central) holds the ONLY mTLS cert and runs the app-side ingest protocol
+// (create/finalize/refresh-url). The DEVICE is a PUT-worker: it lists a session's
+// chunks (GetSessionManifest), receives pre-signed per-chunk URLs (PutChunks),
+// PUTs each chunk over WiFi (no cert), and reports per-chunk outcome
+// (GetChunkUploadStatus). Delete is app-gated (DeleteRecording after finalize).
+// URLs are ~1-2 KB; PutChunks is sent in small batches to stay under
+// EFR_PROTO_MAX_PAYLOAD (8192).
+message GetSessionManifest { string name = 1; }          // empty => current/last session
+message ChunkInfo   { uint32 index = 1; string filename = 2; uint64 size_bytes = 3; }
+message SessionManifest { string name = 1; repeated ChunkInfo chunks = 2; }
+
+message ChunkUrl  { uint32 index = 1; string url = 2; }  // one pre-signed PUT URL
+message PutChunks { string name = 1; repeated ChunkUrl urls = 2; }  // (re-)PUT these, over WiFi
+
+message ChunkResult          { uint32 index = 1; bool ok = 2; uint64 bytes_put = 3; ErrorCode error = 4; }
+message GetChunkUploadStatus { string name = 1; }
+message ChunkUploadStatus    { string name = 1; repeated ChunkResult results = 2; bool all_ok = 3; }
+
+// ============================ OTA (thin front-end over the device OTA) ============================
+// Thin front-end over the device OTA. Commit and rollback happen automatically
+// after boot; the host observes OTA_SUCCESS / OTA_ROLLEDBACK via OtaStatus.
+message OtaCheck     {}                      // fetch manifest+sig, ECC-verify, version-gate; no download
+message OtaDownload  { string base_url = 1; }// empty => configured OTA_BASE_URL; stages to inactive slot
+message OtaApply     {}                      // apply the staged (verified) download, then reboot
+message OtaAbort     {}                      // kill a running download (apply = point of no return)
+message GetOtaStatus {}
+message SetOtaConfig { string base_url = 1; uint32 max_retries = 2; bool stage_mode = 3; }
+// OTA push: relay a self-contained .eff to the device over the wire (no-WiFi update).
+//   USB (B1): OtaPushBegin -> raw .eff bytes on the bulk-OUT push endpoint -> OtaPushEnd.
+//   BLE (B2): OtaPushBegin -> OtaPushChunk{offset,data,eof} over the command channel (delta-sized).
+// The device stores it locally, extracts manifest+sig, sets
+// OTA_BASE_URL=file://, and consumes via the existing file:// path (no consumer change).
+message OtaPushBegin { string name = 1; uint64 total_size = 2; }   // total_size => storage pre-check
+message OtaPushChunk { uint64 offset = 1; bytes data = 2; bool eof = 3; }  // BLE; data <= ~7 KB
+message OtaPushEnd   { bool ok = 1; }                              // USB: raw stream done (false => abort)
+message OtaStatus {
+  OtaPhase phase               = 1;          // checking..warn (device codes 1-12)
+  int32    progress            = 2;          // 0-100, or -1 indeterminate
+  string   message             = 3;
+  int64    timestamp           = 4;
+  string   running_version_str = 5;
+  uint32   running_version_int = 6;
+  Slot     current_slot        = 7;
+  bool     staged              = 8;          // a verified `ready` download waiting to apply
+  uint32   target_version_int  = 9;
+}
+
+// ============================ Health ============================
+// StartHealthCheck{deep} kicks off the sweep; GetHealthStatus reports it.
+// health_passed is an inline core-presence gate; overall is the sweep verdict
+// (PASS only if no FAIL); checks[] carries each probe. Non-critical FAILs are
+// reported, never latched.
+message StartHealthCheck { bool deep = 1; }  // deep => ~2 min perf/stress tier
+message GetHealthStatus  {}
+message HealthCheck { string name = 1; HealthVerdict status = 2; string detail = 3; }  // one probe
+message HealthStatus {
+  bool          health_passed   = 1;         // inline gate: capture reachable + core presence
+  HealthVerdict overall         = 2;         // sweep verdict: PASS only if no FAIL (SKIP ignored)
+  bool          sweep_in_flight = 3;
+  bool          deep            = 4;
+  repeated HealthCheck checks   = 5;         // imu/camera/emmc/wifi/bt/usb/leds/cpu/svc:*/ctl:*/
+                                             // emmc_perf/cpu_coherency/mem_bw/thermal... (deep metrics in detail)
+  int64         timestamp_ns    = 6;
+}
+
+// ============================ WiFi ============================
+message WifiScan {}        message WifiScanResult { repeated WifiNetwork networks = 1; }
+message WifiNetwork { string ssid = 1; int32 rssi = 2; bool secured = 3; }
+message WifiAdd { string ssid = 1; string psk = 2;
+                  // country: ISO 3166-1 alpha-2 (e.g. "US"); "" keeps the device regdomain (5 GHz needs it)
+                  string country = 3; }
+message WifiRemove { string ssid = 1; }
+message WifiSelect { string ssid = 1; }  // prefer a specific saved network
+message WifiList {}        message WifiListResult { repeated string ssids = 1; }
+message StartWifiCheck {}  message GetWifiStatus {}
+message WifiStatus { bool connected = 1; string ssid = 2; int32 rssi = 3; string ip = 4;
+                     bool internet = 5; double mbps_down = 6; double mbps_up = 7;
+                     // Association phase bucketed from wpa_state: "connected" /
+                     // "connecting" / "disconnected". Lets the host tell a mid-
+                     // association attempt from a genuinely idle link (connected
+                     // stays for back-compat = state == "connected").
+                     string state = 8;
+                     int32  link_speed = 9;    // negotiated PHY link rate, Mbps (0 = unknown)
+                     int32  freq_mhz   = 10;   // associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz)
+                     string security   = 11;   // "WPA2" / "WPA3" / "WPA2/WPA3" / "Open" ("" = unknown)
+                   }
+
+// ============================ Time / System ============================
+// Device geographic location, written into each MCAP's foxglove.LocationFix.
+// covariance_diag fills the diagonal of the 3x3 position covariance (accuracy).
+message Location    { double latitude = 1; double longitude = 2; double altitude = 3; double covariance_diag = 4; }
+message SetLocation { Location location = 1; }   // persist on the device (replaces the default)
+message GetLocation {}                            // -> Response.location (effective: file, else default)
+
+message SetTime  { uint64 wall_ns = 1; }     // host sets device wall-clock (-> varlink SetTime epoch_ms)
+message TimeSync { uint64 host_tx_ns = 1; }  // host monotonic at send
+message TimeSyncReply { uint64 host_tx_ns = 1; uint64 device_mono_ns = 2; uint64 device_wall_ns = 3; }
+message Heartbeat { uint32 timeout_ms = 1; } // miss => device returns to IDLE
+message Reboot {}
+message GetStorage {}  message StorageInfo { uint64 total_bytes = 1; uint64 free_bytes = 2; uint32 recordings = 3; }
+// Current device FSM state (INIT/IDLE/COLLECT/CAL/OTA/HEALTH_TEST/SAFE/SLEEP),
+// the reported device_state, and whether it is fault-latched in SAFE.
+message GetState {}
+message StateInfo { string state = 1; string device_state = 2; bool fault_latch = 3; string last_fault = 4; }
+
+// ============================ Device info ============================
+message GetDeviceInformation {}
+message DeviceInformation {
+  string serial = 1; string model = 2; string hw_rev = 3;   // serial: device serial number
+  uint32 protocol_version = 4; string firmware_version = 5; bool superspeed = 6;
+  CameraIntrinsics camera = 7; ImuCalibration imu = 8;
+  uint64 storage_total_bytes = 9;   // userdata (recording) filesystem, total
+  uint64 storage_free_bytes  = 10;  // userdata (recording) filesystem, available
+  // ---- v1 additive (11+): previously host-struct-only, now reported on the wire.
+  uint32       firmware_version_int   = 11;  // OTA monotonic int (from the version file)
+  VideoConfig  current_config         = 12;  // current selected session config (w/h/fps/codec)
+  RateControl  rate_control           = 13;  // current encoder rate-control
+  float        bitrate                = 14;  // current target bitrate (0 if n/a)
+  Capabilities caps                   = 15;  // hardware capability menu
+  WifiStatus   wifi                   = 17;  // live WiFi association (ssid/ip)
+  bool         must_change_password   = 20;  // BLE password is still the factory default (123456)
+  string       wifi_mac               = 21;  // WiFi MAC from vendor storage (item 2), "" if unprovisioned
+  string       bt_mac                 = 22;  // BT MAC from vendor storage (item 4), "" if unprovisioned
+}
+// Hardware capability menu, mirrors device.json (generated from CAPS[]).
+message CapMode { uint32 width = 1; uint32 height = 2; uint32 fps = 3; string binning = 4; bool usable = 5; }
+message Capabilities {
+  repeated string  codecs        = 1;   // "H264" "H265" "RAW"
+  repeated string  pixel_formats = 2;   // "NV12"
+  repeated string  containers    = 3;   // "MCAP"
+  repeated CapMode modes         = 4;   // every advertised width/height/fps/binning (usable flag per row)
+}
+message CameraIntrinsics {  // Double-Sphere
+  double fx = 1; double fy = 2; double cx = 3; double cy = 4; double xi = 5; double alpha = 6;
+  uint32 width = 7; uint32 height = 8; repeated double extrinsics_quat = 9;
+}
+message ImuCalibration {
+  repeated double accel_bias = 1; repeated double gyro_bias = 2;
+  double accel_noise_density = 3; double gyro_noise_density = 4; repeated double imu_to_camera = 5;
+}
+
+
+// ============================ Auth / access control ============================
+// BLE control is gated by a user password (default 123456, rekeyable). The device
+// issues a nonce (GetAuthChallenge); the host proves the password with
+// Authenticate{response = HMAC-SHA256(key = PBKDF2(password), msg = nonce)}, the
+// password itself never crosses the air. SetBlePassword rekeys (BLE needs the old
+// password; the USB transport may reset without it, physical-access recovery).
+// USB control requires no password.
+message GetAuthChallenge {}
+message AuthChallenge    { bytes nonce = 1;                            // 32-byte random, single-use
+                           bytes salt = 2; uint32 iters = 3; }         // KDF params so host derives the key
+message Authenticate     { bytes response = 1; }                       // HMAC-SHA256(PBKDF2(pw,salt,iters), nonce)
+message SetBlePassword   { string old_password = 1; string new_password = 2; }
+

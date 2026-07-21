@@ -1,0 +1,264 @@
+////////////////////////////////////////////////////////////////////////////////
+//
+// File:      Core.hpp
+// Purpose:   Public SDK data types returned by the device.
+// Author:    Calvin Nguyen, Gianluca Bencomo
+//
+// Copyright (c) 2026, Remnant Robotics, Inc. All rights reserved.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+#ifndef EF_CORE_HPP
+#define EF_CORE_HPP
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "Enums.hpp"
+
+namespace ef {
+
+class Timestamp {
+public:
+    uint64_t data_ns = 0;
+
+    uint64_t nanoseconds()  const { return data_ns; }
+    uint64_t microseconds() const { return data_ns / 1000ULL; }
+    uint64_t milliseconds() const { return data_ns / 1000000ULL; }
+    uint64_t seconds()      const { return data_ns / 1000000000ULL; }
+};
+
+struct Resolution {
+    int width  = 0;
+    int height = 0;
+};
+
+// Device geographic location, written into each recording's location metadata.
+// covariance_diag fills the diagonal of the 3x3 position covariance (0 = unknown).
+struct Location {
+    double latitude        = 0;
+    double longitude       = 0;
+    double altitude        = 0;
+    double covariance_diag = 0;
+};
+
+struct Matrix4x4 {
+    std::array<double, 16> m{};
+};
+
+
+struct CalibrationParameters {
+    LENS_DISTORTION_MODEL model = LENS_DISTORTION_MODEL::DS;
+    double fx = 0, fy = 0;      // focal length (px)
+    double cx = 0, cy = 0;      // principal point (px)
+    double xi = 0, alpha = 0;   // double-sphere parameters
+};
+
+struct CameraConfiguration {
+    Resolution resolution;
+    int fps = 0;
+    COMPRESSION_MODE compression = COMPRESSION_MODE::RAW;
+    CalibrationParameters calibration;
+};
+
+// One selectable capture mode. Only the capture modes the device has enabled
+// are listed here; disabled modes are filtered out.
+struct SupportedMode {
+    Resolution resolution;
+    int fps = 0;
+};
+
+// The device's enabled capability menu: the resolution/fps modes and codecs
+// a client may select.
+struct Capabilities {
+    std::vector<SupportedMode> modes;
+    std::vector<std::string>   codecs;
+};
+
+// One inertial sensor (SENSOR_TYPE::ACCELEROMETER or GYROSCOPE).
+struct SensorParameters {
+    SENSOR_TYPE  type = SENSOR_TYPE::ACCELEROMETER;
+    SENSOR_UNIT unit = SENSOR_UNIT::M_SEC_2;
+    int sampling_rate = 0;      // Hz
+    int range         = 0;      // ±g (accel) / ±deg/s (gyro)
+    float noise_density = 0.f;
+    SENSOR_STATE state = SENSOR_STATE::NOT_AVAILABLE;
+};
+
+struct SensorsConfiguration {
+    SensorParameters accelerometer;
+    SensorParameters gyroscope;
+    Matrix4x4        camera_imu_transform;   // camera frame -> IMU frame
+};
+
+struct WirelessConfiguration {
+    std::string wifi_mac_address;
+    std::string bt_mac_address;
+    bool        bt_paired = false;
+    bool        wifi_connected = false;
+    std::string wifi_ssid;
+    std::string wifi_ip_address;
+    int         wifi_rssi = 0;
+    bool        internet_reachable = false;
+    // Live association detail (best-effort; empty/0 = unknown or older firmware).
+    std::string wifi_state;           // "connected" / "connecting" / "disconnected"
+    int         wifi_link_speed = 0;  // negotiated PHY link rate, Mbps
+    int         wifi_freq_mhz = 0;    // channel frequency, MHz (2.4 vs 5 GHz derivable)
+    std::string wifi_security;        // "WPA2" / "WPA3" / "WPA2/WPA3" / "Open"
+    std::vector<std::string> saved_networks;
+};
+
+// For device discovery
+struct DeviceProperties {
+    INPUT_TYPE input_type = INPUT_TYPE::USB;
+    int device_id  = 0;
+    std::string serial;             // USB descriptor serial
+    std::string ble_address;        // BLE MAC (input_type == STREAM)
+    std::string ble_name;           // advertised name ("Efference M1")
+};
+
+struct DeviceInformation {
+    std::string serial;             // full device serial (may be non-numeric)
+    unsigned int serial_number = 0; // numeric form; 0 when the serial is not numeric
+    MODEL model = MODEL::M1;
+    unsigned int firmware_version = 0;
+    INPUT_TYPE input_type = INPUT_TYPE::USB;
+    CameraConfiguration camera_configuration;
+    SensorsConfiguration sensors_configuration;
+    WirelessConfiguration wireless;
+    Capabilities         capabilities;   // enabled capture modes + codecs (device CAPS)
+};
+
+
+// One frame of image data plus the metadata needed to interpret it. Fields are
+// private so the buffer's layout invariants (step/size vs resolution/type) always
+// hold; the SDK (Device) is a friend and the sole producer, while consumers read
+// through the accessors. Owns its buffer; copy and assignment are deep.
+class Mat {
+public:
+    Mat() = default;
+
+    // Allocate a CPU buffer for (width x height) of the given layout, computing
+    // step and size from the type. MEM::GPU returns UNSUPPORTED; a zero/negative
+    // extent returns INVALID_FUNCTION_CALL.
+    ERROR_CODE alloc(int width, int height, MAT_TYPE type, MEM mem = MEM::CPU);
+
+    // Release the buffer; the Mat becomes uninitialised (isInit() == false).
+    void free();
+
+    // Deep copy into dst (full pixel copy). MEM::GPU returns UNSUPPORTED.
+    ERROR_CODE copyTo(Mat& dst, MEM mem = MEM::CPU) const;
+
+    // Raw pointer to the pixel bytes. CPU -> the owning buffer; GPU -> nullptr
+    // (GPU memory is not supported).
+    uint8_t*       getPtr(MEM mem = MEM::CPU);
+    const uint8_t* getPtr(MEM mem = MEM::CPU) const;
+
+    // --- metadata (read-only for consumers) ---
+    bool       isInit()         const { return !data_.empty(); }
+    int        getWidth()       const { return resolution_.width; }
+    int        getHeight()      const { return resolution_.height; }
+    Resolution getResolution()  const { return resolution_; }
+    int        getStep()        const { return step_; }          // bytes per row (plane 0)
+    size_t     getSizeInBytes() const { return data_.size(); }
+    MAT_TYPE   getDataType()    const { return type_; }
+    VIEW       getView()        const { return view_; }
+    MEM        getMemoryType()  const { return memory_; }
+    uint32_t   getFrameId()     const { return frame_id_; }
+    Timestamp  getTimestamp()   const { return timestamp_; }
+
+private:
+    friend class Device;   // sole producer; fills the fields below directly
+    void flip180();        // in-place 180-degree rotation (host-side, upside-down camera)
+
+    uint32_t   frame_id_ = 0;
+    Timestamp  timestamp_;                // capture time, device clock
+    Resolution resolution_;
+    MAT_TYPE   type_   = MAT_TYPE::NV12;
+    VIEW       view_   = VIEW::NV12;
+    MEM        memory_ = MEM::CPU;
+    int        step_   = 0;               // bytes per row (first plane)
+    std::vector<uint8_t> data_;
+};
+
+struct ImuSample {
+    Timestamp timestamp;                 // device clock
+    uint64_t  sequence = 0;
+    float     acceleration[3]     = {0, 0, 0};   // m/s^2
+    float     angular_velocity[3] = {0, 0, 0};   // rad/s
+    float     temperature_c       = 0.f;
+};
+
+// All IMU samples since the previous grab(), filled by retrieve_imu().
+struct SensorsData {
+    std::vector<ImuSample> samples;
+    uint64_t     dropped      = 0;
+    MOTION_STATE motion_state = MOTION_STATE::STATIC;   // ZUPT / free-fall
+};
+
+
+struct HealthCheck {
+    std::string name;
+    bool        passed = false;
+    std::string detail;
+};
+
+struct HealthStatus {
+    // Live availability: whether the camera and IMU are currently readable.
+    CAMERA_STATE camera = CAMERA_STATE::NOT_AVAILABLE;
+    SENSOR_STATE imu    = SENSOR_STATE::NOT_AVAILABLE;
+
+    // Saved: last completed sweep.
+    bool                     passed = false;   // no probe failed
+    bool                     deep   = false;   // stress tier was included
+    std::vector<HealthCheck> checks;
+    Timestamp                timestamp;        // when the sweep completed
+};
+
+struct RecordingStatus {
+    std::string      name;
+    RECORDING_TARGET target    = RECORDING_TARGET::HOST_FILE;
+    bool             recording = false;
+    uint64_t         bytes       = 0;
+    uint64_t         frames      = 0;
+    uint64_t         duration_ms = 0;
+
+    // Device storage (free/total space for continued recording).
+    uint64_t storage_free_bytes  = 0;
+    uint64_t storage_total_bytes = 0;
+
+    // Upload of this session (upload_recording()).
+    UPLOAD_STATE upload             = UPLOAD_STATE::OFF;
+    uint64_t     upload_bytes_sent  = 0;
+    uint64_t     upload_bytes_total = 0;
+    ERROR_CODE   last_error         = ERROR_CODE::SUCCESS;
+};
+
+struct UpdateStatus {
+    bool         active   = false;
+    UPDATE_STATE state    = UPDATE_STATE::DOWNLOADING;
+    int          progress = -1;              // 0-100, -1 indeterminate
+    std::string  message;
+    std::string  running_version;
+    uint32_t     running_version_int = 0;
+    uint32_t     target_version_int  = 0;
+    ERROR_CODE   last_error = ERROR_CODE::SUCCESS;
+};
+
+}  // namespace ef
+
+#endif  // EF_CORE_HPP

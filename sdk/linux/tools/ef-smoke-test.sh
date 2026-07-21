@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+# ef-smoke-test.sh: exercise the whole `ef` control-plane CLI against a live
+# device (USB) and print every command, its output, and exit code for review.
+# Includes intentional-error cases (labeled EXPECT-FAIL) to confirm the new
+# granular error codes. Does NOT reboot or apply an OTA update.
+#
+# Usage:
+#   ./tools/ef-smoke-test.sh                 # full run (record cycle + wifi + deep health)
+#   EF=/path/to/ef ./tools/ef-smoke-test.sh  # point at a specific ef binary
+#   EFARGS="--verbose" ./tools/ef-smoke-test.sh
+#   ./tools/ef-smoke-test.sh --wifi-ssid MyNet --wifi-psk secret --wifi-country US
+#   ./tools/ef-smoke-test.sh --skip-ble --reboot        # (see --help for all flags)
+#   SKIP_WIFI=1 ./tools/ef-smoke-test.sh     # skip the wifi-mutation section
+#   SKIP_DEEP=1 ./tools/ef-smoke-test.sh     # skip the deep health sweep
+#
+# Env knobs:
+#   EF               ef binary (default: <script>/../build/ef)
+#   EFARGS           extra global flags (e.g. "--verbose", "--device <id>")
+#   TEST_WIFI_SSID   throwaway SSID to add/select/remove (default: ef-smoke-fake)
+#   TEST_WIFI_PSK    its PSK (default: bogus-password-123)
+#   TEST_WIFI_COUNTRY regdomain (default: US)
+#   EFGRAB           ef-grab binary (default: <script>/../build/ef-grab)
+#   GRAB_SECS        seconds for the data-plane live-capture smoke (default: 5)
+#   GRAB_BASE        base path for the saved capture .mcap/.h265/.mp4/.png (default: ./efsmoke_grab,
+#                    overwritten each run, NOT cleaned up)
+#   SKIP_WIFI/SKIP_BLE/SKIP_DEEP/SKIP_RECORD/SKIP_GRAB  set to 1 to skip a section
+#   TEST_REBOOT      set to 1 to reboot the device as the LAST step (off by default;
+#                    OTA update/apply is out of scope, test it separately)
+
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EF="${EF:-$HERE/../build/ef}"
+EFARGS="${EFARGS:-}"
+GARGS="$EFARGS"                          # global flags the helpers use (USB by default; BLE section swaps this)
+TIMEOUT="${TIMEOUT:-330}"                # per-command cap (s): covers deep health ~3min; a hung verb is killed so we move on
+EFX() { timeout -k 5 "$TIMEOUT" "$EF" "$@"; }   # every ef call goes through this so nothing can stall the run
+TEST_BLE_PASSWORD="${TEST_BLE_PASSWORD:-123456}"
+TEST_WIFI_SSID="${TEST_WIFI_SSID:-ef-smoke-fake}"
+TEST_WIFI_PSK="${TEST_WIFI_PSK:-bogus-password-123}"
+TEST_WIFI_COUNTRY="${TEST_WIFI_COUNTRY:-US}"
+SESSION="efsmoke$$"          # unique throwaway recording name
+PSESSION="efsmokeps$$"       # second throwaway session for the per-session --location test
+DLDIR=""                     # download scratch dir; created after the cleanup trap is armed
+
+usage() {
+    cat <<EOF
+Usage: ef-smoke-test.sh [options]
+  --wifi-ssid SSID      real SSID to join (default: throwaway -> only tests connecting/disconnected)
+  --wifi-psk PSK        WiFi password (required for a real join)
+  --wifi-country CC     regdomain (default $TEST_WIFI_COUNTRY; needed for 5 GHz)
+  --ble-password PW     BLE control password (default 123456)
+  --grab-secs N         data-plane live-capture seconds (default 5)
+  --timeout N           per-command timeout seconds (default $TIMEOUT)
+  --ef PATH             ef binary to use
+  --efargs "ARGS"       extra global ef flags (e.g. "--verbose")
+  --reboot              reboot the device as the final step
+  --test-upload         record + upload to a built-in local receiver, verify it lands
+  --upload-host IP      host IP the device reaches over WiFi (required for --test-upload)
+  --upload-port N       receiver port (default 8099)
+  --open-firewall       ufw-allow the receiver port for the test, auto-reverted on exit
+                        (only if not already open; needs sudo)
+  --skip-wifi | --skip-ble | --skip-deep | --skip-record | --skip-grab
+  -h, --help
+All options also accept the matching env var (see header comment).
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --wifi-ssid)    TEST_WIFI_SSID="$2";    shift 2;;
+        --wifi-psk)     TEST_WIFI_PSK="$2";     shift 2;;
+        --wifi-country) TEST_WIFI_COUNTRY="$2"; shift 2;;
+        --ble-password) TEST_BLE_PASSWORD="$2"; shift 2;;
+        --grab-secs)    GRAB_SECS="$2";         shift 2;;
+        --timeout)      TIMEOUT="$2";           shift 2;;
+        --ef)           EF="$2";                shift 2;;
+        --efargs)       EFARGS="$2";            shift 2;;
+        --reboot)       TEST_REBOOT=1;          shift;;
+        --test-upload)  TEST_UPLOAD=1;          shift;;
+        --upload-host)  UPLOAD_HOST="$2";       shift 2;;
+        --upload-port)  UPLOAD_PORT="$2";       shift 2;;
+        --skip-wifi)    SKIP_WIFI=1;            shift;;
+        --skip-ble)     SKIP_BLE=1;             shift;;
+        --skip-deep)    SKIP_DEEP=1;            shift;;
+        --skip-record)  SKIP_RECORD=1;          shift;;
+        --skip-grab)    SKIP_GRAB=1;            shift;;
+        --open-firewall) OPEN_FIREWALL=1;       shift;;
+        -h|--help)      usage; exit 0;;
+        *) echo "unknown option: $1" >&2; usage; exit 2;;
+    esac
+done
+GARGS="$EFARGS"              # re-sync after --efargs (helpers target USB via $GARGS)
+
+pass=0 fail=0 xfail_ok=0 xfail_bad=0
+FW_OPENED=0 FW_PORT=""       # set if --open-firewall opened a ufw rule we must revert
+RXPID="" RXDIR="" UPSESS=""  # upload-test receiver pid / temp dir / session (for cleanup)
+# Arg-only knobs default here so `set -u` doesn't abort when a flag is omitted.
+UPLOAD_HOST="${UPLOAD_HOST:-}" TEST_UPLOAD="${TEST_UPLOAD:-0}" TEST_REBOOT="${TEST_REBOOT:-0}"
+
+c_hdr=$'\033[1;36m'; c_cmd=$'\033[1;33m'; c_ok=$'\033[1;32m'
+c_err=$'\033[1;31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+[ -t 1 ] || { c_hdr= c_cmd= c_ok= c_err= c_dim= c_off=; }
+
+banner() { printf '\n%s========== %s ==========%s\n' "$c_hdr" "$1" "$c_off"; }
+
+# run "<description>" <ef args...>. Expect SUCCESS (rc 0). Uses $GARGS (USB or BLE).
+run() {
+    local desc="$1"; shift
+    printf '\n%s# %s%s\n%s$ ef %s %s%s\n' "$c_dim" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
+    local out rc
+    out="$(EFX $GARGS "$@" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    if [ $rc -eq 0 ]; then printf '%s[exit %d OK]%s\n' "$c_ok" "$rc" "$c_off"; pass=$((pass+1))
+    else printf '%s[exit %d UNEXPECTED-FAIL]%s\n' "$c_err" "$rc" "$c_off"; fail=$((fail+1)); fi
+}
+
+# xfail "<description>" "<expected code substring>" <ef args...>. Expect FAILURE
+xfail() {
+    local desc="$1" want="$2"; shift 2
+    printf '\n%s# EXPECT-FAIL (%s): %s%s\n%s$ ef %s %s%s\n' \
+        "$c_dim" "$want" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
+    local out rc
+    out="$(EFX $GARGS "$@" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "$want"; then
+        printf '%s[correctly failed with %s]%s\n' "$c_ok" "$want" "$c_off"; xfail_ok=$((xfail_ok+1))
+    elif [ $rc -ne 0 ]; then
+        printf '%s[failed, but not with %s (rc %d)]%s\n' "$c_err" "$want" "$rc" "$c_off"; xfail_bad=$((xfail_bad+1))
+    else
+        printf '%s[UNEXPECTEDLY SUCCEEDED, expected %s]%s\n' "$c_err" "$want" "$c_off"; xfail_bad=$((xfail_bad+1))
+    fi
+}
+
+cleanup_done=0
+cleanup() {
+    [ "$cleanup_done" = 1 ] && return; cleanup_done=1     # idempotent (INT then EXIT)
+    banner "CLEANUP"
+    EFX $EFARGS record stop            >/dev/null 2>&1
+    EFX $EFARGS record delete "$SESSION" >/dev/null 2>&1 && echo "deleted test session $SESSION"
+    EFX $EFARGS record delete "$PSESSION" >/dev/null 2>&1 && echo "deleted test session $PSESSION"
+    # Restore the persistent location to the compiled SF default (the smoke test
+    # mutated session_meta.json). No "reset" verb exists, so we re-set the default.
+    EFX $EFARGS location set 37.7749 -122.4194 16 >/dev/null 2>&1 && echo "restored location to SF default"
+    [ -n "$UPSESS" ] && EFX $EFARGS record delete "$UPSESS" >/dev/null 2>&1 && echo "deleted upload session $UPSESS"
+    # only forget the FAKE throwaway, never a real network the user passed in
+    [ "${SKIP_WIFI:-0}" = 1 ] || [ "$TEST_WIFI_SSID" != "ef-smoke-fake" ] || { \
+        EFX $EFARGS wifi remove "$TEST_WIFI_SSID" >/dev/null 2>&1 \
+        && echo "removed throwaway wifi $TEST_WIFI_SSID"; }
+    # upload receiver + temp dir (set only while the upload test is running)
+    [ -n "$RXPID" ] && { kill "$RXPID" 2>/dev/null && echo "stopped upload receiver (pid $RXPID)"; }
+    [ -n "$RXDIR" ] && rm -rf "$RXDIR"
+    # revert the ufw rule iff WE opened it
+    [ "$FW_OPENED" = 1 ] && { sudo ufw delete allow "$FW_PORT/tcp" >/dev/null 2>&1 \
+        && echo "ufw: reverted $FW_PORT/tcp"; }
+    [ -n "$DLDIR" ] && rm -rf "$DLDIR"
+}
+
+# mcap_location <file> -> prints "lat lon" (%.4f) from the first /camera/location
+# LocationFix message, or nothing. Minimal varint-aware protobuf walk (fields
+# latitude=1, longitude=2 are 64-bit doubles). No-op if python3/mcap are absent.
+mcap_location() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import sys, struct
+try:
+    from mcap.reader import make_reader
+except Exception:
+    sys.exit(0)
+def walk(b):
+    d={}; i=0; n=len(b)
+    while i < n:
+        tag=b[i]; i+=1; fn=tag>>3; wt=tag&7
+        if wt==0:
+            while i<n and b[i]&0x80: i+=1
+            i+=1
+        elif wt==1:
+            d[fn]=struct.unpack_from('<d', b, i)[0]; i+=8
+        elif wt==2:
+            ln=0; sh=0
+            while i<n:
+                c=b[i]; i+=1; ln|=(c&0x7f)<<sh
+                if not c&0x80: break
+                sh+=7
+            i+=ln
+        elif wt==5: i+=4
+        else: break
+    return d
+try:
+    with open(sys.argv[1],'rb') as f:
+        for _s,ch,m in make_reader(f).iter_messages():
+            if ch.topic=='/camera/location':
+                d=walk(m.data)
+                print(f"{d.get(1,0.0):.4f} {d.get(2,0.0):.4f}")
+                break
+except Exception:
+    pass
+PY
+}
+
+# check_mcap_loc <file> <lat-substr> <lon-substr>. Assert the MCAP's LocationFix
+# contains the expected lat/lon (substring match tolerates float formatting).
+check_mcap_loc() {
+    if ! have python3 || ! python3 -c "import mcap" >/dev/null 2>&1; then
+        echo "${c_dim}(skip MCAP location check: need python3 + the mcap lib)${c_off}"; return
+    fi
+    local loc; loc="$(mcap_location "$1")"
+    printf '  MCAP /camera/location = [%s]  (want ~%s, %s)\n' "$loc" "$2" "$3"
+    if printf '%s' "$loc" | grep -q -- "$2" && printf '%s' "$loc" | grep -q -- "$3"; then
+        printf '%s[LocationFix matches]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+    else
+        printf '%s[LocationFix MISMATCH]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+    fi
+}
+# Full cleanup on normal exit AND on Ctrl-C / kill: INT/TERM clear the EXIT trap,
+# run cleanup once, then exit with the conventional signal code.
+trap 'trap - EXIT; cleanup; exit 130' INT
+trap 'trap - EXIT; cleanup; exit 143' TERM
+trap cleanup EXIT
+
+# Private 0700 dir for downloaded captures (never predictable world-writable /tmp
+# paths: symlink/temp race). Created now that cleanup() is armed to remove it.
+DLDIR="$(mktemp -d "${TMPDIR:-/tmp}/efsmoke.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+banner "PREFLIGHT"
+echo "ef binary : $EF"
+[ -x "$EF" ] || { echo "${c_err}ef not found/executable at $EF: build it first (cmake --build build)$c_off"; exit 1; }
+
+# ---- Linux dependency check: hard-fail on required, warn on optional tools that
+#      an ENABLED feature needs (missing optional -> that step skips, not aborts).
+have() { command -v "$1" >/dev/null 2>&1; }
+dep_req=""; dep_opt=""
+have timeout || dep_req="$dep_req coreutils"     # EFX wraps every ef call in `timeout`
+[ "${SKIP_GRAB:-0}"    = 1 ] || { have ffmpeg || dep_opt="$dep_opt ffmpeg"; have python3 || dep_opt="$dep_opt python3"; }
+[ "${TEST_UPLOAD:-0}"  = 1 ] && { have python3 || dep_opt="$dep_opt python3"; }
+[ "${OPEN_FIREWALL:-0}" = 1 ] && { have ufw || dep_opt="$dep_opt ufw"; }
+if [ -n "$dep_req" ]; then
+    echo "${c_err}missing required:$dep_req  ->  sudo apt install$dep_req$c_off"; exit 1
+fi
+if [ -n "$dep_opt" ]; then
+    dep_opt=$(printf '%s\n' $dep_opt | sort -u | tr '\n' ' ')
+    echo "${c_err}missing tools for enabled features: $dep_opt$c_off"
+    echo "  install:  sudo apt install $dep_opt   (otherwise those steps skip/degrade)"
+else
+    echo "deps ok   : all tools for the enabled features are present"
+fi
+
+EFX $EFARGS list 2>&1
+if ! EFX $EFARGS info >/dev/null 2>&1; then
+    echo "${c_err}No device reachable (ef info failed). Flash + connect the board over USB, then re-run.$c_off"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+banner "IDENTITY / QUERIES (read-only)"
+run "device discovery"                 list
+run "device information snapshot"      info
+run "current DEVICE_STATE (4-state)"   state
+run "enabled capture modes + current"  config
+run "recording store free/total"       storage
+run "align device clock to host"       sync-time
+run "read device wall clock"           time
+run "read device location"             location
+
+# ---------------------------------------------------------------------------
+banner "HEALTH"
+run "shallow health sweep"             health
+if [ "${SKIP_DEEP:-0}" != 1 ]; then
+    run "deep health sweep (stress ~2-3 min)"  health --deep
+else
+    echo "(skipped deep sweep: SKIP_DEEP=1)"
+fi
+
+# ---------------------------------------------------------------------------
+banner "CONFIG: valid set (restore a known-good mode)"
+run "set 1920x1080@30 h265"            config set 1920 1080 30 h265
+
+# ---------------------------------------------------------------------------
+banner "LOCATION: persistent set/get (session_meta.json)"
+run "set persistent location (NYC)"    location set 40.7128 -74.0060 10
+LOC_AFTER="$(EFX $GARGS location 2>&1)"
+printf '  location now: %s\n' "$LOC_AFTER"
+if printf '%s' "$LOC_AFTER" | grep -q "40.7128" && printf '%s' "$LOC_AFTER" | grep -q -- "-74.006"; then
+    printf '%s[persistent location applied]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[persistent location NOT applied]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+run "config after set"                 config
+
+# ---------------------------------------------------------------------------
+if [ "${SKIP_GRAB:-0}" != 1 ]; then
+banner "DATA PLANE: live stream smoke (ef-grab: open/grab/retrieve) + save a viewable clip"
+EFGRAB="${EFGRAB:-$HERE/../build/ef-grab}"
+GRAB_SECS="${GRAB_SECS:-5}"
+# Fixed base name in the current folder, OVERWRITTEN each run (not cleaned up) so
+# you always have the latest capture to eyeball. Override the location with GRAB_BASE.
+GRAB_BASE="${GRAB_BASE:-./efsmoke_grab}"
+if [ ! -x "$EFGRAB" ]; then
+    echo "${c_err}ef-grab not found at $EFGRAB, skipping data-plane smoke$c_off"
+else
+    printf '\n%s# %ss live capture over the wire (frames / IMU / fps), tee to %s.mcap%s\n%s$ ef-grab %s --codec h265 --record %s.mcap%s\n' \
+        "$c_dim" "$GRAB_SECS" "$GRAB_BASE" "$c_off" "$c_cmd" "$GRAB_SECS" "$GRAB_BASE" "$c_off"
+    out="$(timeout -k 5 "$TIMEOUT" "$EFGRAB" "$GRAB_SECS" --codec h265 --record "$GRAB_BASE.mcap" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    if [ $rc -eq 0 ]; then printf '%s[exit 0 OK]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+    else printf '%s[exit %d UNEXPECTED-FAIL]%s\n' "$c_err" "$rc" "$c_off"; fail=$((fail+1)); fi
+    # Convert the captured frames to viewable artifacts (same names, overwritten).
+    # mcap -> raw H.265 Annex-B (mcap_to_video.py) -> ffmpeg clip (.mp4) + still (.png).
+    MCV="$HERE/mcap_to_video.py"
+    if [ -s "$GRAB_BASE.mcap" ] && command -v ffmpeg >/dev/null 2>&1 && [ -f "$MCV" ] \
+       && python3 "$MCV" "$GRAB_BASE.mcap" "$GRAB_BASE.h265" >/dev/null 2>&1 && [ -s "$GRAB_BASE.h265" ]; then
+        ffmpeg -y -loglevel error -f hevc -i "$GRAB_BASE.h265" -c:v libx264 "$GRAB_BASE.mp4" 2>/dev/null \
+            && echo "${c_ok}saved clip : $GRAB_BASE.mp4$c_off   (view: ffplay $GRAB_BASE.mp4)"
+        ffmpeg -y -loglevel error -f hevc -i "$GRAB_BASE.h265" -frames:v 1 "$GRAB_BASE.png" 2>/dev/null \
+            && echo "${c_ok}saved still: $GRAB_BASE.png$c_off   (view: ffplay $GRAB_BASE.png)"
+    else
+        echo "${c_dim}(no viewable clip: need frames in $GRAB_BASE.mcap + ffmpeg + mcap_to_video.py)$c_off"
+    fi
+fi
+else
+echo; echo "(skipped data-plane smoke: SKIP_GRAB=1)"
+fi
+
+# ---------------------------------------------------------------------------
+banner "INTENTIONAL ERRORS: config (P2/P3 granular codes)"
+xfail "bad resolution"      INVALID_RESOLUTION      config set 9999 9999 30 h265
+xfail "bad fps"             INVALID_FPS             config set 1920 1080 999 h265
+# The CLI validates the codec client-side (raw|h264|h264hq|h265|h265hq), so a bad
+# codec is rejected before the wire, every wire-valid codec is device-supported,
+# so UNSUPPORTED_COMPRESSION isn't reachable via `config set`. Test the CLI guard.
+xfail "unknown codec (CLI-side reject)" "unknown codec" config set 1920 1080 30 mjpeg
+xfail "location set missing args (CLI reject)"     "need <lat>"  location set 40.0
+xfail "record --location bad format (CLI reject)"  "LAT,LON"     record start --location not-a-coord
+
+# ---------------------------------------------------------------------------
+banner "INTENTIONAL ERRORS: recording / state"
+xfail "stop when not recording"  INVALID_FUNCTION_CALL  record stop
+xfail "status of missing session" RECORDING_NOT_FOUND   record status no-such-session
+xfail "delete missing session"    RECORDING_NOT_FOUND   record delete no-such-session
+xfail "download missing session"  RECORDING_NOT_FOUND   download no-such-session /tmp/none.mcap
+
+# upload URL scheme is validated host-side (CLI reject, no device round-trip)
+xfail "upload with no scheme"     "must be an http"  upload no-such-session example.com/x
+xfail "upload with ftp:// scheme" "must be an http"  upload no-such-session ftp://host/x
+xfail "upload with file:// path"  "must be an http"  upload no-such-session file:///tmp/x
+
+# ---------------------------------------------------------------------------
+if [ "${SKIP_RECORD:-0}" != 1 ]; then
+banner "RECORD LIFECYCLE (device-local, self-cleaning)"
+run "start recording $SESSION"    record start "$SESSION"
+sleep 3
+run "recording status"            record status "$SESSION"
+run "state during recording (STREAMING)"  state
+xfail "location set while recording (must reject)"  INVALID_FUNCTION_CALL  location set 1.0 2.0
+run "stop recording"              record stop
+run "list recordings"             record list
+xfail "start with a duplicate name (must reject, not overwrite)" \
+      RECORDING_ALREADY_EXISTS    record start "$SESSION"
+run "download $SESSION"           download "$SESSION" "$DLDIR/$SESSION.mcap"
+[ -s "$DLDIR/$SESSION.mcap" ] && echo "downloaded $(stat -c%s "$DLDIR/$SESSION.mcap" 2>/dev/null) bytes -> $DLDIR/$SESSION.mcap"
+# this (no-override) recording must carry the persistent NYC set in the LOCATION section
+check_mcap_loc "$DLDIR/$SESSION.mcap" "40.712" "-74.006"
+run "delete $SESSION"             record delete "$SESSION"
+
+# per-session --location override (London): the MCAP must carry London, and the
+# persistent default must remain NYC afterwards (a per-session override never persists).
+run "start recording $PSESSION (--location London)"  record start "$PSESSION" --location 51.5074,-0.1278
+sleep 3
+run "stop recording (per-session)"  record stop
+run "download $PSESSION"            download "$PSESSION" "$DLDIR/$PSESSION.mcap"
+check_mcap_loc "$DLDIR/$PSESSION.mcap" "51.507" "-0.127"
+LOC_STILL="$(EFX $GARGS location 2>&1)"
+printf '  persistent location after per-session run: %s\n' "$LOC_STILL"
+if printf '%s' "$LOC_STILL" | grep -q "40.7128"; then
+    printf '%s[per-session did NOT change the persistent default]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[per-session leaked into persistent!]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+run "delete $PSESSION"             record delete "$PSESSION"
+else
+echo; echo "(skipped record lifecycle: SKIP_RECORD=1)"
+fi
+
+# ---------------------------------------------------------------------------
+if [ "${TEST_UPLOAD:-0}" = 1 ]; then
+banner "UPLOAD (opt-in: --test-upload): record -> upload to a local receiver -> verify"
+# We only stand up a RECEIVER at a ready URL; the create/finalize orchestration
+# is the cloud/app side and out of scope. Device uploads over WiFi, so the device
+# must be on WiFi with a route to --upload-host (this machine's reachable IP).
+# If it's not connected and real creds were given, provision + wait for it first.
+if [ -n "$UPLOAD_HOST" ] && ! EFX $EFARGS wifi status 2>/dev/null | grep -q "connected to" \
+   && [ -n "$TEST_WIFI_PSK" ] && [ "$TEST_WIFI_SSID" != "ef-smoke-fake" ]; then
+    echo "device not on WiFi, provisioning '$TEST_WIFI_SSID' for the upload..."
+    EFX $EFARGS wifi add "$TEST_WIFI_SSID" "$TEST_WIFI_PSK" "$TEST_WIFI_COUNTRY" >/dev/null 2>&1
+    j=0; while [ $j -lt 20 ]; do
+        EFX $EFARGS wifi status 2>/dev/null | grep -q "connected to" && break
+        sleep 2; j=$((j + 1))
+    done
+fi
+UPLOAD_PORT="${UPLOAD_PORT:-8099}"
+if [ -z "$UPLOAD_HOST" ]; then
+    echo "${c_err}--upload-host <ip> required (host IP the device can reach over WiFi), skipping$c_off"
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "${c_err}python3 not found (needed for the receiver), skipping$c_off"
+elif ! EFX $EFARGS wifi status 2>/dev/null | grep -q "connected to"; then
+    echo "${c_err}device is NOT on WiFi. Upload runs over WiFi, so it can't work. Connect it, or"
+    echo "${c_err}pass --wifi-ssid/--wifi-psk so the test provisions it. Skipping upload.$c_off"
+elif ss -ltn 2>/dev/null | grep -q ":$UPLOAD_PORT "; then
+    echo "${c_err}port $UPLOAD_PORT is already in use on this host, our receiver can't bind, so the"
+    echo "${c_err}device's PUT would hit the wrong server (e.g. a plain file server that rejects PUT)."
+    echo "${c_err}Pick a free --upload-port, or find + stop the owner:  ss -ltnp | grep :$UPLOAD_PORT . Skipping.$c_off"
+else
+    # Optionally ufw-allow the inbound port for the duration of the test. Only if
+    # it isn't already allowed (so we never clobber existing config), and record
+    # that WE opened it so cleanup() reverts it on exit (incl. Ctrl-C).
+    if [ "${OPEN_FIREWALL:-0}" = 1 ] && command -v ufw >/dev/null 2>&1; then
+        if sudo ufw status 2>/dev/null | grep -q "$UPLOAD_PORT/tcp"; then
+            echo "ufw: $UPLOAD_PORT/tcp already allowed, leaving as-is"
+        elif sudo ufw allow "$UPLOAD_PORT/tcp" >/dev/null 2>&1; then
+            FW_OPENED=1; FW_PORT="$UPLOAD_PORT"
+            echo "ufw: opened $UPLOAD_PORT/tcp (will auto-revert on exit)"
+        else
+            echo "${c_err}ufw: could not open $UPLOAD_PORT/tcp (sudo?), inbound PUT may be blocked$c_off"
+        fi
+    fi
+    UPSESS="efup$$"
+    RXDIR="$(mktemp -d)"
+    cat > "$RXDIR/rx.py" <<'PYEOF'
+import http.server, os, sys
+D, P = sys.argv[1], int(sys.argv[2])
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_PUT(self):
+        n = int(self.headers.get('Content-Length', 0))
+        with open(os.path.join(D, os.path.basename(self.path)), 'wb') as f:
+            f.write(self.rfile.read(n))
+        self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+    def do_POST(self):  # tolerate any create/finalize the device may send
+        self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+http.server.HTTPServer(('0.0.0.0', P), H).serve_forever()
+PYEOF
+    python3 "$RXDIR/rx.py" "$RXDIR" "$UPLOAD_PORT" >/dev/null 2>&1 &
+    RXPID=$!
+    sleep 1
+    URL="http://$UPLOAD_HOST:$UPLOAD_PORT/gcs/$UPSESS.mcap"
+    echo "receiver pid $RXPID  dir $RXDIR   target url: $URL"
+    echo "${c_dim}  NOTE: the device connects INBOUND to $UPLOAD_HOST:$UPLOAD_PORT. That port must be"
+    echo "        allowed through THIS host's firewall or the PUT is silently dropped,"
+    echo "        e.g.  sudo ufw allow $UPLOAD_PORT/tcp   (revert with 'ufw delete allow $UPLOAD_PORT/tcp').${c_off}"
+    run "record a session to upload"  record start "$UPSESS"
+    sleep 3
+    run "stop it"                      record stop
+    run "upload $UPSESS -> receiver"   upload "$UPSESS" "$URL"
+    printf '\n%s# waiting up to 40s for the file to land at the receiver (device uploads async over WiFi)...%s\n' "$c_dim" "$c_off"
+    got=0; i=0
+    while [ $i -lt 20 ]; do
+        [ -s "$RXDIR/$UPSESS.mcap" ] && { got=1; break; }
+        sleep 2; i=$((i + 1))
+    done
+    if [ "$got" = 1 ]; then
+        sz=$(stat -c%s "$RXDIR/$UPSESS.mcap" 2>/dev/null)
+        printf '%s[received %s bytes at the receiver -> UPLOAD OK]%s\n' "$c_ok" "$sz" "$c_off"; pass=$((pass + 1))
+    else
+        printf '%s[nothing received after 40s -> UPLOAD FAILED]%s\n' "$c_err" "$c_off"; fail=$((fail + 1))
+        echo "  likely: (1) inbound port $UPLOAD_PORT blocked by this host's firewall (open it), or"
+        echo "          (2) device not on WiFi / no route to $UPLOAD_HOST. 'ef record status $UPSESS' shows the device-side upload state."
+    fi
+    # Normal-path teardown; clear the globals so cleanup() doesn't repeat it.
+    # (The ufw revert is left to cleanup so it also covers a Ctrl-C before here.)
+    EFX $EFARGS record delete "$UPSESS" >/dev/null 2>&1
+    kill "$RXPID" 2>/dev/null; rm -rf "$RXDIR"
+    RXPID="" RXDIR="" UPSESS=""
+fi
+else
+echo; echo "(upload round-trip NOT run, pass --test-upload --upload-host <ip> to enable)"
+fi
+
+# ---------------------------------------------------------------------------
+banner "INTENTIONAL ERROR: upload precondition (WIFI_NOT_CONNECTED)"
+# Only meaningful if the device is NOT on WiFi; if it is connected this may
+# instead reach the URL. Kept as EXPECT-FAIL either way (bad URL / no wifi).
+xfail "upload without WiFi (or bad URL)"  "WIFI_NOT_CONNECTED\|RECORDING_NOT_FOUND\|FAIL" \
+      upload no-such-session http://192.0.2.1/none
+
+# ---------------------------------------------------------------------------
+if [ "${SKIP_WIFI:-0}" != 1 ]; then
+banner "WIFI MUTATION (throwaway '$TEST_WIFI_SSID', added then removed)"
+[ "$TEST_WIFI_SSID" = "ef-smoke-fake" ] && \
+    echo "(fake creds -> expect connecting then disconnected; pass --wifi-ssid/--wifi-psk for a real join to 'connected')"
+run "wifi status before"          wifi status
+run "list saved networks before"  wifi list
+run "add throwaway network"       wifi add "$TEST_WIFI_SSID" "$TEST_WIFI_PSK" "$TEST_WIFI_COUNTRY"
+run "list saved networks after add" wifi list
+for i in 1 2 3 4; do
+    printf '\n%s# wifi status poll %d/4 (watch for connecting -> connected/disconnected)%s\n' "$c_dim" "$i" "$c_off"
+    EFX $EFARGS wifi status 2>&1
+    sleep 3
+done
+run "select throwaway network"    wifi select "$TEST_WIFI_SSID"
+run "wifi status after select"    wifi status
+if [ "$TEST_WIFI_SSID" = "ef-smoke-fake" ]; then
+    run "remove throwaway network"    wifi remove "$TEST_WIFI_SSID"
+    run "wifi status after remove"    wifi status
+else
+    echo "(keeping '$TEST_WIFI_SSID', it's your real network; not removing so the device stays connected)"
+fi
+xfail "select a network not saved" INVALID_FUNCTION_CALL wifi select definitely-not-saved
+else
+echo; echo "(skipped wifi mutation: SKIP_WIFI=1)"
+fi
+
+# ---------------------------------------------------------------------------
+if [ "${SKIP_BLE:-0}" != 1 ]; then
+banner "BLE CONTROL (MAC discovered from 'ef info' over USB, not assumed)"
+# We don't know the BLE MAC up front, pull it from the USB identity snapshot,
+# exactly as a real client would (ef info -> 'bt mac : <MAC>').
+BLE_MAC="$(EFX $EFARGS info 2>/dev/null | sed -n 's/^bt mac *: *\([0-9A-Fa-f:]\{17\}\).*/\1/p')"
+if [ -z "$BLE_MAC" ]; then
+    echo "${c_err}no BT MAC in 'ef info' (bt unprovisioned / down), skipping BLE section$c_off"
+else
+    echo "discovered BT MAC : $BLE_MAC   (password: $TEST_BLE_PASSWORD)"
+    run "BLE scan/discover" list --scan-ble
+    # Re-run the read-only control verbs over the BLE transport. Same verbs,
+    # different global flags, swap $GARGS so the helpers target BLE, then restore.
+    GARGS="$EFARGS --ble $BLE_MAC --password $TEST_BLE_PASSWORD"
+    run "BLE: device information"        info
+    run "BLE: DEVICE_STATE"              state
+    run "BLE: config"                    config
+    run "BLE: storage"                   storage
+    run "BLE: wifi status"               wifi status
+    run "BLE: wifi list"                 wifi list
+    run "BLE: recording list"            record list
+    run "BLE: shallow health"            health
+    # Explicit wrong-password check (bypasses $GARGS to force a bad password):
+    printf '\n%s# EXPECT-FAIL (INVALID_PASSWORD): BLE wrong password%s\n%s$ ef --ble %s --password WRONGPASS state%s\n' \
+        "$c_dim" "$c_off" "$c_cmd" "$BLE_MAC" "$c_off"
+    if out="$(EFX --ble "$BLE_MAC" --password WRONGPASS state 2>&1)"; then
+        printf '%s\n%s[UNEXPECTEDLY SUCCEEDED, expected INVALID_PASSWORD]%s\n' "$out" "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
+    else
+        printf '%s\n' "$out"
+        if printf '%s' "$out" | grep -q "INVALID_PASSWORD"; then
+            printf '%s[correctly failed with INVALID_PASSWORD]%s\n' "$c_ok" "$c_off"; xfail_ok=$((xfail_ok+1))
+        else
+            printf '%s[failed, but not with INVALID_PASSWORD]%s\n' "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
+        fi
+    fi
+    GARGS="$EFARGS"                       # restore USB for anything after
+fi
+else
+echo; echo "(skipped BLE section: SKIP_BLE=1)"
+fi
+
+# ---------------------------------------------------------------------------
+banner "SUMMARY"
+printf '%ssuccess-path OK : %d%s\n' "$c_ok"  "$pass"      "$c_off"
+printf '%ssuccess-path FAIL: %d%s\n' "$c_err" "$fail"      "$c_off"
+printf '%sexpected-fail correct : %d%s\n' "$c_ok"  "$xfail_ok"  "$c_off"
+printf '%sexpected-fail wrong   : %d%s\n' "$c_err" "$xfail_bad" "$c_off"
+echo
+echo "NOTE: OTA (update/abort-update) is out of scope for this harness (test it separately)."
+echo "      reboot is opt-in via TEST_REBOOT=1 (runs last; ends the session)."
+[ $((fail + xfail_bad)) -eq 0 ] && echo "${c_ok}ALL CHECKS BEHAVED AS EXPECTED$c_off" || echo "${c_err}REVIEW THE FLAGGED LINES ABOVE$c_off"
+
+# ---------------------------------------------------------------------------
+# Reboot LAST and only when explicitly opted in, it drops the device off the
+# bus, so nothing can run after it. Clean up first and disarm the EXIT trap so
+# cleanup doesn't then flail against a rebooting device.
+if [ "${TEST_REBOOT:-0}" = 1 ]; then
+    banner "REBOOT (opt-in: TEST_REBOOT=1)"
+    cleanup
+    trap - EXIT
+    printf '\n%s# reboot the device (session ends here)%s\n%s$ ef %s reboot%s\n' \
+        "$c_dim" "$c_off" "$c_cmd" "$EFARGS" "$c_off"
+    EFX $EFARGS reboot 2>&1
+    echo "reboot issued, the device is restarting; reconnect and re-run to verify it came back."
+else
+    echo; echo "(reboot NOT run, set TEST_REBOOT=1 to include it as the final step.)"
+fi

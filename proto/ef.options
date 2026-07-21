@@ -1,0 +1,107 @@
+# nanopb static-allocation sizing for ef.proto: no malloc, no callbacks (FT_STATIC).
+# Strings: max_size includes the NUL. Repeated: max_count. Sized so any single
+# Request/Response body stays under EFR_PROTO_MAX_PAYLOAD (8192) once encoded.
+
+# ---- envelope ----
+ef.v1.Response.message                    max_size:256
+
+# ---- device info ----
+ef.v1.DeviceInformation.serial            max_size:40
+ef.v1.DeviceInformation.model             max_size:32
+ef.v1.DeviceInformation.hw_rev            max_size:16
+ef.v1.DeviceInformation.firmware_version  max_size:32
+ef.v1.DeviceInformation.wifi_mac          max_size:18
+ef.v1.DeviceInformation.bt_mac            max_size:18
+ef.v1.CameraIntrinsics.extrinsics_quat    max_count:4
+ef.v1.ImuCalibration.accel_bias           max_count:3
+ef.v1.ImuCalibration.gyro_bias            max_count:3
+ef.v1.ImuCalibration.imu_to_camera        max_count:16
+# caps menu (from device.json): 24 modes * ~25B + string lists ~= 700B, < 8192
+ef.v1.CapMode.binning                     max_size:8
+ef.v1.Capabilities.codecs                 max_size:8
+ef.v1.Capabilities.codecs                 max_count:8
+ef.v1.Capabilities.pixel_formats          max_size:8
+ef.v1.Capabilities.pixel_formats          max_count:4
+ef.v1.Capabilities.containers             max_size:8
+ef.v1.Capabilities.containers             max_count:4
+ef.v1.Capabilities.modes                  max_count:24
+ef.v1.PackerInfo.format                   max_size:8
+
+# ---- stream ----
+ef.v1.StreamTarget.dest_host              max_size:64
+
+# ---- recording ----
+ef.v1.StartRecording.name                 max_size:64
+ef.v1.StopRecording.name                  max_size:64
+ef.v1.GetRecordingStatus.name             max_size:64
+ef.v1.RecordingStatus.name                max_size:64
+ef.v1.DeleteRecording.name                max_size:64
+ef.v1.DownloadRecording.name              max_size:64
+ef.v1.RecordingChunk.data                 max_size:7168
+ef.v1.RecordingList.recordings            max_count:48
+
+# ---- upload (presigned URLs can be long) ----
+ef.v1.UploadSpec.presigned_url            max_size:2048
+ef.v1.StartUpload.recording_name          max_size:64
+ef.v1.StopUpload.recording_name           max_size:64
+ef.v1.GetUploadStatus.recording_name      max_size:64
+ef.v1.UploadStatus.recording_name         max_size:64
+
+# ---- chunked upload, option (b) ----
+# chunks max_count 128 * (idx+filename<=32+size) ~ 55B ~= 7KB manifest, < 8192.
+# PutChunks.urls capped at 3: 3 * (idx + url<=2048) ~= 6.2KB, < 8192 (app batches).
+# A session is thus <= 128 chunks (128 * 10s = ~21 min at segment_seconds=10);
+# longer recordings need a coarser segment (fewer chunks).
+ef.v1.GetSessionManifest.name             max_size:64
+ef.v1.ChunkInfo.filename                  max_size:32
+ef.v1.SessionManifest.name                max_size:64
+ef.v1.SessionManifest.chunks              max_count:128
+ef.v1.ChunkUrl.url                        max_size:2048
+ef.v1.PutChunks.name                      max_size:64
+ef.v1.PutChunks.urls                      max_count:3
+ef.v1.GetChunkUploadStatus.name           max_size:64
+ef.v1.ChunkUploadStatus.name              max_size:64
+ef.v1.ChunkUploadStatus.results           max_count:128
+
+# ---- OTA ----
+ef.v1.OtaDownload.base_url                max_size:512
+ef.v1.SetOtaConfig.base_url               max_size:512
+ef.v1.OtaStatus.message                   max_size:256
+ef.v1.OtaStatus.running_version_str       max_size:32
+# OTA push (.eff relay). USB streams bytes raw on the bulk ep (no proto chunk);
+# BLE uses OtaPushChunk.data, capped so the message fits the 8192-byte frame.
+ef.v1.OtaPushBegin.name                   max_size:64
+ef.v1.OtaPushChunk.data                   max_size:7168
+
+# ---- health (28 * ~176B ~= 5KB, under 8192) ----
+ef.v1.HealthCheck.name                    max_size:40
+ef.v1.HealthCheck.detail                  max_size:128
+ef.v1.HealthStatus.checks                 max_count:40
+
+# ---- wifi ----
+ef.v1.WifiNetwork.ssid                    max_size:33
+ef.v1.WifiAdd.ssid                        max_size:33
+ef.v1.WifiAdd.psk                         max_size:64
+ef.v1.WifiAdd.country                     max_size:4
+ef.v1.WifiRemove.ssid                     max_size:33
+ef.v1.WifiSelect.ssid                     max_size:33
+ef.v1.WifiStatus.ssid                     max_size:33
+ef.v1.WifiStatus.ip                       max_size:46
+ef.v1.WifiStatus.state                    max_size:16
+ef.v1.WifiStatus.security                 max_size:16
+ef.v1.WifiScanResult.networks             max_count:48
+ef.v1.WifiListResult.ssids                max_size:33
+ef.v1.WifiListResult.ssids                max_count:32
+
+# ---- state ----
+ef.v1.StateInfo.state                     max_size:16
+ef.v1.StateInfo.device_state              max_size:24
+ef.v1.StateInfo.last_fault                max_size:64
+
+
+# ---- auth / access control ----
+ef.v1.AuthChallenge.nonce                 max_size:32     # 32-byte random nonce
+ef.v1.AuthChallenge.salt                  max_size:16     # PBKDF2 salt (not secret)
+ef.v1.Authenticate.response               max_size:32     # HMAC-SHA256 = 32 bytes
+ef.v1.SetBlePassword.old_password         max_size:64
+ef.v1.SetBlePassword.new_password         max_size:64
