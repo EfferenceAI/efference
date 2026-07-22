@@ -1,42 +1,60 @@
-<div align="left">
+<p align="center">
+  <img src="assets/header.png" alt="Efference" width="50%">
+</p>
 
-# Efference SDK
+<p align="center">
+  The open source SDK for the Efference M1.
+</p>
 
-[![License](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://efference.ai"><u>Website</u></a> ·
+  <a href="https://docs.efference.ai/introduction"><u>Documentation</u></a> ·
+  <a href="https://docs.efference.ai/api/device"><u>API Reference</u></a> ·
+  <a href="https://x.com/EfferenceAI"><u>X</u></a>
+</p>
 
-</div>
+<p align="center">
+  <a href="https://github.com/EfferenceAI/efference/stargazers"><img src="https://img.shields.io/github/stars/EfferenceAI/efference?style=flat&logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/EfferenceAI/efference/network/members"><img src="https://img.shields.io/github/forks/EfferenceAI/efference?style=flat&logo=github" alt="GitHub forks"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/EfferenceAI/efference?style=flat" alt="BSD 3-Clause license"></a>
+</p>
 
-The Efference SDK is the host-side interface to the Efference M1. The device
-firmware is closed, but everything you need to talk to the M1 from your own
-machine lives here: a control plane for device info, health, configuration,
-WiFi, recording, and firmware updates, and a grab-and-retrieve data plane for
-live video and IMU over USB or WiFi.
+Efference provides the host-side C++ interface for our devices. Use them as
+standalone systems for distributed data collection or connect them to a host
+computer for robot perception applications.
 
-One library backs all of it (`ef::Device`), with a command-line tool (`ef`), a
-live viewer, and worked examples built on top.
+## Getting started
 
-## Quickstart
+The Efference SDK includes the libraries, tools, and examples needed to integrate
+an Efference device. See the [documentation](https://docs.efference.ai/introduction)
+for complete setup and usage guides, or browse the
+[API reference](https://docs.efference.ai/api/device).
+
+The SDK currently targets Linux and requires C++17, CMake 3.16 or newer,
+`pkg-config`, and `libusb-1.0`.
 
 ```sh
-cd sdk/linux
-./build.sh                      # add --deps on Debian/Ubuntu to install dependencies
-./build/ef info                 # with the M1 plugged in over USB
-./build/wired_01_serial_number  # or run one of the examples
+git clone https://github.com/EfferenceAI/efference.git
+cd efference
+./build.sh
 ```
 
-`./build.sh` builds the library, the `ef` CLI, the viewer, and every example
-into `sdk/linux/build/`.
+On Debian or Ubuntu, pass `--deps` on the first build to install dependencies
+and the udev rule:
 
-## Where to go next
+```sh
+./build.sh --deps
+```
 
-- **`sdk/linux/README.md`** is the SDK reference: build options, the full `ef`
-  command set, and the connection model (USB, Bluetooth control, WiFi/UDP data,
-  MCAP replay).
-- **`examples/`** holds small self-contained programs, one per feature (wired,
-  wireless, OpenCV). Start with `examples/README.md`.
-- **`proto/ef.proto`** is the wire protocol, for integrating without the C++
-  library (for example a mobile app talking to the M1 over Bluetooth).
+With an Efference device connected over USB:
+
+```sh
+./sdk/linux/build/ef info
+```
+
+For installation, device setup, transports, examples, and the complete CLI
+reference, visit **[docs.efference.ai](https://docs.efference.ai)**.
 
 ## License
 
-BSD-3-Clause. See [LICENSE](LICENSE).
+Efference is available under the [BSD 3-Clause License](LICENSE).
