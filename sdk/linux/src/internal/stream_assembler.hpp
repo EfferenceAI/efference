@@ -37,11 +37,10 @@
 namespace ef {
 namespace internal {
 
-// ef_stream reassembly + consumer state, shared by every data-plane reader (USB isoc
-// StreamReader, WiFi UdpStreamReader). Owns the wire-format parse (on_packet), the
-// latest-wins video quad buffer, the IMU ring, and the consumer API (grab /
-// current_video / drain_imu). A concrete reader feeds on_packet() from its transport
-// and implements start()/stop(); one wire-format home means USB and UDP can't drift.
+// ef_stream reassembly + consumer state, shared by every data-plane reader (USB
+// isoc StreamReader, WiFi UdpStreamReader). Owns the wire-format parse (on_packet),
+// the latest-wins video quad buffer, the IMU ring, and the consumer API. A concrete
+// reader feeds on_packet() and implements start()/stop(), so USB and UDP can't drift.
 class StreamAssembler {
 public:
     StreamAssembler() = default;
@@ -81,9 +80,8 @@ public:
     // samples a later drain_imu() owes the recorder. False if none yet.
     bool peek_latest_accel(float out[3]);
 
-    // Codec of the video stream, so the drop-until-IDR gate can classify keyframes.
-    // 0 = RAW/MJPEG (intra, never gated), 1 = H264, 2 = H265. Set once by the Device
-    // before the stream flows.
+    // Video codec for the drop-until-IDR keyframe gate (0 = RAW/MJPEG never gated,
+    // 1 = H264, 2 = H265). Set once by the Device before the stream flows.
     void set_video_codec(int codec) {
         vcodec_.store(codec, std::memory_order_relaxed);
     }
@@ -97,9 +95,9 @@ protected:
     // closed / fatal error). After this, grab() returns END_OF_STREAM.
     void mark_ended();
 
-    // Called (transport thread, no lock) when on_packet() detects a video seq gap
-    // (wire loss). A transport with a back channel (UDP) overrides this to request a
-    // keyframe (PLI); default no-op (USB isoc recovers at the next GOP IDR).
+    // Called (transport thread, no lock) when on_packet() detects a video seq gap.
+    // UDP overrides this to request a keyframe (PLI); default no-op (USB isoc
+    // recovers at the next GOP IDR).
     virtual void on_loss() {}
 
     int  free_vbuf() const;    // a slot not held by consumer/ready/reassembly
@@ -132,8 +130,8 @@ protected:
     bool     have_vseq_ = false;
 
     // Drop-until-IDR resync gate (encoded streams only). Set on wire loss or consumer
-    // supersede; while set, on_packet withholds every complete frame until an IDR/IRAP
-    // resets the decoder reference chain. Starts true so the first delivered frame is a
+    // supersede; while set, on_packet withholds complete frames until an IDR/IRAP
+    // resets the decoder reference chain. Starts true so the first frame is a
     // keyframe. Transport-thread only, no lock.
     bool     resync_pending_ = true;
     // Video codec for keyframe classification (0=RAW/MJPEG, 1=H264, 2=H265).

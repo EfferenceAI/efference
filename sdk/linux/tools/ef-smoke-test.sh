@@ -14,12 +14,15 @@
 #   SKIP_DEEP=1 ./tools/ef-smoke-test.sh     # skip the deep health sweep
 #
 # Env knobs:
-#   EF               ef binary (default: <script>/../build/ef)
+#   EF               ef-cli binary (default: <script>/../build/ef-cli)
 #   EFARGS           extra global flags (e.g. "--verbose", "--device <id>")
 #   TEST_WIFI_SSID   throwaway SSID to add/select/remove (default: ef-smoke-fake)
 #   TEST_WIFI_PSK    its PSK (default: bogus-password-123)
 #   TEST_WIFI_COUNTRY regdomain (default: US)
-#   EFGRAB           ef-grab binary (default: <script>/../build/ef-grab)
+#   TEST_WIFI_AUTHFAIL set to 1 (with a real --wifi-ssid/--wifi-psk) to also test
+#                    wrong-password detection: joins with a bad PSK, expects
+#                    auth_failed, then restores the correct PSK (drops WiFi briefly)
+#   EFGRAB           grab-tutorial binary (default: built from tutorials/grab/cpp on demand)
 #   GRAB_SECS        seconds for the data-plane live-capture smoke (default: 5)
 #   GRAB_BASE        base path for the saved capture .mcap/.h265/.mp4/.png (default: ./efsmoke_grab,
 #                    overwritten each run, NOT cleaned up)
@@ -28,8 +31,9 @@
 #                    OTA update/apply is out of scope, test it separately)
 
 set -u
+export LC_ALL=C   # stable %.2f / strtod formatting so the float greps below don't drift
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EF="${EF:-$HERE/../build/ef}"
+EF="${EF:-$HERE/../build/ef-cli}"
 EFARGS="${EFARGS:-}"
 GARGS="$EFARGS"                          # global flags the helpers use (USB by default; BLE section swaps this)
 TIMEOUT="${TIMEOUT:-330}"                # per-command cap (s): covers deep health ~3min; a hung verb is killed so we move on
@@ -54,6 +58,9 @@ Usage: ef-smoke-test.sh [options]
   --ef PATH             ef binary to use
   --efargs "ARGS"       extra global ef flags (e.g. "--verbose")
   --reboot              reboot the device as the final step
+  --test-calibration    run the destructive calibration set/reset tests (WIPES the
+                        device calibration; snapshots + restores best-effort). Off by
+                        default: without it, only a read-only calibration --get runs.
   --test-upload         record + upload to a built-in local receiver, verify it lands
   --upload-host IP      host IP the device reaches over WiFi (required for --test-upload)
   --upload-port N       receiver port (default 8099)
@@ -76,6 +83,7 @@ while [ $# -gt 0 ]; do
         --ef)           EF="$2";                shift 2;;
         --efargs)       EFARGS="$2";            shift 2;;
         --reboot)       TEST_REBOOT=1;          shift;;
+        --test-calibration) TEST_CALIB=1;       shift;;
         --test-upload)  TEST_UPLOAD=1;          shift;;
         --upload-host)  UPLOAD_HOST="$2";       shift 2;;
         --upload-port)  UPLOAD_PORT="$2";       shift 2;;
@@ -96,6 +104,8 @@ FW_OPENED=0 FW_PORT=""       # set if --open-firewall opened a ufw rule we must 
 RXPID="" RXDIR="" UPSESS=""  # upload-test receiver pid / temp dir / session (for cleanup)
 # Arg-only knobs default here so `set -u` doesn't abort when a flag is omitted.
 UPLOAD_HOST="${UPLOAD_HOST:-}" TEST_UPLOAD="${TEST_UPLOAD:-0}" TEST_REBOOT="${TEST_REBOOT:-0}"
+TEST_CALIB="${TEST_CALIB:-0}"       # destructive calibration tests: opt-in (wipes calib)
+CAL_SNAP=""                          # snapshot of the real calibration, for restore
 
 c_hdr=$'\033[1;36m'; c_cmd=$'\033[1;33m'; c_ok=$'\033[1;32m'
 c_err=$'\033[1;31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
@@ -106,7 +116,7 @@ banner() { printf '\n%s========== %s ==========%s\n' "$c_hdr" "$1" "$c_off"; }
 # run "<description>" <ef args...>. Expect SUCCESS (rc 0). Uses $GARGS (USB or BLE).
 run() {
     local desc="$1"; shift
-    printf '\n%s# %s%s\n%s$ ef %s %s%s\n' "$c_dim" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
+    printf '\n%s# %s%s\n%s$ ef-cli %s %s%s\n' "$c_dim" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
     local out rc
     out="$(EFX $GARGS "$@" 2>&1)"; rc=$?
     printf '%s\n' "$out"
@@ -117,7 +127,7 @@ run() {
 # xfail "<description>" "<expected code substring>" <ef args...>. Expect FAILURE
 xfail() {
     local desc="$1" want="$2"; shift 2
-    printf '\n%s# EXPECT-FAIL (%s): %s%s\n%s$ ef %s %s%s\n' \
+    printf '\n%s# EXPECT-FAIL (%s): %s%s\n%s$ ef-cli %s %s%s\n' \
         "$c_dim" "$want" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
     local out rc
     out="$(EFX $GARGS "$@" 2>&1)"; rc=$?
@@ -131,10 +141,64 @@ xfail() {
     fi
 }
 
+# xfail_rc "<description>" <ef args...>. Like xfail but asserts only a non-zero
+# exit, with no substring match on the message. Use when any failure mode is fine.
+xfail_rc() {
+    local desc="$1"; shift
+    printf '\n%s# EXPECT-FAIL (any error): %s%s\n%s$ ef-cli %s %s%s\n' \
+        "$c_dim" "$desc" "$c_off" "$c_cmd" "$GARGS" "$*" "$c_off"
+    local out rc
+    out="$(EFX $GARGS "$@" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    if [ $rc -ne 0 ]; then
+        printf '%s[correctly failed (rc %d)]%s\n' "$c_ok" "$rc" "$c_off"; xfail_ok=$((xfail_ok+1))
+    else
+        printf '%s[UNEXPECTEDLY SUCCEEDED, expected non-zero exit]%s\n' "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
+    fi
+}
+
+# Snapshot the active calibration into CAL_SNAP as "fx fy cx cy xi alpha W H hw fov"
+# (best-effort, from calibration --get display precision). Empty => uncalibrated.
+snapshot_calibration() {
+    local g; g="$(EFX $GARGS calibration --get 2>&1)"
+    printf '%s' "$g" | grep -q "uncalibrated" && { CAL_SNAP=""; return; }
+    local fx fy cx cy xi al hw fov wh w h
+    fx=$(printf '%s' "$g" | sed -n 's/.*fx=\([-0-9.eE+]*\).*/\1/p')
+    fy=$(printf '%s' "$g" | sed -n 's/.*fy=\([-0-9.eE+]*\).*/\1/p')
+    cx=$(printf '%s' "$g" | sed -n 's/.*cx=\([-0-9.eE+]*\).*/\1/p')
+    cy=$(printf '%s' "$g" | sed -n 's/.*cy=\([-0-9.eE+]*\).*/\1/p')
+    xi=$(printf '%s' "$g" | sed -n 's/.*xi=\([-0-9.eE+]*\).*/\1/p')
+    al=$(printf '%s' "$g" | sed -n 's/.*alpha=\([-0-9.eE+]*\).*/\1/p')
+    hw=$(printf '%s' "$g" | sed -n 's/.*rectify: \(o[nf]*\).*/\1/p')
+    fov=$(printf '%s' "$g" | sed -n 's/.*fov-scale : \([0-9.]*\).*/\1/p')
+    # Calibration resolution isn't shown by --get; use the largest supported mode
+    # (calibration is always at full sensor res), fall back to 1920x1200.
+    wh=$(EFX $GARGS config 2>&1 | grep -oE '[0-9]+x[0-9]+' | sort -t x -k1,1n -k2,2n | tail -1)
+    w=${wh%x*}; h=${wh#*x}; [ -n "$w" ] || { w=1920; h=1200; }
+    [ -n "$fx" ] && CAL_SNAP="$fx $fy $cx $cy $xi $al $w $h ${hw:-off} ${fov:-1.0}" || CAL_SNAP=""
+}
+
+# Restore the CAL_SNAP snapshot (best-effort). Empty snapshot => reset to factory.
+restore_calibration() {
+    if [ -z "$CAL_SNAP" ]; then
+        EFX $EFARGS calibration --camera --reset >/dev/null 2>&1 && echo "calibration reset (was uncalibrated)"
+        return
+    fi
+    # shellcheck disable=SC2086
+    set -- $CAL_SNAP
+    EFX $EFARGS calibration --camera --set "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" \
+        --rectify "$9" --fov-scale "${10}" >/dev/null 2>&1 \
+        && echo "restored calibration snapshot (best-effort, display precision)"
+}
+
 cleanup_done=0
 cleanup() {
     [ "$cleanup_done" = 1 ] && return; cleanup_done=1     # idempotent (INT then EXIT)
     banner "CLEANUP"
+    # Calibration: restore the pre-test snapshot and drop the embed-test recording
+    # (only the destructive path touches these).
+    [ "${TEST_CALIB:-0}" = 1 ] && restore_calibration
+    EFX $EFARGS record delete ef-smoke-cal >/dev/null 2>&1 && echo "deleted ef-smoke-cal"
     EFX $EFARGS record stop            >/dev/null 2>&1
     EFX $EFARGS record delete "$SESSION" >/dev/null 2>&1 && echo "deleted test session $SESSION"
     EFX $EFARGS record delete "$PSESSION" >/dev/null 2>&1 && echo "deleted test session $PSESSION"
@@ -265,6 +329,10 @@ run "read device location"             location
 banner "HEALTH"
 run "shallow health sweep"             health
 if [ "${SKIP_DEEP:-0}" != 1 ]; then
+    # Let the device firmware leave HEALTH_TEST before the next sweep; back-to-back
+    # health checks race it and the second returns DEVICE_NOT_AVAILABLE. (ef state
+    # reports IDLE even mid-health-test, so a settle is more reliable than polling.)
+    sleep 3
     run "deep health sweep (stress ~2-3 min)"  health --deep
 else
     echo "(skipped deep sweep: SKIP_DEEP=1)"
@@ -272,7 +340,10 @@ fi
 
 # ---------------------------------------------------------------------------
 banner "CONFIG: valid set (restore a known-good mode)"
-run "set 1920x1080@30 h265"            config set 1920 1080 30 h265
+# Settle after the health sweep: config set is IDLE-only and a just-finished
+# sweep can leave the device briefly busy (INVALID_FUNCTION_CALL otherwise).
+sleep 2
+run "set 1920x1200@30 h265"            config set 1920 1200 30 h265
 
 # ---------------------------------------------------------------------------
 banner "LOCATION: persistent set/get (session_meta.json)"
@@ -287,17 +358,174 @@ fi
 run "config after set"                 config
 
 # ---------------------------------------------------------------------------
+banner "CALIBRATION: read-only get (always) + set/reset/toggle (opt-in)"
+run "read camera + IMU calibration"    calibration --get
+if [ "${TEST_CALIB:-0}" != 1 ]; then
+    echo "(skipped destructive calibration tests: pass --test-calibration to run;"
+    echo " they WIPE the device calibration; snapshot+restore is best-effort)"
+else
+printf '%s! --test-calibration modifies the device calibration; best-effort restore at exit.%s\n' "$c_err" "$c_off"
+snapshot_calibration
+[ -n "$CAL_SNAP" ] && echo "calibration snapshot: $CAL_SNAP" || echo "calibration snapshot: (uncalibrated)"
+# set intrinsics, confirm they persist + read back (host -> endpoint -> device firmware
+# -> /var/lib/efference/calibration/camera.json -> read).
+run "set camera intrinsics"            calibration --camera --set 702.5 703.1 960 600 0 0.61 1920 1200
+CAL_GET="$(EFX $GARGS calibration --get 2>&1)"
+printf '%s\n' "$CAL_GET"
+if printf '%s' "$CAL_GET" | grep -q "fx=702\.5" && printf '%s' "$CAL_GET" | grep -q "alpha=0\.610000"; then
+    printf '%s[intrinsics applied + read back]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[intrinsics NOT read back]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# ef info must show the same values + "rectify off" (the flag defaults off).
+CAL_INFO="$(EFX $GARGS info 2>&1 | grep calibration)"
+printf '  info: %s\n' "$CAL_INFO"
+if printf '%s' "$CAL_INFO" | grep -q "702\.50" && printf '%s' "$CAL_INFO" | grep -q "rectify off"; then
+    printf '%s[ef info reflects calibration, rectify off]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[ef info calibration mismatch]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# --rectify sets the on-device FEC rectify flag (persisted; rectification itself is not
+# implemented yet). ef info must flip to "rectify on".
+run "set intrinsics with --rectify on"  calibration --camera --set 702.5 703.1 960 600 0 0.61 1920 1200 --rectify on
+if EFX $GARGS info 2>&1 | grep calibration | grep -q "rectify on"; then
+    printf '%s[rectify flag on]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[rectify flag did not turn on]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# Standalone toggle: change rectify / fov-scale WITHOUT re-typing intrinsics
+# (read-modify-write). The intrinsics (fx=702.5) must survive every round-trip.
+run "toggle rectify OFF (standalone)"   calibration --camera --rectify off
+TOG="$(EFX $GARGS calibration --get 2>&1)"
+printf '%s\n' "$TOG"
+if printf '%s' "$TOG" | grep -q "rectify: off" && printf '%s' "$TOG" | grep -q "fx=702\.5"; then
+    printf '%s[rectify off, intrinsics preserved]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[standalone toggle flipped flag wrong or disturbed intrinsics]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+run "toggle rectify ON (standalone)"    calibration --camera --rectify on
+if EFX $GARGS calibration --get 2>&1 | grep -q "rectify: on"; then
+    printf '%s[rectify on (standalone)]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[standalone rectify on did not take]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# --fov-scale alone sets the rectified FOV without touching rectify or intrinsics.
+run "set fov-scale 1.20 (standalone)"      calibration --camera --fov-scale 1.20
+FOV="$(EFX $GARGS calibration --get 2>&1)"
+printf '%s\n' "$FOV"
+if printf '%s' "$FOV" | grep -q "fov-scale : 1.20" && printf '%s' "$FOV" | grep -q "fx=702\.5" \
+   && printf '%s' "$FOV" | grep -q "rectify: on"; then
+    printf '%s[fov-scale 1.20; rectify + intrinsics untouched]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[fov-scale not applied or it clobbered other fields]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# Both flags in one call; also restores fov-scale 1.0 so later steps aren't surprised.
+run "toggle rectify+fov together"       calibration --camera --rectify on --fov-scale 1.00
+if EFX $GARGS calibration --get 2>&1 | grep -q "fov-scale : 1.00"; then
+    printf '%s[combined toggle applied; fov-scale back to 1.00]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[combined toggle / fov restore failed]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# A device-local recording must embed the intrinsics as foxglove.CameraCalibration
+# (distortion_model="double_sphere") while calibration is set. Verify the recorded
+# MCAP carries it (embed is ungated by the rectify flag).
+if [ "${SKIP_RECORD:-0}" != 1 ]; then
+    CAL_MCAP="./efsmoke_cal.mcap"
+    run "record for calibration embed"     record start ef-smoke-cal
+    sleep 2
+    # calibration writes are IDLE-only: a set is rejected while a recording is
+    # active (device is in COLLECT, not IDLE). The rejected set does NOT change the
+    # active calibration, so the embed check below still sees double_sphere.
+    xfail "set calibration while recording (IDLE-only)" INVALID_FUNCTION_CALL \
+        calibration --camera --set 100 100 100 100 0 0.5 1920 1200
+    # The standalone toggle is a calibration write too, so it's IDLE-only as well.
+    xfail "rectify toggle while recording (IDLE-only)" INVALID_FUNCTION_CALL \
+        calibration --camera --rectify off
+    sleep 2
+    run "stop calibration recording"       record stop
+    run "download calibration recording"   download ef-smoke-cal "$CAL_MCAP"
+    if [ -s "$CAL_MCAP" ] && grep -a -q "double_sphere" "$CAL_MCAP"; then
+        printf '%s[MCAP embeds double_sphere intrinsics]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+    else
+        printf '%s[MCAP missing double_sphere intrinsics]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+    fi
+    run "delete calibration recording"     record delete ef-smoke-cal
+    rm -f "$CAL_MCAP"
+else
+    echo "(skipped calibration MCAP-embed check: SKIP_RECORD=1)"
+fi
+
+# reset restores the golden factory default. Assert it moved AWAY from the test
+# intrinsics (702.5) -- holds whether golden is zeroed or a real calibration.
+run "reset camera calibration"         calibration --camera --reset
+if EFX $GARGS calibration --get 2>&1 | grep -q "fx=702\.5"; then
+    printf '%s[reset did NOT clear the test intrinsics]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+else
+    printf '%s[reset cleared the test intrinsics]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+fi
+fi   # end --test-calibration (destructive)
+
+# ---------------------------------------------------------------------------
+banner "CALIBRATION: IMU field-calibration mode + reset (IDLE-only)"
+# The IMU calibration values are written by the field-calibration tutorial
+# (tutorials/calibrate_imu: still + tumble capture -> solve -> set). Here
+# we exercise the control surface the SDK exposes: the on-device capture-mode
+# toggle, reset, report readback, and that a recording embeds the params.
+run "select calibrated IMU capture"    calibration --imu --mode calibrated
+run "select both (raw+calibrated)"     calibration --imu --mode both
+run "reset IMU calibration"            calibration --imu --reset
+# report readback: the IMU block must be present. This reads the field imu.json
+# (device-firmware-owned), not a stale device.json -- the report-path fix.
+IMU_GET="$(EFX $GARGS calibration --get 2>&1)"
+printf '%s\n' "$IMU_GET"
+if printf '%s' "$IMU_GET" | grep -qi "imu calibration"; then
+    printf '%s[calibration --get reports the IMU block]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[calibration --get missing IMU block]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
+# leave the device recording UNCALIBRATED (the data-collection default) for the rest.
+run "back to raw (data-collection default)"  calibration --imu --mode raw
+# A device-local recording must embed the full IMU calibration as
+# efference.ImuCalibration on /camera/imu/0/calibration (params ride as metadata
+# regardless of the capture mode).
+if [ "${SKIP_RECORD:-0}" != 1 ]; then
+    IMU_MCAP="$DLDIR/efsmoke_imucal.mcap"
+    run "record for IMU-cal embed"         record start ef-smoke-imucal
+    sleep 2
+    run "stop IMU-cal recording"           record stop
+    run "download IMU-cal recording"       download ef-smoke-imucal "$IMU_MCAP"
+    if [ -s "$IMU_MCAP" ] && grep -a -q "efference.ImuCalibration" "$IMU_MCAP" \
+       && grep -a -q "camera/imu/0/calibration" "$IMU_MCAP"; then
+        printf '%s[MCAP embeds efference.ImuCalibration on /camera/imu/0/calibration]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+    else
+        printf '%s[MCAP missing the IMU calibration message]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+    fi
+    run "delete IMU-cal recording"         record delete ef-smoke-imucal
+    rm -f "$IMU_MCAP"
+else
+    echo "(skipped IMU-cal MCAP-embed check: SKIP_RECORD=1)"
+fi
+
+# ---------------------------------------------------------------------------
 if [ "${SKIP_GRAB:-0}" != 1 ]; then
-banner "DATA PLANE: live stream smoke (ef-grab: open/grab/retrieve) + save a viewable clip"
-EFGRAB="${EFGRAB:-$HERE/../build/ef-grab}"
+banner "DATA PLANE: live stream smoke (grab tutorial: open/grab/retrieve) + save a viewable clip"
+# The grab tutorial is a standalone project; build it against the SDK build tree
+# on demand (unless EFGRAB points at a prebuilt binary).
+GRABDIR="$HERE/../../../tutorials/grab/cpp"
+if [ -z "${EFGRAB:-}" ] && [ -d "$GRABDIR" ]; then
+    cmake -S "$GRABDIR" -B "$GRABDIR/build" -DCMAKE_PREFIX_PATH="$HERE/../build" >/dev/null 2>&1 \
+        && cmake --build "$GRABDIR/build" >/dev/null 2>&1
+    EFGRAB="$GRABDIR/build/grab"
+fi
+EFGRAB="${EFGRAB:-$GRABDIR/build/grab}"
 GRAB_SECS="${GRAB_SECS:-5}"
 # Fixed base name in the current folder, OVERWRITTEN each run (not cleaned up) so
 # you always have the latest capture to eyeball. Override the location with GRAB_BASE.
 GRAB_BASE="${GRAB_BASE:-./efsmoke_grab}"
 if [ ! -x "$EFGRAB" ]; then
-    echo "${c_err}ef-grab not found at $EFGRAB, skipping data-plane smoke$c_off"
+    echo "${c_err}grab tutorial not found/built at $EFGRAB, skipping data-plane smoke$c_off"
 else
-    printf '\n%s# %ss live capture over the wire (frames / IMU / fps), tee to %s.mcap%s\n%s$ ef-grab %s --codec h265 --record %s.mcap%s\n' \
+    printf '\n%s# %ss live capture over the wire (frames / IMU / fps), tee to %s.mcap%s\n%s$ grab %s --codec h265 --record %s.mcap%s\n' \
         "$c_dim" "$GRAB_SECS" "$GRAB_BASE" "$c_off" "$c_cmd" "$GRAB_SECS" "$GRAB_BASE" "$c_off"
     out="$(timeout -k 5 "$TIMEOUT" "$EFGRAB" "$GRAB_SECS" --codec h265 --record "$GRAB_BASE.mcap" 2>&1)"; rc=$?
     printf '%s\n' "$out"
@@ -321,15 +549,48 @@ echo; echo "(skipped data-plane smoke: SKIP_GRAB=1)"
 fi
 
 # ---------------------------------------------------------------------------
+banner "INTENTIONAL ERROR: raw codec over WiFi/UDP (INSUFFICIENT_WIFI_BANDWIDTH)"
+# Raw NV12 (~830 Mbit/s @1200p30) overruns the WiFi link, so the SDK rejects
+# RAW + a udp_host at open(), before any streaming. efference-viewer is the CLI
+# entry that sets both (init.compression via --codec, plus --udp). 192.0.2.1 is
+# TEST-NET-1 and is never contacted: the guard fires on open() over USB, before
+# the data plane is touched. (The device enforces the same rule at StartStream.)
+EFVIEW="${EFVIEW:-$HERE/../build/efference-viewer}"
+if [ ! -x "$EFVIEW" ]; then
+    echo "${c_dim}(skip raw-over-UDP check: efference-viewer not built at $EFVIEW)${c_off}"
+else
+    printf '\n%s# EXPECT-FAIL (INSUFFICIENT_WIFI_BANDWIDTH): raw over UDP%s\n%s$ efference-viewer --codec raw --udp 192.0.2.1 --headless%s\n' \
+        "$c_dim" "$c_off" "$c_cmd" "$c_off"
+    out="$(timeout -k 5 "$TIMEOUT" "$EFVIEW" --codec raw --udp 192.0.2.1 --headless 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "INSUFFICIENT_WIFI_BANDWIDTH"; then
+        printf '%s[correctly rejected raw-over-UDP at open]%s\n' "$c_ok" "$c_off"; xfail_ok=$((xfail_ok+1))
+    elif [ $rc -ne 0 ]; then
+        printf '%s[failed, but not with INSUFFICIENT_WIFI_BANDWIDTH (rc %d)]%s\n' "$c_err" "$rc" "$c_off"; xfail_bad=$((xfail_bad+1))
+    else
+        printf '%s[UNEXPECTEDLY SUCCEEDED, expected INSUFFICIENT_WIFI_BANDWIDTH]%s\n' "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 banner "INTENTIONAL ERRORS: config (P2/P3 granular codes)"
 xfail "bad resolution"      INVALID_RESOLUTION      config set 9999 9999 30 h265
-xfail "bad fps"             INVALID_FPS             config set 1920 1080 999 h265
+xfail "bad fps"             INVALID_FPS             config set 1920 1200 999 h265
 # The CLI validates the codec client-side (raw|h264|h264hq|h265|h265hq), so a bad
 # codec is rejected before the wire, every wire-valid codec is device-supported,
 # so UNSUPPORTED_COMPRESSION isn't reachable via `config set`. Test the CLI guard.
-xfail "unknown codec (CLI-side reject)" "unknown codec" config set 1920 1080 30 mjpeg
+xfail "unknown codec (CLI-side reject)" "unknown codec" config set 1920 1200 30 mjpeg
 xfail "location set missing args (CLI reject)"     "need <lat>"  location set 40.0
 xfail "record --location bad format (CLI reject)"  "LAT,LON"     record start --location not-a-coord
+xfail "calibration set wrong arg count (CLI reject)" "usage"     calibration --camera --set 1 2 3
+xfail "rectify bad value (CLI reject)"     "wants 'on' or 'off'"   calibration --camera --rectify maybe
+xfail "fov-scale missing value (CLI reject)"  "wants a value"         calibration --camera --fov-scale
+xfail "fov-scale non-positive (CLI reject)"   "positive number"       calibration --camera --fov-scale 0
+xfail "fov-scale not a number (CLI reject)"    "positive number"       calibration --camera --fov-scale abc
+xfail "rectify toggle on --imu (CLI reject)"  "apply to --camera only" calibration --imu --rectify on
+xfail "rectify flags with stray args (CLI reject)" "unexpected arguments" calibration --camera --rectify on 1920 1080
+xfail "imu bad capture mode (CLI reject)"  "unknown imu mode"    calibration --imu --mode bogus
+xfail_rc "imu --set points to the field-cal tool" calibration --imu --set
 
 # ---------------------------------------------------------------------------
 banner "INTENTIONAL ERRORS: recording / state"
@@ -504,6 +765,31 @@ else
     echo "(keeping '$TEST_WIFI_SSID', it's your real network; not removing so the device stays connected)"
 fi
 xfail "select a network not saved" INVALID_FUNCTION_CALL wifi select definitely-not-saved
+# Removing a never-saved ssid must report not-saved, NOT a false "forgotten"
+# success, and must never wipe the whole store (the bug this guards).
+xfail "remove a network not saved" "not a saved network" wifi remove definitely-not-saved
+
+# Wrong-password detection: add the REAL network with a deliberately bad PSK and
+# confirm the device reports auth_failed within seconds (not an endless
+# "connecting"), then restore the correct PSK so it reconnects. Opt-in
+# (TEST_WIFI_AUTHFAIL=1) and needs a real --wifi-ssid/--wifi-psk, since it briefly
+# drops the live WiFi link. Only the device (wpa_supplicant) can prove this.
+if [ "${TEST_WIFI_AUTHFAIL:-0}" = 1 ] && [ "$TEST_WIFI_SSID" != "ef-smoke-fake" ] \
+   && [ -n "$TEST_WIFI_PSK" ]; then
+    banner "WIFI WRONG-PASSWORD (auth_failed) for real net '$TEST_WIFI_SSID'"
+    run "forget real net (drop live link)" wifi remove "$TEST_WIFI_SSID"
+    run "add real net with WRONG psk"      wifi add "$TEST_WIFI_SSID" definitely-wrong-psk-123 "$TEST_WIFI_COUNTRY"
+    authfail_ok=0
+    for i in 1 2 3 4 5 6; do
+        printf '\n%s# auth_failed poll %d/6%s\n' "$c_dim" "$i" "$c_off"
+        authfail_out=$(EFX $EFARGS wifi status 2>&1); printf '%s\n' "$authfail_out"
+        printf '%s' "$authfail_out" | grep -qi "authentication failed" && { authfail_ok=1; break; }
+        sleep 2
+    done
+    [ "$authfail_ok" = 1 ] && echo "${c_ok}PASS: reported auth_failed for wrong password$c_off" \
+                           || echo "${c_err}FAIL: never reported auth_failed$c_off"
+    run "restore correct psk" wifi add "$TEST_WIFI_SSID" "$TEST_WIFI_PSK" "$TEST_WIFI_COUNTRY"
+fi
 else
 echo; echo "(skipped wifi mutation: SKIP_WIFI=1)"
 fi
@@ -531,7 +817,7 @@ else
     run "BLE: recording list"            record list
     run "BLE: shallow health"            health
     # Explicit wrong-password check (bypasses $GARGS to force a bad password):
-    printf '\n%s# EXPECT-FAIL (INVALID_PASSWORD): BLE wrong password%s\n%s$ ef --ble %s --password WRONGPASS state%s\n' \
+    printf '\n%s# EXPECT-FAIL (INVALID_PASSWORD): BLE wrong password%s\n%s$ ef-cli --ble %s --password WRONGPASS state%s\n' \
         "$c_dim" "$c_off" "$c_cmd" "$BLE_MAC" "$c_off"
     if out="$(EFX --ble "$BLE_MAC" --password WRONGPASS state 2>&1)"; then
         printf '%s\n%s[UNEXPECTEDLY SUCCEEDED, expected INVALID_PASSWORD]%s\n' "$out" "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
@@ -568,7 +854,7 @@ if [ "${TEST_REBOOT:-0}" = 1 ]; then
     banner "REBOOT (opt-in: TEST_REBOOT=1)"
     cleanup
     trap - EXIT
-    printf '\n%s# reboot the device (session ends here)%s\n%s$ ef %s reboot%s\n' \
+    printf '\n%s# reboot the device (session ends here)%s\n%s$ ef-cli %s reboot%s\n' \
         "$c_dim" "$c_off" "$c_cmd" "$EFARGS" "$c_off"
     EFX $EFARGS reboot 2>&1
     echo "reboot issued, the device is restarting; reconnect and re-run to verify it came back."

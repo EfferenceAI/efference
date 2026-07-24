@@ -42,6 +42,7 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::INVALID_PASSWORD:               return "INVALID_PASSWORD";
         case ERROR_CODE::INSUFFICIENT_PERMISSIONS:       return "INSUFFICIENT_PERMISSIONS";
         case ERROR_CODE::UNSUPPORTED:                    return "UNSUPPORTED";
+        case ERROR_CODE::DEVICE_BUSY:                    return "DEVICE_BUSY";
         case ERROR_CODE::INVALID_RESOLUTION:             return "INVALID_RESOLUTION";
         case ERROR_CODE::INVALID_FPS:                    return "INVALID_FPS";
         case ERROR_CODE::UNSUPPORTED_COMPRESSION:        return "UNSUPPORTED_COMPRESSION";
@@ -52,6 +53,7 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::CANNOT_START_CAMERA_STREAM:     return "CANNOT_START_CAMERA_STREAM";
         case ERROR_CODE::COMMUNICATION_ERROR:            return "COMMUNICATION_ERROR";
         case ERROR_CODE::WIFI_NOT_CONNECTED:             return "WIFI_NOT_CONNECTED";
+        case ERROR_CODE::INSUFFICIENT_WIFI_BANDWIDTH:    return "INSUFFICIENT_WIFI_BANDWIDTH";
         case ERROR_CODE::CORRUPTED_FRAME:                return "CORRUPTED_FRAME";
         case ERROR_CODE::SESSION_RECORDING_ERROR:        return "SESSION_RECORDING_ERROR";
         case ERROR_CODE::END_OF_BUFFER:                  return "END_OF_BUFFER";
@@ -205,6 +207,10 @@ const char* to_string(UPDATE_STATE s) {
         case UPDATE_STATE::VERIFYING:      return "VERIFYING";
         case UPDATE_STATE::READY_TO_APPLY: return "READY_TO_APPLY";
         case UPDATE_STATE::APPLYING:       return "APPLYING";
+        case UPDATE_STATE::CHECKING:       return "CHECKING";
+        case UPDATE_STATE::UPLOADING:      return "UPLOADING";
+        case UPDATE_STATE::REBOOTING:      return "REBOOTING";
+        case UPDATE_STATE::RECONNECTING:   return "RECONNECTING";
     }
     return "DOWNLOADING";
 }
@@ -217,6 +223,15 @@ const char* to_string(MAT_TYPE t) {
         case MAT_TYPE::NV12:  return "NV12";
     }
     return "NV12";
+}
+
+const char* to_string(IMU_DATA d) {
+    switch (d) {
+        case IMU_DATA::RAW:        return "raw";
+        case IMU_DATA::CALIBRATED: return "calibrated";
+        case IMU_DATA::BOTH:       return "both";
+    }
+    return "raw";
 }
 
 }  // namespace ef

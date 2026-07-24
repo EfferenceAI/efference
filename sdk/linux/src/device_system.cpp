@@ -145,7 +145,10 @@ ERROR_CODE Device::wifi_remove(const std::string& ssid) {
     req.which_body = ef_v1_Request_wifi_remove_tag;
     std::snprintf(req.body.wifi_remove.ssid, sizeof req.body.wifi_remove.ssid, "%s", ssid.c_str());
     WireResponse resp;
-    ERROR_CODE ec = impl_->call(req, resp);
+    // Ctx::WIFI keeps a device-side BUSY distinct (DEVICE_BUSY, retryable) from
+    // "not a saved network" (NOT_FOUND -> INVALID_FUNCTION_CALL); the CLI leans on
+    // that split to word the failure.
+    ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::WIFI);
     if (ec == ERROR_CODE::SUCCESS) {
         auto& v = impl_->info.wireless.saved_networks;
         for (auto it = v.begin(); it != v.end();) it = (*it == ssid) ? v.erase(it) : it + 1;
@@ -164,6 +167,26 @@ ERROR_CODE Device::wifi_select(const std::string& ssid) {
     ERROR_CODE ec = impl_->call(req, resp);
     if (ec == ERROR_CODE::SUCCESS) impl_->refresh_wireless();
     return ec;
+}
+
+ERROR_CODE Device::scan_wifi_networks(std::vector<WifiNetwork>& out) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_wifi_scan_tag;
+    WireResponse resp;
+    // Ctx::WIFI maps a device-side BUSY (recording/livestream) to a retryable
+    // ERROR_CODE::BUSY; leave `out` untouched so the caller can retry in place.
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_wifi_scan_result_tag,
+                                Ctx::WIFI);
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    const ef_v1_WifiScanResult& r = resp.body.wifi_scan_result;
+    out.clear();
+    out.reserve(r.networks_count);
+    for (pb_size_t i = 0; i < r.networks_count; i++)
+        out.push_back({r.networks[i].ssid, r.networks[i].rssi, r.networks[i].secured});
+    std::sort(out.begin(), out.end(),
+              [](const WifiNetwork& a, const WifiNetwork& b) { return a.rssi > b.rssi; });
+    return ERROR_CODE::SUCCESS;
 }
 
 // ---- system --------------------------------------------------------------------------
@@ -250,6 +273,68 @@ ERROR_CODE Device::get_location(Location& out) {
     return ERROR_CODE::SUCCESS;
 }
 
+ERROR_CODE Device::set_camera_calibration(const CalibrationParameters& c,
+                                          int width, int height) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_set_calibration_tag;
+    req.body.set_calibration.which_target = ef_v1_SetCalibration_camera_tag;
+    ef_v1_CameraIntrinsics& cam = req.body.set_calibration.target.camera;
+    cam.fx     = c.fx;
+    cam.fy     = c.fy;
+    cam.cx     = c.cx;
+    cam.cy     = c.cy;
+    cam.xi     = c.xi;
+    cam.alpha  = c.alpha;
+    cam.width  = (uint32_t)width;
+    cam.height = (uint32_t)height;
+    cam.rectify = c.rectify;   // on-device FEC rectification (default off)
+    cam.fov_scale  = c.fov_scale;    // rectified-output FOV scale (default 1.0)
+    // extrinsics_quat intentionally left empty (meaning undefined; see proto).
+    WireResponse resp;
+    // The device rejects a write outside IDLE (INVALID_STATE -> INVALID_FUNCTION_CALL).
+    return impl_->call(req, resp);
+}
+
+ERROR_CODE Device::set_imu_calibration(const ImuCalibrationParameters& c) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_set_calibration_tag;
+    req.body.set_calibration.which_target = ef_v1_SetCalibration_imu_tag;
+    ef_v1_ImuCalibration& im = req.body.set_calibration.target.imu;
+    im.accel_bias_count = 3;
+    im.gyro_bias_count  = 3;
+    for (int i = 0; i < 3; i++) { im.accel_bias[i] = c.accel_bias[i]; im.gyro_bias[i] = c.gyro_bias[i]; }
+    im.accel_scale_misalign_count = 9;
+    im.gyro_scale_misalign_count  = 9;
+    for (int i = 0; i < 9; i++) {
+        im.accel_scale_misalign[i] = c.accel_scale_misalign[i];
+        im.gyro_scale_misalign[i]  = c.gyro_scale_misalign[i];
+    }
+    im.accel_noise_density    = c.accel_noise_density;
+    im.gyro_noise_density     = c.gyro_noise_density;
+    im.accel_bias_random_walk = c.accel_bias_random_walk;
+    im.gyro_bias_random_walk  = c.gyro_bias_random_walk;
+    im.accel_tau              = c.accel_tau;
+    im.gyro_tau               = c.gyro_tau;
+    im.imu_to_camera_count = 16;
+    for (int i = 0; i < 16; i++) im.imu_to_camera[i] = c.imu_to_camera[i];
+    im.time_offset_ns = c.time_offset_ns;
+    WireResponse resp;
+    // IDLE-only on the device; applied on the next capture session.
+    return impl_->call(req, resp);
+}
+
+ERROR_CODE Device::reset_calibration(bool camera, bool imu) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body                  = ef_v1_Request_reset_calibration_tag;
+    req.body.reset_calibration.camera = camera;
+    req.body.reset_calibration.imu    = imu;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
 ERROR_CODE Device::reboot() {
     if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     WireRequest req = ef_v1_Request_init_zero;
@@ -284,6 +369,31 @@ ERROR_CODE Device::set_configuration(int width, int height, int fps,
     ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::SESSION);
     // Same INVALID_PARAMETER disambiguation configure_session() uses: the wire
     // collapses every bad knob into INVALID_PARAMETER; the reason string names it.
+    return disambiguate_config_error(ec, resp);
+}
+
+ERROR_CODE Device::set_configuration(int width, int height, int fps,
+                                     COMPRESSION_MODE codec, IMU_DATA imu_data) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body                        = ef_v1_Request_configure_tag;
+    req.body.configure.has_video          = true;
+    req.body.configure.video.width        = (uint32_t)width;
+    req.body.configure.video.height       = (uint32_t)height;
+    req.body.configure.video.fps          = (uint32_t)fps;
+    req.body.configure.video.pixel_format = ef_v1_PixelFormat_NV12;
+    req.body.configure.video.codec        = pb_codec(codec);
+    req.body.configure.video.quality      = quality_for(codec);
+    // IMU capture-mode select (proto ImuConfig.data). has_imu makes it opt-in on
+    // the device side (the endpoint forwards "imu_calibrate" only when present),
+    // so this overload is the only path that changes the persisted IMU mode.
+    req.body.configure.has_imu            = true;
+    req.body.configure.imu.data =
+        imu_data == IMU_DATA::CALIBRATED ? ef_v1_ImuData_IMU_CALIBRATED :
+        imu_data == IMU_DATA::BOTH       ? ef_v1_ImuData_IMU_BOTH       :
+                                           ef_v1_ImuData_IMU_RAW;
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::SESSION);
     return disambiguate_config_error(ec, resp);
 }
 

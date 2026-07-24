@@ -39,6 +39,7 @@ UpdateStatus update_from_wire(const WireOta& s) {
     u.target_version_int  = s.target_version_int;
     switch (s.phase) {
         case ef_v1_OtaPhase_OTA_CHECKING:
+            u.active = true; u.state = UPDATE_STATE::CHECKING; break;
         case ef_v1_OtaPhase_OTA_DOWNLOADING:
             u.active = true; u.state = UPDATE_STATE::DOWNLOADING; break;
         case ef_v1_OtaPhase_OTA_VERIFYING:
@@ -46,8 +47,9 @@ UpdateStatus update_from_wire(const WireOta& s) {
         case ef_v1_OtaPhase_OTA_READY:
             u.active = true; u.state = UPDATE_STATE::READY_TO_APPLY; break;
         case ef_v1_OtaPhase_OTA_APPLYING:
-        case ef_v1_OtaPhase_OTA_REBOOTING:
             u.active = true; u.state = UPDATE_STATE::APPLYING; break;
+        case ef_v1_OtaPhase_OTA_REBOOTING:
+            u.active = true; u.state = UPDATE_STATE::REBOOTING; break;
         case ef_v1_OtaPhase_OTA_ERROR:
         case ef_v1_OtaPhase_OTA_ROLLEDBACK:
             u.last_error = ERROR_CODE::FAILED_TO_UPDATE; break;
@@ -166,36 +168,47 @@ ERROR_CODE Device::update(const std::string& url,
 
     // 1. Get the image onto the device (sideload push or device-side download).
     if (sideload) {
-        // Sideload progress reads as the DOWNLOADING phase, the device is
-        // downloading from this host, just over the control link.
+        // A host->device push; report it as UPLOADING, not the device's DOWNLOADING.
         auto push_progress = [&](uint64_t sent, uint64_t total) {
             if (!on_progress) return;
             UpdateStatus u;
             u.active   = true;
-            u.state    = UPDATE_STATE::DOWNLOADING;
+            u.state    = UPDATE_STATE::UPLOADING;
             u.progress = total ? (int)((sent * 100) / total) : -1;
+            u.message  = "sending update.eff over the wire";
             on_progress(u);
         };
         ERROR_CODE ec = impl_->ota_push(url, push_progress);
         if (ec != ERROR_CODE::SUCCESS) return bail(ec);
     } else {
-        // Only the "" = configured-server path is gated by check_update(): OtaCheck
-        // consults the device's CONFIGURED server (proto carries no URL), so gating an
-        // explicit caller URL on it could skip a reachable LAN mirror. Explicit URL
-        // goes straight to ota_download.
-        if (url.empty()) {
-            bool available = false;
-            ERROR_CODE ec = check_update(available);
+        // Attach to an in-flight OTA rather than starting a competing download the device
+        // would refuse. Only pre-apply phases can still reach READY; assumes same target.
+        UpdateStatus cur;
+        const bool in_flight =
+            get_update_status(cur) == ERROR_CODE::SUCCESS && cur.active &&
+            (cur.state == UPDATE_STATE::CHECKING ||
+             cur.state == UPDATE_STATE::DOWNLOADING ||
+             cur.state == UPDATE_STATE::VERIFYING ||
+             cur.state == UPDATE_STATE::READY_TO_APPLY);
+        if (!in_flight) {
+            // Only the "" = configured-server path is gated by check_update(): OtaCheck
+            // consults the device's CONFIGURED server (proto carries no URL), so gating an
+            // explicit caller URL on it could skip a reachable LAN mirror. Explicit URL
+            // goes straight to ota_download.
+            if (url.empty()) {
+                bool available = false;
+                ERROR_CODE ec = check_update(available);
+                if (ec != ERROR_CODE::SUCCESS) return bail(ec);
+                if (!available)                return bail(ERROR_CODE::DEVICE_UP_TO_DATE);
+            }
+            WireRequest req = ef_v1_Request_init_zero;
+            req.which_body = ef_v1_Request_ota_download_tag;
+            std::snprintf(req.body.ota_download.base_url,
+                          sizeof req.body.ota_download.base_url, "%s", url.c_str());
+            WireResponse resp;
+            ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::UPDATE);
             if (ec != ERROR_CODE::SUCCESS) return bail(ec);
-            if (!available)                return bail(ERROR_CODE::DEVICE_UP_TO_DATE);
         }
-        WireRequest req = ef_v1_Request_init_zero;
-        req.which_body = ef_v1_Request_ota_download_tag;
-        std::snprintf(req.body.ota_download.base_url,
-                      sizeof req.body.ota_download.base_url, "%s", url.c_str());
-        WireResponse resp;
-        ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::UPDATE);
-        if (ec != ERROR_CODE::SUCCESS) return bail(ec);
     }
 
     // 2. Device-side verify, reporting progress until READY. The acquire verbs are
@@ -205,11 +218,22 @@ ERROR_CODE Device::update(const std::string& url,
     auto deadline    = std::chrono::steady_clock::now() + std::chrono::minutes(15);
     auto start_grace = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     bool seen_active = false;
+    // Poll a control-only link (BLE) gently: it is fragile and shares the radio with
+    // the WiFi download. USB (has_stream) can poll fast. Future: subscribe to the
+    // device's OTA Event notify over BLE instead of polling.
+    const bool control_only = impl_->connection && !impl_->connection->has_stream();
+    const auto poll_interval = std::chrono::seconds(control_only ? 5 : 1);
     for (;;) {
         UpdateStatus u;
         ERROR_CODE ec = get_update_status(u);
         if (ec != ERROR_CODE::SUCCESS) return bail(ec);
-        if (on_progress) on_progress(u);
+        // A stale error from a prior attempt (before this op goes active) is ignored
+        // below; don't render it either, or the caller shows a spurious FAIL.
+        const bool terminal = (u.last_error == ERROR_CODE::FAILED_TO_UPDATE ||
+                               u.last_error == ERROR_CODE::DEVICE_UP_TO_DATE);
+        const bool ignoring = terminal && !seen_active &&
+                              std::chrono::steady_clock::now() < start_grace;
+        if (on_progress && !ignoring) on_progress(u);
         if (u.active) seen_active = true;
         if (u.active && u.state == UPDATE_STATE::READY_TO_APPLY) break;
         if ((u.last_error == ERROR_CODE::FAILED_TO_UPDATE ||
@@ -217,11 +241,21 @@ ERROR_CODE Device::update(const std::string& url,
             (seen_active || std::chrono::steady_clock::now() >= start_grace))
             return bail(u.last_error);
         if (std::chrono::steady_clock::now() >= deadline) return bail(ERROR_CODE::FAILED_TO_UPDATE);
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(poll_interval);
     }
+
+    // Report a phase for the host-driven window (apply/reboot/reconnect), where
+    // there is no device status to poll.
+    auto report = [&](UPDATE_STATE st, int progress, const std::string& msg) {
+        if (!on_progress) return;
+        UpdateStatus u;
+        u.active = true; u.state = st; u.progress = progress; u.message = msg;
+        on_progress(u);
+    };
 
     // 3. Apply, the device writes the boot slot and reboots underneath the host.
     {
+        report(UPDATE_STATE::APPLYING, -1, "writing boot slot");
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_ota_apply_tag;
         WireResponse resp;
@@ -229,25 +263,38 @@ ERROR_CODE Device::update(const std::string& url,
         if (ec != ERROR_CODE::SUCCESS) return bail(ec);
     }
 
-    // 4. Reconnect after the reboot, then confirm what's running.
+    // 4. Reconnect after the reboot, then confirm what's running. Report REBOOTING/
+    // RECONNECTING so the caller sees the window advance, not a frozen bar.
+    report(UPDATE_STATE::REBOOTING, -1, "device restarting");
     const InitParameters saved = impl_->init;
     impl_->close_transport();
     std::this_thread::sleep_for(std::chrono::seconds(5));
     ERROR_CODE reopened = ERROR_CODE::DEVICE_NOT_DETECTED;
-    auto reconnect_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(3);
+    const auto reconnect_start = std::chrono::steady_clock::now();
+    const auto reconnect_deadline = reconnect_start + std::chrono::minutes(3);
     while (std::chrono::steady_clock::now() < reconnect_deadline) {
+        // Elapsed is appended by the host renderer; don't duplicate it in the message.
+        report(UPDATE_STATE::RECONNECTING, -1, "waiting for device");
         reopened = open(saved);
         if (reopened == ERROR_CODE::SUCCESS) break;
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
-    if (reopened != ERROR_CODE::SUCCESS) return ERROR_CODE::FAILED_TO_UPDATE;
-
-    // Rolled back or same version => the update did not take.
-    UpdateStatus u;
-    if (get_update_status(u) == ERROR_CODE::SUCCESS && on_progress) on_progress(u);
-    if (u.last_error == ERROR_CODE::FAILED_TO_UPDATE ||
-        impl_->info.firmware_version <= old_version)
+    // Distinguish the three outcomes so the caller can show why it failed.
+    if (reopened != ERROR_CODE::SUCCESS) {
+        report(UPDATE_STATE::RECONNECTING, -1,
+               "device did not come back after reboot (possible crash)");
         return ERROR_CODE::FAILED_TO_UPDATE;
+    }
+    // For the rollback check only; don't render it (a stale post-boot "rebooting"
+    // phase would draw a duplicate line).
+    UpdateStatus u;
+    get_update_status(u);
+    if (u.last_error == ERROR_CODE::FAILED_TO_UPDATE ||
+        impl_->info.firmware_version <= old_version) {
+        report(UPDATE_STATE::RECONNECTING, -1,
+               "device rebooted but is still on the old version (update rejected / rolled back)");
+        return ERROR_CODE::FAILED_TO_UPDATE;
+    }
     return ERROR_CODE::SUCCESS;
 }
 

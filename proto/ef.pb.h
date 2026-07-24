@@ -23,7 +23,7 @@ typedef enum _ef_v1_ErrorCode {
     ef_v1_ErrorCode_TIMEOUT = 8,
     ef_v1_ErrorCode_NOT_SUPERSPEED = 9,
     ef_v1_ErrorCode_CORRUPTED_FRAME = 10,
-    ef_v1_ErrorCode_ORCHESTRATOR_UNREACHABLE = 11,
+    ef_v1_ErrorCode_DEVICE_SERVICE_UNREACHABLE = 11,
     ef_v1_ErrorCode_INVALID_STATE = 12,
     ef_v1_ErrorCode_WIFI_NOT_CONNECTED = 13,
     ef_v1_ErrorCode_NOT_FOUND = 14,
@@ -142,6 +142,15 @@ typedef enum _ef_v1_RateControl {
     ef_v1_RateControl_RC_FIXQP = 3
 } ef_v1_RateControl;
 
+/* IMU capture mode. Default IMU_RAW: record uncalibrated samples + carry the full
+ ImuCalibration params as metadata (consumer applies M·S·(x−b)). IMU_CALIBRATED: the
+ device applies the calibration to the samples on-device. IMU_BOTH: emit both (dual topics). */
+typedef enum _ef_v1_ImuData {
+    ef_v1_ImuData_IMU_RAW = 0,
+    ef_v1_ImuData_IMU_CALIBRATED = 1,
+    ef_v1_ImuData_IMU_BOTH = 2
+} ef_v1_ImuData;
+
 typedef enum _ef_v1_StreamTarget_Kind {
     ef_v1_StreamTarget_Kind_LOCAL = 0,
     ef_v1_StreamTarget_Kind_ONLINE = 1
@@ -152,7 +161,7 @@ typedef enum _ef_v1_StreamTarget_Kind {
 typedef struct _ef_v1_VideoConfig {
     uint32_t width;
     uint32_t height;
-    uint32_t fps; /* 1920x1080x60 */
+    uint32_t fps; /* e.g. 1920x1200x30 */
     ef_v1_PixelFormat pixel_format; /* NV12 v1 */
     ef_v1_Codec codec; /* only meaningful in BULK_COLLECT */
     uint32_t quality; /* encoder quality 1-100 (0 = device default); HQ presets use a high value */
@@ -163,6 +172,7 @@ typedef struct _ef_v1_ImuConfig {
     uint32_t rate_hz;
     uint32_t accel_range_g;
     uint32_t gyro_range_dps;
+    ef_v1_ImuData data;
 } ef_v1_ImuConfig;
 
 typedef struct _ef_v1_Configure {
@@ -502,10 +512,9 @@ typedef struct _ef_v1_WifiStatus {
     bool internet;
     double mbps_down;
     double mbps_up;
-    /* Association phase bucketed from wpa_state: "connected" /
- "connecting" / "disconnected". Lets the host tell a mid-
- association attempt from a genuinely idle link (connected
- stays for back-compat = state == "connected"). */
+    /* Association phase from wpa_state: "connected" / "connecting"
+ / "disconnected" / "auth_failed" (last connect rejected, e.g.
+ wrong password). "connected" stays for back-compat. */
     char state[16];
     int32_t link_speed; /* negotiated PHY link rate, Mbps (0 = unknown) */
     int32_t freq_mhz; /* associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz) */
@@ -622,6 +631,8 @@ typedef struct _ef_v1_CameraIntrinsics { /* Double-Sphere */
     uint32_t height;
     pb_size_t extrinsics_quat_count;
     double extrinsics_quat[4];
+    bool rectify; /* perform rectification on-device via FEC hardware (default false); intrinsics are always published as metadata regardless */
+    double fov_scale; /* rectified-output FOV scale (rectify path); default 1.0, <1 widens (more periphery), >1 zooms the clean center */
 } ef_v1_CameraIntrinsics;
 
 typedef struct _ef_v1_ImuCalibration {
@@ -633,6 +644,18 @@ typedef struct _ef_v1_ImuCalibration {
     double gyro_noise_density;
     pb_size_t imu_to_camera_count;
     double imu_to_camera[16];
+    /* ---- additive (6+): full per-sensor M·S·(x−b) model + noise-model + temporal (IMU lane, 2026-07-21).
+ Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
+ uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream. */
+    pb_size_t accel_scale_misalign_count;
+    double accel_scale_misalign[9]; /* accel 3x3 M·S, row-major (empty = identity) */
+    pb_size_t gyro_scale_misalign_count;
+    double gyro_scale_misalign[9]; /* gyro  3x3 M·S, row-major (empty = identity; model is bias-only) */
+    double accel_bias_random_walk; /* Allan +1/2 slope */
+    double gyro_bias_random_walk;
+    double accel_tau; /* bias-instability correlation time (Gauss-Markov), s */
+    double gyro_tau;
+    int64_t time_offset_ns; /* IMU->camera temporal offset (0 when HW-sync only) */
 } ef_v1_ImuCalibration;
 
 typedef struct _ef_v1_DeviceInformation {
@@ -662,6 +685,23 @@ typedef struct _ef_v1_DeviceInformation {
     char wifi_mac[18]; /* WiFi MAC from vendor storage (item 2), "" if unprovisioned */
     char bt_mac[18]; /* BT MAC from vendor storage (item 4), "" if unprovisioned */
 } ef_v1_DeviceInformation;
+
+/* Write calibration for one sensor (IDLE only; applied on the next capture
+ session). Get is folded into GetDeviceInformation (camera/imu fields). */
+typedef struct _ef_v1_SetCalibration {
+    pb_size_t which_target;
+    union {
+        ef_v1_CameraIntrinsics camera;
+        ef_v1_ImuCalibration imu;
+    } target;
+} ef_v1_SetCalibration;
+
+/* Restore factory-default calibration for the selected sensor(s) (IDLE only).
+ Camera factory default is currently all-zeros (uncalibrated). */
+typedef struct _ef_v1_ResetCalibration {
+    bool camera;
+    bool imu;
+} ef_v1_ResetCalibration;
 
 /* ============================ Auth / access control ============================
  BLE control is gated by a user password (default 123456, rekeyable). The device
@@ -780,6 +820,9 @@ typedef struct _ef_v1_Request {
         ef_v1_GetState get_state;
         ef_v1_SetLocation set_location; /* persist device location on the device */
         ef_v1_GetLocation get_location; /* read current effective device location */
+        /* calibration (per-sensor; get is folded into GetDeviceInformation.camera/imu) */
+        ef_v1_SetCalibration set_calibration; /* write intrinsics (IDLE only, next session) */
+        ef_v1_ResetCalibration reset_calibration; /* restore factory default (IDLE only) */
         /* auth / access control (BLE password is user-facing) */
         ef_v1_GetAuthChallenge get_auth_challenge; /* device -> nonce (BLE auth handshake) */
         ef_v1_Authenticate authenticate; /* prove the BLE password (HMAC over nonce) */
@@ -857,6 +900,10 @@ extern "C" {
 #define _ef_v1_RateControl_MAX ef_v1_RateControl_RC_FIXQP
 #define _ef_v1_RateControl_ARRAYSIZE ((ef_v1_RateControl)(ef_v1_RateControl_RC_FIXQP+1))
 
+#define _ef_v1_ImuData_MIN ef_v1_ImuData_IMU_RAW
+#define _ef_v1_ImuData_MAX ef_v1_ImuData_IMU_BOTH
+#define _ef_v1_ImuData_ARRAYSIZE ((ef_v1_ImuData)(ef_v1_ImuData_IMU_BOTH+1))
+
 #define _ef_v1_StreamTarget_Kind_MIN ef_v1_StreamTarget_Kind_LOCAL
 #define _ef_v1_StreamTarget_Kind_MAX ef_v1_StreamTarget_Kind_ONLINE
 #define _ef_v1_StreamTarget_Kind_ARRAYSIZE ((ef_v1_StreamTarget_Kind)(ef_v1_StreamTarget_Kind_ONLINE+1))
@@ -867,6 +914,7 @@ extern "C" {
 #define ef_v1_VideoConfig_pixel_format_ENUMTYPE ef_v1_PixelFormat
 #define ef_v1_VideoConfig_codec_ENUMTYPE ef_v1_Codec
 
+#define ef_v1_ImuConfig_data_ENUMTYPE ef_v1_ImuData
 
 #define ef_v1_Configure_mode_ENUMTYPE ef_v1_Mode
 
@@ -971,11 +1019,13 @@ extern "C" {
 
 
 
+
+
 /* Initializer values for message structs */
 #define ef_v1_Request_init_default               {0, 0, {ef_v1_GetDeviceInformation_init_default}}
 #define ef_v1_Response_init_default              {0, _ef_v1_ErrorCode_MIN, "", 0, {ef_v1_DeviceInformation_init_default}}
 #define ef_v1_VideoConfig_init_default           {0, 0, 0, _ef_v1_PixelFormat_MIN, _ef_v1_Codec_MIN, 0}
-#define ef_v1_ImuConfig_init_default             {0, 0, 0, 0}
+#define ef_v1_ImuConfig_init_default             {0, 0, 0, 0, _ef_v1_ImuData_MIN}
 #define ef_v1_Configure_init_default             {_ef_v1_Mode_MIN, false, ef_v1_VideoConfig_init_default, false, ef_v1_ImuConfig_init_default}
 #define ef_v1_StartStream_init_default           {_ef_v1_Mode_MIN, false, ef_v1_StreamTarget_init_default}
 #define ef_v1_StreamTarget_init_default          {_ef_v1_StreamTarget_Kind_MIN, "", 0, _ef_v1_Protocol_MIN}
@@ -1049,8 +1099,10 @@ extern "C" {
 #define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", ""}
 #define ef_v1_CapMode_init_default               {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_default          {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default}}
-#define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}}
-#define ef_v1_ImuCalibration_init_default        {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+#define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
+#define ef_v1_ImuCalibration_init_default        {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0, 0}
+#define ef_v1_SetCalibration_init_default        {0, {ef_v1_CameraIntrinsics_init_default}}
+#define ef_v1_ResetCalibration_init_default      {0, 0}
 #define ef_v1_GetAuthChallenge_init_default      {0}
 #define ef_v1_AuthChallenge_init_default         {{0, {0}}, {0, {0}}, 0}
 #define ef_v1_Authenticate_init_default          {{0, {0}}}
@@ -1058,7 +1110,7 @@ extern "C" {
 #define ef_v1_Request_init_zero                  {0, 0, {ef_v1_GetDeviceInformation_init_zero}}
 #define ef_v1_Response_init_zero                 {0, _ef_v1_ErrorCode_MIN, "", 0, {ef_v1_DeviceInformation_init_zero}}
 #define ef_v1_VideoConfig_init_zero              {0, 0, 0, _ef_v1_PixelFormat_MIN, _ef_v1_Codec_MIN, 0}
-#define ef_v1_ImuConfig_init_zero                {0, 0, 0, 0}
+#define ef_v1_ImuConfig_init_zero                {0, 0, 0, 0, _ef_v1_ImuData_MIN}
 #define ef_v1_Configure_init_zero                {_ef_v1_Mode_MIN, false, ef_v1_VideoConfig_init_zero, false, ef_v1_ImuConfig_init_zero}
 #define ef_v1_StartStream_init_zero              {_ef_v1_Mode_MIN, false, ef_v1_StreamTarget_init_zero}
 #define ef_v1_StreamTarget_init_zero             {_ef_v1_StreamTarget_Kind_MIN, "", 0, _ef_v1_Protocol_MIN}
@@ -1132,8 +1184,10 @@ extern "C" {
 #define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", ""}
 #define ef_v1_CapMode_init_zero                  {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_zero             {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero}}
-#define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}}
-#define ef_v1_ImuCalibration_init_zero           {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+#define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
+#define ef_v1_ImuCalibration_init_zero           {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0, 0}
+#define ef_v1_SetCalibration_init_zero           {0, {ef_v1_CameraIntrinsics_init_zero}}
+#define ef_v1_ResetCalibration_init_zero         {0, 0}
 #define ef_v1_GetAuthChallenge_init_zero         {0}
 #define ef_v1_AuthChallenge_init_zero            {{0, {0}}, {0, {0}}, 0}
 #define ef_v1_Authenticate_init_zero             {{0, {0}}}
@@ -1150,6 +1204,7 @@ extern "C" {
 #define ef_v1_ImuConfig_rate_hz_tag              2
 #define ef_v1_ImuConfig_accel_range_g_tag        3
 #define ef_v1_ImuConfig_gyro_range_dps_tag       4
+#define ef_v1_ImuConfig_data_tag                 5
 #define ef_v1_Configure_mode_tag                 1
 #define ef_v1_Configure_video_tag                2
 #define ef_v1_Configure_imu_tag                  3
@@ -1310,11 +1365,20 @@ extern "C" {
 #define ef_v1_CameraIntrinsics_width_tag         7
 #define ef_v1_CameraIntrinsics_height_tag        8
 #define ef_v1_CameraIntrinsics_extrinsics_quat_tag 9
+#define ef_v1_CameraIntrinsics_rectify_tag       10
+#define ef_v1_CameraIntrinsics_fov_scale_tag     11
 #define ef_v1_ImuCalibration_accel_bias_tag      1
 #define ef_v1_ImuCalibration_gyro_bias_tag       2
 #define ef_v1_ImuCalibration_accel_noise_density_tag 3
 #define ef_v1_ImuCalibration_gyro_noise_density_tag 4
 #define ef_v1_ImuCalibration_imu_to_camera_tag   5
+#define ef_v1_ImuCalibration_accel_scale_misalign_tag 6
+#define ef_v1_ImuCalibration_gyro_scale_misalign_tag 7
+#define ef_v1_ImuCalibration_accel_bias_random_walk_tag 8
+#define ef_v1_ImuCalibration_gyro_bias_random_walk_tag 9
+#define ef_v1_ImuCalibration_accel_tau_tag       10
+#define ef_v1_ImuCalibration_gyro_tau_tag        11
+#define ef_v1_ImuCalibration_time_offset_ns_tag  12
 #define ef_v1_DeviceInformation_serial_tag       1
 #define ef_v1_DeviceInformation_model_tag        2
 #define ef_v1_DeviceInformation_hw_rev_tag       3
@@ -1334,6 +1398,10 @@ extern "C" {
 #define ef_v1_DeviceInformation_must_change_password_tag 20
 #define ef_v1_DeviceInformation_wifi_mac_tag     21
 #define ef_v1_DeviceInformation_bt_mac_tag       22
+#define ef_v1_SetCalibration_camera_tag          1
+#define ef_v1_SetCalibration_imu_tag             2
+#define ef_v1_ResetCalibration_camera_tag        1
+#define ef_v1_ResetCalibration_imu_tag           2
 #define ef_v1_AuthChallenge_nonce_tag            1
 #define ef_v1_AuthChallenge_salt_tag             2
 #define ef_v1_AuthChallenge_iters_tag            3
@@ -1409,6 +1477,8 @@ extern "C" {
 #define ef_v1_Request_get_state_tag              75
 #define ef_v1_Request_set_location_tag           76
 #define ef_v1_Request_get_location_tag           77
+#define ef_v1_Request_set_calibration_tag        78
+#define ef_v1_Request_reset_calibration_tag      79
 #define ef_v1_Request_get_auth_challenge_tag     92
 #define ef_v1_Request_authenticate_tag           93
 #define ef_v1_Request_set_ble_password_tag       94
@@ -1462,6 +1532,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_storage,body.get_storage),  74) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_state,body.get_state),  75) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_location,body.set_location),  76) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_location,body.get_location),  77) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_calibration,body.set_calibration),  78) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,reset_calibration,body.reset_calibration),  79) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_auth_challenge,body.get_auth_challenge),  92) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,authenticate,body.authenticate),  93) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_ble_password,body.set_ble_password),  94)
@@ -1513,6 +1585,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_ble_password,body.set_ble_password)
 #define ef_v1_Request_body_get_state_MSGTYPE ef_v1_GetState
 #define ef_v1_Request_body_set_location_MSGTYPE ef_v1_SetLocation
 #define ef_v1_Request_body_get_location_MSGTYPE ef_v1_GetLocation
+#define ef_v1_Request_body_set_calibration_MSGTYPE ef_v1_SetCalibration
+#define ef_v1_Request_body_reset_calibration_MSGTYPE ef_v1_ResetCalibration
 #define ef_v1_Request_body_get_auth_challenge_MSGTYPE ef_v1_GetAuthChallenge
 #define ef_v1_Request_body_authenticate_MSGTYPE ef_v1_Authenticate
 #define ef_v1_Request_body_set_ble_password_MSGTYPE ef_v1_SetBlePassword
@@ -1576,7 +1650,8 @@ X(a, STATIC,   SINGULAR, UINT32,   quality,           6)
 X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
 X(a, STATIC,   SINGULAR, UINT32,   rate_hz,           2) \
 X(a, STATIC,   SINGULAR, UINT32,   accel_range_g,     3) \
-X(a, STATIC,   SINGULAR, UINT32,   gyro_range_dps,    4)
+X(a, STATIC,   SINGULAR, UINT32,   gyro_range_dps,    4) \
+X(a, STATIC,   SINGULAR, UENUM,    data,              5)
 #define ef_v1_ImuConfig_CALLBACK NULL
 #define ef_v1_ImuConfig_DEFAULT NULL
 
@@ -2087,7 +2162,9 @@ X(a, STATIC,   SINGULAR, DOUBLE,   xi,                5) \
 X(a, STATIC,   SINGULAR, DOUBLE,   alpha,             6) \
 X(a, STATIC,   SINGULAR, UINT32,   width,             7) \
 X(a, STATIC,   SINGULAR, UINT32,   height,            8) \
-X(a, STATIC,   REPEATED, DOUBLE,   extrinsics_quat,   9)
+X(a, STATIC,   REPEATED, DOUBLE,   extrinsics_quat,   9) \
+X(a, STATIC,   SINGULAR, BOOL,     rectify,          10) \
+X(a, STATIC,   SINGULAR, DOUBLE,   fov_scale,        11)
 #define ef_v1_CameraIntrinsics_CALLBACK NULL
 #define ef_v1_CameraIntrinsics_DEFAULT NULL
 
@@ -2096,9 +2173,30 @@ X(a, STATIC,   REPEATED, DOUBLE,   accel_bias,        1) \
 X(a, STATIC,   REPEATED, DOUBLE,   gyro_bias,         2) \
 X(a, STATIC,   SINGULAR, DOUBLE,   accel_noise_density,   3) \
 X(a, STATIC,   SINGULAR, DOUBLE,   gyro_noise_density,   4) \
-X(a, STATIC,   REPEATED, DOUBLE,   imu_to_camera,     5)
+X(a, STATIC,   REPEATED, DOUBLE,   imu_to_camera,     5) \
+X(a, STATIC,   REPEATED, DOUBLE,   accel_scale_misalign,   6) \
+X(a, STATIC,   REPEATED, DOUBLE,   gyro_scale_misalign,   7) \
+X(a, STATIC,   SINGULAR, DOUBLE,   accel_bias_random_walk,   8) \
+X(a, STATIC,   SINGULAR, DOUBLE,   gyro_bias_random_walk,   9) \
+X(a, STATIC,   SINGULAR, DOUBLE,   accel_tau,        10) \
+X(a, STATIC,   SINGULAR, DOUBLE,   gyro_tau,         11) \
+X(a, STATIC,   SINGULAR, INT64,    time_offset_ns,   12)
 #define ef_v1_ImuCalibration_CALLBACK NULL
 #define ef_v1_ImuCalibration_DEFAULT NULL
+
+#define ef_v1_SetCalibration_FIELDLIST(X, a) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (target,camera,target.camera),   1) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (target,imu,target.imu),   2)
+#define ef_v1_SetCalibration_CALLBACK NULL
+#define ef_v1_SetCalibration_DEFAULT NULL
+#define ef_v1_SetCalibration_target_camera_MSGTYPE ef_v1_CameraIntrinsics
+#define ef_v1_SetCalibration_target_imu_MSGTYPE ef_v1_ImuCalibration
+
+#define ef_v1_ResetCalibration_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     camera,            1) \
+X(a, STATIC,   SINGULAR, BOOL,     imu,               2)
+#define ef_v1_ResetCalibration_CALLBACK NULL
+#define ef_v1_ResetCalibration_DEFAULT NULL
 
 #define ef_v1_GetAuthChallenge_FIELDLIST(X, a) \
 
@@ -2202,6 +2300,8 @@ extern const pb_msgdesc_t ef_v1_CapMode_msg;
 extern const pb_msgdesc_t ef_v1_Capabilities_msg;
 extern const pb_msgdesc_t ef_v1_CameraIntrinsics_msg;
 extern const pb_msgdesc_t ef_v1_ImuCalibration_msg;
+extern const pb_msgdesc_t ef_v1_SetCalibration_msg;
+extern const pb_msgdesc_t ef_v1_ResetCalibration_msg;
 extern const pb_msgdesc_t ef_v1_GetAuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_AuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_Authenticate_msg;
@@ -2287,6 +2387,8 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_Capabilities_fields &ef_v1_Capabilities_msg
 #define ef_v1_CameraIntrinsics_fields &ef_v1_CameraIntrinsics_msg
 #define ef_v1_ImuCalibration_fields &ef_v1_ImuCalibration_msg
+#define ef_v1_SetCalibration_fields &ef_v1_SetCalibration_msg
+#define ef_v1_ResetCalibration_fields &ef_v1_ResetCalibration_msg
 #define ef_v1_GetAuthChallenge_fields &ef_v1_GetAuthChallenge_msg
 #define ef_v1_AuthChallenge_fields &ef_v1_AuthChallenge_msg
 #define ef_v1_Authenticate_fields &ef_v1_Authenticate_msg
@@ -2296,16 +2398,16 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define EF_V1_EF_PB_H_MAX_SIZE                   ef_v1_Response_size
 #define ef_v1_AuthChallenge_size                 58
 #define ef_v1_Authenticate_size                  34
-#define ef_v1_CameraIntrinsics_size              102
+#define ef_v1_CameraIntrinsics_size              113
 #define ef_v1_CapMode_size                       29
 #define ef_v1_Capabilities_size                  888
 #define ef_v1_ChunkInfo_size                     50
 #define ef_v1_ChunkResult_size                   21
 #define ef_v1_ChunkUploadStatus_size             3011
 #define ef_v1_ChunkUrl_size                      2056
-#define ef_v1_Configure_size                     54
+#define ef_v1_Configure_size                     56
 #define ef_v1_DeleteRecording_size               65
-#define ef_v1_DeviceInformation_size             1628
+#define ef_v1_DeviceInformation_size             1848
 #define ef_v1_DownloadRecording_size             82
 #define ef_v1_GetAuthChallenge_size              0
 #define ef_v1_GetChunkUploadStatus_size          65
@@ -2324,8 +2426,8 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_HealthCheck_size                   173
 #define ef_v1_HealthStatus_size                  7059
 #define ef_v1_Heartbeat_size                     6
-#define ef_v1_ImuCalibration_size                216
-#define ef_v1_ImuConfig_size                     20
+#define ef_v1_ImuCalibration_size                425
+#define ef_v1_ImuConfig_size                     22
 #define ef_v1_ListRecordings_size                0
 #define ef_v1_Location_size                      36
 #define ef_v1_OtaAbort_size                      0
@@ -2342,10 +2444,12 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_RecordingList_size                 4992
 #define ef_v1_RecordingStatus_size               102
 #define ef_v1_Request_size                       7194
+#define ef_v1_ResetCalibration_size              4
 #define ef_v1_Response_size                      7454
 #define ef_v1_SelectTransfer_size                2
 #define ef_v1_SessionManifest_size               6721
 #define ef_v1_SetBlePassword_size                130
+#define ef_v1_SetCalibration_size                428
 #define ef_v1_SetLocation_size                   38
 #define ef_v1_SetOtaConfig_size                  522
 #define ef_v1_SetSetting_size                    11

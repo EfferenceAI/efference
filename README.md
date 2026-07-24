@@ -49,7 +49,7 @@ and the udev rule:
 With an Efference device connected over USB:
 
 ```sh
-./sdk/linux/build/ef info
+./sdk/linux/build/ef-cli info
 ```
 
 For installation, device setup, transports, examples, and the complete CLI

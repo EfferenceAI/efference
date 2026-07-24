@@ -66,6 +66,14 @@ struct CalibrationParameters {
     double fx = 0, fy = 0;      // focal length (px)
     double cx = 0, cy = 0;      // principal point (px)
     double xi = 0, alpha = 0;   // double-sphere parameters
+    int    width = 0, height = 0;   // resolution the intrinsics were calibrated at
+    // Perform rectification ON-DEVICE via FEC hardware (undistort frames using
+    // these intrinsics). Default off; the intrinsics are always published as
+    // recording metadata regardless, so a host consumer can rectify instead.
+    bool   rectify = false;
+    // Rectified-output FOV scale (rectify path). 1.0 = match lens focal; <1
+    // widens (more periphery + black corners), >1 zooms the center.
+    double fov_scale = 1.0;
 };
 
 struct CameraConfiguration {
@@ -78,8 +86,9 @@ struct CameraConfiguration {
 // One selectable capture mode. Only the capture modes the device has enabled
 // are listed here; disabled modes are filtered out.
 struct SupportedMode {
-    Resolution resolution;
-    int fps = 0;
+    Resolution  resolution;
+    int         fps = 0;
+    std::string binning;   // "none" or "2x2" (how the mode derives from the full sensor)
 };
 
 // The device's enabled capability menu: the resolution/fps modes and codecs
@@ -96,6 +105,8 @@ struct SensorParameters {
     int sampling_rate = 0;      // Hz
     int range         = 0;      // ±g (accel) / ±deg/s (gyro)
     float noise_density = 0.f;
+    float bias_random_walk = 0.f;   // 0 = not estimated (no Allan-variance run)
+    double tau = 0.0;               // bias correlation time, s (0 = not estimated)
     SENSOR_STATE state = SENSOR_STATE::NOT_AVAILABLE;
 };
 
@@ -103,6 +114,34 @@ struct SensorsConfiguration {
     SensorParameters accelerometer;
     SensorParameters gyroscope;
     Matrix4x4        camera_imu_transform;   // camera frame -> IMU frame
+    std::array<double, 3> accel_bias{};      // b, m/s^2 (all-zero = uncalibrated)
+    std::array<double, 3> gyro_bias{};       // b, rad/s
+    // 3x3 scale-misalignment (M*S), row-major; identity = uncalibrated. Mirrors
+    // ImuCalibrationParameters so a set_imu_calibration round-trips through read-back.
+    std::array<double, 9> accel_scale_misalign{ {1,0,0, 0,1,0, 0,0,1} };
+    std::array<double, 9> gyro_scale_misalign{  {1,0,0, 0,1,0, 0,0,1} };
+    long long time_offset_ns = 0;            // IMU->camera temporal offset
+};
+
+// Full IMU field calibration written to the device (set_imu_calibration). Model:
+// a* = M*S*(x - b), with the 3x3 scale-misalignment folding M and S together,
+// row-major, per sensor. Defaults are the identity map (a no-op), so a partially
+// filled struct is safe. The params are recorded as MCAP metadata regardless;
+// the device only bakes them into the samples when the capture mode is
+// IMU_DATA::CALIBRATED. Values come from the host-side IMU calibration solve.
+struct ImuCalibrationParameters {
+    std::array<double, 3>  accel_bias{};   // b, m/s^2
+    std::array<double, 3>  gyro_bias{};    // b, rad/s
+    std::array<double, 9>  accel_scale_misalign{ {1,0,0, 0,1,0, 0,0,1} };  // M*S, row-major
+    std::array<double, 9>  gyro_scale_misalign { {1,0,0, 0,1,0, 0,0,1} };  // bias-only => identity
+    double accel_noise_density    = 0.0;
+    double gyro_noise_density     = 0.0;
+    double accel_bias_random_walk = 0.0;   // Allan +1/2 slope
+    double gyro_bias_random_walk  = 0.0;
+    double accel_tau = 0.0;                 // Gauss-Markov correlation time, s
+    double gyro_tau  = 0.0;
+    std::array<double, 16> imu_to_camera{ {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} };  // 4x4 identity
+    int64_t time_offset_ns = 0;             // IMU->camera temporal offset (0 = HW-sync only)
 };
 
 struct WirelessConfiguration {
@@ -122,6 +161,13 @@ struct WirelessConfiguration {
     std::vector<std::string> saved_networks;
 };
 
+// One access point seen by scan_wifi_networks().
+struct WifiNetwork {
+    std::string ssid;
+    int         rssi = 0;        // signal level, dBm (higher = stronger)
+    bool        secured = false; // true = encrypted (WPA/WPA2/WPA3)
+};
+
 // For device discovery
 struct DeviceProperties {
     INPUT_TYPE input_type = INPUT_TYPE::USB;
@@ -135,7 +181,8 @@ struct DeviceInformation {
     std::string serial;             // full device serial (may be non-numeric)
     unsigned int serial_number = 0; // numeric form; 0 when the serial is not numeric
     MODEL model = MODEL::M1;
-    unsigned int firmware_version = 0;
+    unsigned int firmware_version = 0;      // OTA monotonic int (anti-rollback)
+    std::string  firmware_version_str;      // human-readable "XX.XX.XX" (display only)
     INPUT_TYPE input_type = INPUT_TYPE::USB;
     CameraConfiguration camera_configuration;
     SensorsConfiguration sensors_configuration;

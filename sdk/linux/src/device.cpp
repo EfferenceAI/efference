@@ -98,7 +98,8 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
                     const std::string& usb_serial, DeviceInformation* out, Caps* caps) {
     DeviceInformation di;
     di.model            = MODEL::M1;
-    di.firmware_version = d.firmware_version_int;
+    di.firmware_version     = d.firmware_version_int;
+    di.firmware_version_str = d.firmware_version;   // "XX.XX.XX" from the device version file
     di.input_type       = transport;
     // Canonical serial (eMMC CID hex today), USB descriptor as fallback.
     // serial_number is the numeric form, parsed only if all-decimal (hex CID stays 0).
@@ -117,6 +118,11 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
         cc.calibration.cy    = d.camera.cy;
         cc.calibration.xi    = d.camera.xi;
         cc.calibration.alpha = d.camera.alpha;
+        cc.calibration.rectify = d.camera.rectify;
+        // Absent/legacy device reports 0; keep the 1.0 default so it's never a no-scale.
+        cc.calibration.fov_scale = (d.camera.fov_scale > 0.0) ? d.camera.fov_scale : 1.0;
+        cc.calibration.width  = (int)d.camera.width;    // resolution intrinsics were calibrated at
+        cc.calibration.height = (int)d.camera.height;
         cc.resolution.width  = (int)d.camera.width;
         cc.resolution.height = (int)d.camera.height;
     }
@@ -137,6 +143,19 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
         sc.gyroscope.state             = SENSOR_STATE::AVAILABLE;
         sc.accelerometer.noise_density = (float)d.imu.accel_noise_density;
         sc.gyroscope.noise_density     = (float)d.imu.gyro_noise_density;
+        sc.accelerometer.bias_random_walk = (float)d.imu.accel_bias_random_walk;
+        sc.gyroscope.bias_random_walk     = (float)d.imu.gyro_bias_random_walk;
+        sc.accelerometer.tau = d.imu.accel_tau;
+        sc.gyroscope.tau     = d.imu.gyro_tau;
+        sc.time_offset_ns    = (long long)d.imu.time_offset_ns;
+        if (d.imu.accel_bias_count >= 3)
+            for (int i = 0; i < 3; i++) sc.accel_bias[(size_t)i] = d.imu.accel_bias[i];
+        if (d.imu.gyro_bias_count >= 3)
+            for (int i = 0; i < 3; i++) sc.gyro_bias[(size_t)i] = d.imu.gyro_bias[i];
+        if (d.imu.accel_scale_misalign_count >= 9)
+            for (int i = 0; i < 9; i++) sc.accel_scale_misalign[(size_t)i] = d.imu.accel_scale_misalign[i];
+        if (d.imu.gyro_scale_misalign_count >= 9)
+            for (int i = 0; i < 9; i++) sc.gyro_scale_misalign[(size_t)i] = d.imu.gyro_scale_misalign[i];
         if (d.imu.imu_to_camera_count >= 16)
             for (int i = 0; i < 16; i++)
                 sc.camera_imu_transform.m[(size_t)i] = d.imu.imu_to_camera[i];
@@ -171,6 +190,7 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
                 sm.resolution.width  = (int)d.caps.modes[i].width;
                 sm.resolution.height = (int)d.caps.modes[i].height;
                 sm.fps               = (int)d.caps.modes[i].fps;
+                sm.binning           = d.caps.modes[i].binning;   // "none"/"2x2"
                 di.capabilities.modes.push_back(sm);
             }
         }
@@ -266,7 +286,7 @@ ERROR_CODE Device::open(InitParameters params) {
     // ---- validate the session configuration against the advertised menu ------
     Resolution res = get_resolution(params.resolution);
     if (params.resolution == RESOLUTION::AUTO) {
-        res = {1920, 1080};
+        res = {1920, 1200};   // device native (HD1200) when caps offer no match
         for (const auto& m : impl_->caps.modes)
             if (m.usable && m.fps == params.fps) { res = {m.w, m.h}; break; }
     } else if (!impl_->caps.modes.empty()) {
@@ -288,6 +308,14 @@ ERROR_CODE Device::open(InitParameters params) {
         for (const auto& c : impl_->caps.codecs)
             if (c == want) { ok = true; break; }
         if (!ok) { impl_->close_transport(); return ERROR_CODE::UNSUPPORTED_COMPRESSION; }
+    }
+    // Raw NV12 (~830 Mbit/s @1200p30) overruns the WiFi/UDP online link, so reject
+    // it at open rather than on the first grab. Raw over USB isoc (SuperSpeed) is
+    // fine, so this is gated on a udp_host, not on the codec alone. The device
+    // enforces the same rule; this fails fast with a clear code before any stream.
+    if (!params.udp_host.empty() && params.compression == COMPRESSION_MODE::RAW) {
+        impl_->close_transport();
+        return ERROR_CODE::INSUFFICIENT_WIFI_BANDWIDTH;
     }
 
     // ---- align the device clock with the host (best-effort, non-fatal) --------
@@ -332,6 +360,16 @@ void Device::close() {
 bool         Device::is_open() const { return impl_ && impl_->state != DEVICE_STATE::CLOSED; }
 DEVICE_STATE Device::get_state() const {
     return impl_ ? impl_->state.load() : DEVICE_STATE::CLOSED;
+}
+bool Device::poll_fault(std::string* reason) {
+    if (!impl_) { if (reason) reason->clear(); return false; }
+    impl_->refresh_device_state();  // live: also refreshes the cached DEVICE_STATE
+    // reason carries the most recent anomaly cause whether or not it latched, so an
+    // unlatched abnormal stop (disk_full, capture_stopped) surfaces too. The bool
+    // return (fault_latch) distinguishes a locked-in fault needing recovery from an
+    // informational last-anomaly. Empty once a new session starts clean.
+    if (reason) *reason = impl_->device_last_fault;
+    return impl_->device_fault_latch;
 }
 
 // Cached get_* never block and stay safe on a moved-from Device (null impl_):

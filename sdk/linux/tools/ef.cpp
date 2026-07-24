@@ -21,12 +21,15 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
+
+#include <unistd.h>   // isatty
 
 #include <ef/Device.hpp>
 
@@ -36,9 +39,9 @@ namespace {
 
 void usage() {
     std::puts(
-        "ef: Efference M1 control tool\n"
+        "ef-cli: Efference M1 control tool\n"
         "\n"
-        "  ef [--ble <MAC>] [--device <id>] [--password <pw>] [--udp <host[:port]>]\n"
+        "  ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--udp <host[:port]>]\n"
         "     [--verbose] <command> [args]\n"
         "\n"
         "flags:\n"
@@ -54,6 +57,17 @@ void usage() {
         "  config                            list enabled capture modes + codecs\n"
         "  config set <W> <H> <fps> <codec>  set capture config (idle only; codec:\n"
         "                                    raw|h264|h264hq|h265|h265hq)\n"
+        "  calibration [--get]               show camera + IMU calibration\n"
+        "  calibration --camera --set <fx> <fy> <cx> <cy> <xi> <alpha> <W> <H> [--rectify on|off] [--fov-scale <s>]\n"
+        "                                    set camera intrinsics (idle only; always\n"
+        "                                    published as metadata; --rectify on|off toggles\n"
+        "                                    on-device FEC rectification, default off, needs FEC fw;\n"
+        "                                    --fov-scale sets the rectified FOV, default 1.0, <1 wider)\n"
+        "  calibration --imu --mode <raw|calibrated|both>\n"
+        "                                    select on-device IMU handling for the session\n"
+        "                                    (calibrated applies M*S*(x-b) per sample)\n"
+        "  calibration [--camera|--imu] --reset\n"
+        "                                    reset calibration to factory default\n"
         "  storage                           free/total space on the recording store\n"
         "  state                             current DEVICE_STATE\n"
         "  health [--deep]                   run the on-device health sweep\n"
@@ -73,6 +87,7 @@ void usage() {
         "  wifi add <ssid> <psk> [country]   provision a WiFi network (\"US\" unlocks 5 GHz)\n"
         "  wifi remove <ssid> | select <ssid>\n"
         "  wifi list                         saved networks (marks the connected one)\n"
+        "  wifi scan                         access points in range (not while recording)\n"
         "  wifi status                       current association\n"
         "  set-password <new>                rekey the BLE password (over USB)\n"
         "  set-password <old> <new>          rekey the BLE password (over BLE)\n"
@@ -85,7 +100,124 @@ void usage() {
 
 int fail(ERROR_CODE ec, const char* what) {
     std::fprintf(stderr, "%s failed: %s\n", what, to_string(ec));
+    // A permissions failure means the device is on the bus but not openable, almost
+    // always a missing udev rule. Point the user at the fix.
+    if (ec == ERROR_CODE::INSUFFICIENT_PERMISSIONS)
+        std::fprintf(stderr,
+            "  Device is connected but not accessible (USB permissions).\n"
+            "  Fix: run './build.sh --udev' once (installs a udev rule, needs sudo),\n"
+            "  then replug the device. Alternatively, run this command with sudo.\n");
     return 1;
+}
+
+// Renders `ef-cli update` as one line per phase: the percent redraws in place while
+// a phase runs, then the line is committed when the next phase begins. Uses '\r' on a
+// TTY; on a redirected stream it prints one plain line per phase. Errors go on their
+// own line. Verification is collapsed to a single line just before "ready".
+struct UpdatePrinter {
+    bool        tty  = isatty(fileno(stdout));
+    bool        have = false;                 // a phase line is currently open
+    std::string cur;                          // current display label
+    std::string last_msg;                     // last device message (for error text)
+    std::chrono::steady_clock::time_point phase_start;
+
+    // Consumer-facing label. The wire push and the device's network fetch both read as
+    // "downloading" (the update coming down to the box) and merge into one line; the
+    // slot write reads as "installing".
+    static std::string display(const UpdateStatus& u) {
+        switch (u.state) {
+            case UPDATE_STATE::CHECKING:       return "checking";
+            case UPDATE_STATE::UPLOADING:      return "downloading";
+            case UPDATE_STATE::DOWNLOADING:
+                return u.message.find("Writing") != std::string::npos ? "installing"
+                                                                      : "downloading";
+            case UPDATE_STATE::VERIFYING:      return "verifying";
+            case UPDATE_STATE::READY_TO_APPLY: return "ready";
+            case UPDATE_STATE::APPLYING:       return "applying";
+            case UPDATE_STATE::REBOOTING:      return "rebooting";
+            case UPDATE_STATE::RECONNECTING:   return "reconnect";
+        }
+        return "update";
+    }
+
+    long elapsed() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now() - phase_start).count();
+    }
+
+    // Finalize the current phase as "[label] status". A message is shown only for a
+    // failure (the reason); success lines are just the label + "done".
+    void commit(const char* status, const std::string& msg = "") {
+        const char* sep = msg.empty() ? "" : "  ";
+        if (tty) std::printf("\r[%-11s] %s%s%s\033[K\n", cur.c_str(), status, sep, msg.c_str());
+        else     std::printf("[%-11s] %s%s%s\n",         cur.c_str(), status, sep, msg.c_str());
+        std::fflush(stdout);
+    }
+
+    // Redraw the in-progress line (TTY only): label + percent, or "...." + ticking
+    // elapsed when there is no real percentage (indeterminate, or stuck at 0 = a device
+    // that never reports size, e.g. v0.3). No device message: the label says enough.
+    void live(int progress) {
+        if (!tty) return;
+        long secs = elapsed();
+        if (progress >= 0 && progress <= 100 && !(progress == 0 && secs >= 3))
+            std::printf("\r[%-11s] %3d%%\033[K", cur.c_str(), progress);
+        else
+            std::printf("\r[%-11s] .... (%lds)\033[K", cur.c_str(), secs);
+        std::fflush(stdout);
+    }
+
+    void enter(const std::string& disp) {
+        cur = disp; have = true;
+        phase_start = std::chrono::steady_clock::now();
+    }
+
+    void on(const UpdateStatus& u) {
+        if (!u.message.empty()) last_msg = u.message;   // capture reason (incl. terminal)
+        // A terminal error: close the open phase as FAIL with the reason.
+        if (u.last_error != ERROR_CODE::SUCCESS &&
+            u.last_error != ERROR_CODE::DEVICE_UP_TO_DATE) {
+            if (have) { commit("FAIL", last_msg); have = false; }
+            return;
+        }
+        if (!u.active) return;
+        std::string disp = display(u);
+
+        // "checking" and "verifying" are internal detail with no line of their own; keep
+        // the current line ticking so a slow hash/verify reads as activity, not a stall.
+        // A single "verifying" line is emitted when the device reaches "ready" (the user
+        // doesn't need "ready" called out separately). Suppressing "checking" also merges
+        // the host push and the device's fetch into one "downloading" line.
+        if (disp == "checking" || disp == "verifying") { if (have) live(-1); return; }
+        if (disp == "ready") {
+            if (have) { commit("done"); have = false; }
+            cur = "verifying"; commit("done");
+            return;
+        }
+        if (!have || disp != cur) {
+            if (have) commit("done");   // finalize the previous phase
+            enter(disp);
+        }
+        // "installing" (slot write + hash) reports no real percentage; show a ticking
+        // spinner so it never freezes at 100%.
+        live(disp == "installing" ? -1 : u.progress);
+    }
+
+    // After a successful update, close the last open phase.
+    void done() { if (have) commit("done"); have = false; }
+};
+
+// Classify a generic FAILED_TO_UPDATE by the device's message. Match BUSY before
+// NETWORK: the lock also fails in the download phase.
+enum class UpdateFailure { GENERIC, NETWORK, BUSY };
+UpdateFailure classify_update_failure(ERROR_CODE ec, const std::string& msg) {
+    if (ec != ERROR_CODE::FAILED_TO_UPDATE) return UpdateFailure::GENERIC;
+    auto has = [&](const char* s) { return msg.find(s) != std::string::npos; };
+    if (has("already running") || has("Download refused")) return UpdateFailure::BUSY;
+    if (has("connectivity") || has("Failed to download") ||
+        has("interrupted (network"))
+        return UpdateFailure::NETWORK;
+    return UpdateFailure::GENERIC;
 }
 
 void print_info(const DeviceInformation& i) {
@@ -95,21 +227,65 @@ void print_info(const DeviceInformation& i) {
     if (i.serial_number != 0)
         std::printf("serial_number    : %u\n", i.serial_number);
     std::printf("model            : %s\n", to_string(i.model));
-    std::printf("firmware_version : %u\n", i.firmware_version);
+    // Prefer the device's human-readable version string ("vXX.XX.XX"); fall back
+    // to the monotonic int for older devices that don't report a usable string.
+    if (!i.firmware_version_str.empty() && i.firmware_version_str != "unknown")
+        std::printf("firmware_version : v%s\n", i.firmware_version_str.c_str());
+    else
+        std::printf("firmware_version : %u\n", i.firmware_version);
     std::printf("input_type       : %s\n", to_string(i.input_type));
     const CameraConfiguration& c = i.camera_configuration;
     std::printf("camera           : %dx%d @ %d fps, %s\n",
                 c.resolution.width, c.resolution.height, c.fps,
                 to_string(c.compression));
-    std::printf("calibration      : fx=%.2f fy=%.2f cx=%.2f cy=%.2f xi=%.4f alpha=%.4f (%s)\n",
-                c.calibration.fx, c.calibration.fy, c.calibration.cx,
-                c.calibration.cy, c.calibration.xi, c.calibration.alpha,
-                to_string(c.calibration.model));
+    // fx<=0 is the factory-default (uncalibrated) sentinel.
+    const CalibrationParameters& cal = c.calibration;
+    std::printf("camera calibration : %s (%s)\n", to_string(cal.model),
+                cal.fx > 0.0 ? "calibrated" : "factory-default, uncalibrated");
+    std::printf("  %-10s = fx=%.2f fy=%.2f cx=%.2f cy=%.2f xi=%.4f alpha=%.4f\n",
+                "intrinsics", cal.fx, cal.fy, cal.cx, cal.cy, cal.xi, cal.alpha);
+    std::printf("  %-10s = %dx%d\n", "size", cal.width, cal.height);
+    std::printf("  %-10s = %s   fov-scale = %.2f\n",
+                "rectify", cal.rectify ? "on" : "off", cal.fov_scale);
     const SensorsConfiguration& s = i.sensors_configuration;
-    std::printf("accelerometer    : %s (noise %.6f)\n",
-                to_string(s.accelerometer.state), s.accelerometer.noise_density);
-    std::printf("gyroscope        : %s (noise %.6f)\n",
-                to_string(s.gyroscope.state), s.gyroscope.noise_density);
+    std::printf("accelerometer    : %s\n", to_string(s.accelerometer.state));
+    std::printf("gyroscope        : %s\n", to_string(s.gyroscope.state));
+    // Full IMU field calibration: a* = M*S*(x - b) (gyro is bias-only). Factory
+    // default is zero bias + identity scale-misalignment; "field" iff any bias != 0
+    // or the accel scale-misalignment differs from identity.
+    {
+        bool nz = s.accel_bias[0] || s.accel_bias[1] || s.accel_bias[2] ||
+                  s.gyro_bias[0]  || s.gyro_bias[1]  || s.gyro_bias[2];
+        for (int k = 0; k < 9 && !nz; ++k)
+            if (s.accel_scale_misalign[k] != (k % 4 == 0 ? 1.0 : 0.0)) nz = true;
+        const auto& a = s.accel_scale_misalign;
+        const auto& g = s.gyro_scale_misalign;
+        const auto& T = s.camera_imu_transform.m;
+        std::printf("imu calibration  : %s\n", nz ? "field" : "factory-default (uncalibrated)");
+        std::printf("  accel bias  [m/s^2]  = [% .6f % .6f % .6f]\n",
+                    s.accel_bias[0], s.accel_bias[1], s.accel_bias[2]);
+        std::printf("  gyro  bias  [rad/s]  = [% .6f % .6f % .6f]\n",
+                    s.gyro_bias[0], s.gyro_bias[1], s.gyro_bias[2]);
+        std::printf("  accel M*S (row-major)= [% .6f % .6f % .6f]\n"
+                    "                         [% .6f % .6f % .6f]\n"
+                    "                         [% .6f % .6f % .6f]\n",
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+        std::printf("  gyro  M*S (row-major)= [% .6f % .6f % .6f] [% .6f % .6f % .6f] [% .6f % .6f % .6f]\n",
+                    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8]);
+        std::printf("  accel noise=%.6f  bias_rw=%.6f  tau=%.4f\n",
+                    s.accelerometer.noise_density, s.accelerometer.bias_random_walk,
+                    s.accelerometer.tau);
+        std::printf("  gyro  noise=%.6f  bias_rw=%.6f  tau=%.4f\n",
+                    s.gyroscope.noise_density, s.gyroscope.bias_random_walk,
+                    s.gyroscope.tau);
+        std::printf("  cam->imu (row-major) = [% .5f % .5f % .5f % .5f]\n"
+                    "                         [% .5f % .5f % .5f % .5f]\n"
+                    "                         [% .5f % .5f % .5f % .5f]\n"
+                    "                         [% .5f % .5f % .5f % .5f]\n",
+                    T[0], T[1], T[2], T[3], T[4], T[5], T[6], T[7],
+                    T[8], T[9], T[10], T[11], T[12], T[13], T[14], T[15]);
+        std::printf("  time offset [ns]     = %lld\n", s.time_offset_ns);
+    }
     const WirelessConfiguration& w = i.wireless;
     std::printf("wifi mac         : %s\n",
                 w.wifi_mac_address.empty() ? "(unprovisioned)" : w.wifi_mac_address.c_str());
@@ -242,7 +418,7 @@ int main(int argc, char** argv) {
     if (cmd == "config" && args.size() > 1 && args[1] == "set") {
         if (args.size() < 6) {
             std::fprintf(stderr,
-                "usage: ef config set <width> <height> <fps> <codec>\n"
+                "usage: ef-cli config set <width> <height> <fps> <codec>\n"
                 "  codec: raw | h264 | h264hq | h265 | h265hq\n");
             return 2;
         }
@@ -288,6 +464,172 @@ int main(int argc, char** argv) {
                             k + 1 < caps.codecs.size() ? ", " : "");
             std::printf("\n");
         }
+        return 0;
+    }
+    if (cmd == "calibration") {
+        bool want_camera = false, want_imu = false;
+        bool do_get = false, do_set = false, do_reset = false;
+        bool set_rectify = false;   // on-device FEC rectification
+        double set_fov_scale = 1.0;    // rectified-output FOV scale
+        bool rectify_given = false; // flag explicitly passed
+        bool fov_scale_given  = false; // flag explicitly passed
+        std::string imu_mode;       // --mode <raw|calibrated|both>
+        std::vector<std::string> vals;
+        for (size_t i = 1; i < args.size(); i++) {
+            const std::string& a = args[i];
+            if      (a == "--get")        do_get   = true;
+            else if (a == "--set")        do_set   = true;
+            else if (a == "--reset")      do_reset = true;
+            else if (a == "--camera")     want_camera = true;
+            else if (a == "--imu")        want_imu    = true;
+            else if (a == "--rectify") {
+                // Explicit on|off (default off if the flag is omitted entirely).
+                if (i + 1 < args.size() &&
+                    (args[i + 1] == "on" || args[i + 1] == "off")) {
+                    set_rectify = (args[++i] == "on");
+                    rectify_given = true;
+                } else {
+                    std::fprintf(stderr, "--rectify wants 'on' or 'off'\n");
+                    return 2;
+                }
+            }
+            else if (a == "--fov-scale") {
+                if (i + 1 >= args.size()) { std::fprintf(stderr, "--fov-scale wants a value\n"); return 2; }
+                char* end = nullptr;
+                set_fov_scale = std::strtod(args[i + 1].c_str(), &end);
+                // Reject unparseable/non-positive: 0 is the "unset" sentinel, not a value.
+                if (end == args[i + 1].c_str() || *end != '\0' || set_fov_scale <= 0.0) {
+                    std::fprintf(stderr, "--fov-scale wants a positive number\n"); return 2;
+                }
+                ++i; fov_scale_given = true;
+            }
+            else if (a == "--mode" && i + 1 < args.size()) imu_mode = args[++i];
+            else                          vals.push_back(a);
+        }
+        // Rectify flags with stray positional args (e.g. mimicking --set) is a
+        // mistake; don't silently drop the flag. --set takes 8 vals; toggle takes none.
+        if ((rectify_given || fov_scale_given) && !do_set && !vals.empty()) {
+            std::fprintf(stderr, "unexpected arguments; pass --rectify/--fov-scale alone "
+                         "to toggle, or use --set for full intrinsics\n");
+            return 2;
+        }
+        // Toggle rectify without re-typing intrinsics: read the current
+        // calibration, change only the named flag(s), resend.
+        if ((rectify_given || fov_scale_given) && vals.empty() &&
+            !do_set && !do_reset && !do_get) {
+            if (want_imu) {
+                std::fprintf(stderr, "--rectify/--fov-scale apply to --camera only\n");
+                return 2;
+            }
+            const DeviceInformation& di = dev.get_device_information();
+            CalibrationParameters c = di.camera_configuration.calibration;
+            // Keep the resolution the intrinsics were calibrated at (full sensor); the
+            // session resolution can differ (1080p crop) and must not overwrite it.
+            int w = c.width, h = c.height;
+            const CameraConfiguration& cam = di.camera_configuration;
+            if (w <= 0 || h <= 0) { w = cam.resolution.width; h = cam.resolution.height; }
+            if (c.fx <= 0.0)
+                std::fprintf(stderr, "warning: device is uncalibrated (fx<=0); the flag is "
+                             "persisted but rectification has no intrinsics to use\n");
+            c.model = LENS_DISTORTION_MODEL::DS;
+            if (rectify_given) c.rectify = set_rectify;
+            if (fov_scale_given)  c.fov_scale  = set_fov_scale;
+            ec = dev.set_camera_calibration(c, w, h);
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "calibration set");
+            std::printf("rectify: %s (on-device FEC); fov-scale: %.2f (applies next capture session)\n",
+                        c.rectify ? "on" : "off", c.fov_scale);
+            if (c.rectify)
+                std::printf("note: device dewarps frames to rectilinear before encoding "
+                            "(recordings ship rectified from the next session).\n");
+            return 0;
+        }
+        // IMU capture-mode select: standalone (re-sends current geometry + the mode).
+        if (want_imu && !imu_mode.empty() && !do_set && !do_reset) {
+            IMU_DATA m;
+            if      (imu_mode == "raw")        m = IMU_DATA::RAW;
+            else if (imu_mode == "calibrated") m = IMU_DATA::CALIBRATED;
+            else if (imu_mode == "both")       m = IMU_DATA::BOTH;
+            else { std::fprintf(stderr, "unknown imu mode '%s' (raw|calibrated|both)\n",
+                                imu_mode.c_str()); return 2; }
+            const DeviceInformation& di = dev.get_device_information();
+            const CameraConfiguration& c = di.camera_configuration;
+            ec = dev.set_configuration(c.resolution.width, c.resolution.height,
+                                       c.fps, c.compression, m);
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "imu mode set");
+            std::printf("imu capture mode = %s (applies next session)\n", to_string(m));
+            return 0;
+        }
+        if (do_get || (!do_set && !do_reset)) {
+            // --get (also the default with no verb): show camera + IMU calibration.
+            const DeviceInformation& di = dev.get_device_information();
+            const CalibrationParameters& cc = di.camera_configuration.calibration;
+            const CameraConfiguration&   cam = di.camera_configuration;
+            // fx<=0 (camera) / all-zero (IMU) are the factory-default sentinels.
+            std::printf("camera calibration: %s\n",
+                        cc.fx > 0.0 ? "calibrated" : "factory-default (uncalibrated)");
+            std::printf("  model  : %s\n", to_string(cc.model));
+            std::printf("  rectify: %s (on-device FEC)\n", cc.rectify ? "on" : "off");
+            std::printf("  fov-scale : %.2f\n", cc.fov_scale);
+            std::printf("  size   : %dx%d\n", cam.resolution.width, cam.resolution.height);
+            std::printf("  fx=%.4f fy=%.4f cx=%.4f cy=%.4f xi=%.6f alpha=%.6f\n",
+                        cc.fx, cc.fy, cc.cx, cc.cy, cc.xi, cc.alpha);
+            const SensorsConfiguration& s = di.sensors_configuration;
+            bool imu_cal = s.accel_bias[0] || s.accel_bias[1] || s.accel_bias[2] ||
+                           s.gyro_bias[0] || s.gyro_bias[1] || s.gyro_bias[2] ||
+                           s.accelerometer.noise_density > 0.f;
+            std::printf("imu calibration: %s\n",
+                        imu_cal ? "field" : "factory-default (uncalibrated)");
+            std::printf("  accel bias =[% .5f % .5f % .5f] m/s^2\n",
+                        s.accel_bias[0], s.accel_bias[1], s.accel_bias[2]);
+            std::printf("  gyro  bias =[% .6f % .6f % .6f] rad/s\n",
+                        s.gyro_bias[0], s.gyro_bias[1], s.gyro_bias[2]);
+            std::printf("  accel noise=%.6f  gyro noise=%.6f\n",
+                        s.accelerometer.noise_density, s.gyroscope.noise_density);
+            return 0;
+        }
+        if (do_set) {
+            if (want_imu) {
+                std::fprintf(stderr,
+                    "IMU field calibration is run via the calibrate_imu tutorial, not this flag:\n"
+                    "  tutorials/calibrate_imu - captures the still + tumble procedure,\n"
+                    "  solves, and writes it via set_imu_calibration.\n");
+                return 2;
+            }
+            if (!want_camera) { std::fprintf(stderr, "specify --camera\n"); return 2; }
+            if (vals.size() != 8) {
+                std::fprintf(stderr,
+                    "usage: ef-cli calibration --camera --set <fx> <fy> <cx> <cy> "
+                    "<xi> <alpha> <width> <height>\n");
+                return 2;
+            }
+            CalibrationParameters c;
+            c.model = LENS_DISTORTION_MODEL::DS;
+            c.fx = std::strtod(vals[0].c_str(), nullptr);
+            c.fy = std::strtod(vals[1].c_str(), nullptr);
+            c.cx = std::strtod(vals[2].c_str(), nullptr);
+            c.cy = std::strtod(vals[3].c_str(), nullptr);
+            c.xi = std::strtod(vals[4].c_str(), nullptr);
+            c.alpha = std::strtod(vals[5].c_str(), nullptr);
+            c.rectify = set_rectify;   // on-device FEC rectification; default off
+            c.fov_scale  = set_fov_scale;    // rectified-output FOV scale; default 1.0
+            int w = std::atoi(vals[6].c_str());
+            int h = std::atoi(vals[7].c_str());
+            ec = dev.set_camera_calibration(c, w, h);
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "calibration set");
+            std::printf("camera calibration set; intrinsics published as recording "
+                        "metadata (applies next capture session)\n");
+            if (c.rectify)
+                std::printf("note: on-device rectification enabled; the device dewarps frames "
+                            "to rectilinear before encoding (from the next capture session).\n");
+            return 0;
+        }
+        // do_reset: default to both sensors when neither is named.
+        bool rc = want_camera || (!want_camera && !want_imu);
+        bool ri = want_imu    || (!want_camera && !want_imu);
+        ec = dev.reset_calibration(rc, ri);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "calibration reset");
+        std::printf("calibration reset to factory default%s%s\n",
+                    rc ? " [camera]" : "", ri ? " [imu]" : "");
         return 0;
     }
     if (cmd == "storage") {
@@ -420,18 +762,47 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "update") {
+        UpdatePrinter pr;
         ec = dev.update(args.size() > 1 ? args[1] : "",
-                        [](const UpdateStatus& u) {
-                            std::printf("\r%-14s %3d%%  %s",
-                                        u.active ? to_string(u.state) : "…",
-                                        u.progress, u.message.c_str());
-                            std::fflush(stdout);
-                        });
-        std::printf("\n");
-        if (ec == ERROR_CODE::DEVICE_UP_TO_DATE) { std::puts("already up to date"); return 0; }
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "update");
-        std::printf("updated, running firmware %u\n",
-                    dev.get_device_information().firmware_version);
+                        [&pr](const UpdateStatus& u) { pr.on(u); });
+        if (ec == ERROR_CODE::DEVICE_UP_TO_DATE) {
+            pr.done();   // close the open line before the summary
+            std::puts("already up to date");
+            return 0;
+        }
+        if (ec != ERROR_CODE::SUCCESS) {
+            if (pr.have) pr.commit("FAIL", pr.last_msg);
+            const std::string url = args.size() > 1 ? args[1] : "";
+            switch (classify_update_failure(ec, pr.last_msg)) {
+                case UpdateFailure::BUSY:
+                    std::fprintf(stderr,
+                        "update failed: a download is already in progress on the device\n"
+                        "  Wait for it to finish (re-running attaches to it), or run\n"
+                        "  'ef-cli abort-update' to cancel it, then retry.\n");
+                    return 1;
+                case UpdateFailure::NETWORK: {
+                    const std::string retry =
+                        url.empty() ? "ef-cli update" : "ef-cli update " + url;
+                    std::fprintf(stderr,
+                        "update failed: network interruption during download\n"
+                        "  The device lost connectivity while fetching the update.\n"
+                        "  Re-run '%s' to try again.\n", retry.c_str());
+                    return 1;
+                }
+                case UpdateFailure::GENERIC:
+                default:
+                    // crashed / rolled back / never came back: lead with the reason.
+                    if (!pr.last_msg.empty())
+                        std::fprintf(stderr, "error: %s\n", pr.last_msg.c_str());
+                    return fail(ec, "update");
+            }
+        }
+        pr.done();
+        DeviceInformation di = dev.get_device_information();
+        if (!di.firmware_version_str.empty() && di.firmware_version_str != "unknown")
+            std::printf("[%-11s] done  running firmware v%s\n", "updated", di.firmware_version_str.c_str());
+        else
+            std::printf("[%-11s] done  running firmware %u\n", "updated", di.firmware_version);
         return 0;
     }
     if (cmd == "abort-update") {
@@ -453,6 +824,14 @@ int main(int argc, char** argv) {
                     std::printf("connecting to \"%s\"...\n", w.wifi_ssid.c_str());
                 else
                     std::puts("connecting...");
+            } else if (w.wifi_state == "auth_failed") {
+                // Device rejected the credentials (wrong password / bad auth);
+                // name the network so the user knows which one to re-add.
+                if (!w.wifi_ssid.empty())
+                    std::printf("authentication failed for \"%s\"; check the password\n",
+                                w.wifi_ssid.c_str());
+                else
+                    std::puts("authentication failed; check the password");
             } else if (w.wifi_state == "connected" || w.wifi_connected) {
                 // Append only the detail the device reported; older firmware
                 // leaves security/freq/link_speed/rssi at ""/0, which drop out.
@@ -480,15 +859,44 @@ int main(int argc, char** argv) {
                     std::printf("%s%s\n", n.c_str(), n == cur ? "  (connected)" : "");
             }
             return 0;
+        } else if (sub == "scan") {
+            std::vector<WifiNetwork> nets;
+            ec = dev.scan_wifi_networks(nets);
+            // BUSY is the expected answer while the radio is in use (recording,
+            // livestream, or an update), not an error; tell the user to retry.
+            if (ec == ERROR_CODE::DEVICE_BUSY) {
+                std::puts("device busy (recording/livestream/update); try again after it stops");
+                return 1;
+            }
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "wifi scan");
+            if (nets.empty()) {
+                std::puts("no networks found");
+            } else {
+                // nets is sorted strongest-first by the SDK; show the top 10.
+                size_t show = std::min<size_t>(nets.size(), 10);
+                for (size_t i = 0; i < show; i++)
+                    std::printf("%-32s  %4d dBm  %s\n", nets[i].ssid.c_str(),
+                                nets[i].rssi, nets[i].secured ? "secured" : "open");
+                if (nets.size() > show)
+                    std::printf("(%zu more; showing strongest %zu)\n",
+                                nets.size() - show, show);
+            }
+            return 0;
         } else { usage(); return 2; }
+        // A remove of a never-saved ssid comes back INVALID_FUNCTION_CALL (device
+        // NOT_FOUND): say so plainly rather than the misleading "forgotten" below.
+        if (sub == "remove" && ec == ERROR_CODE::INVALID_FUNCTION_CALL) {
+            std::fprintf(stderr, "wifi remove: '%s' is not a saved network\n", args[2].c_str());
+            return 1;
+        }
         if (ec != ERROR_CODE::SUCCESS) return fail(ec, std::string("wifi " + sub).c_str());
         if (sub == "add")
-            std::printf("wifi add accepted, connecting to '%s' (poll `ef wifi status`)\n",
+            std::printf("wifi add accepted, connecting to '%s' (poll `ef-cli wifi status`)\n",
                         args[2].c_str());
         else if (sub == "remove")
             std::printf("wifi remove accepted, '%s' forgotten, disconnected\n", args[2].c_str());
         else if (sub == "select")
-            std::printf("wifi select accepted, '%s' (poll `ef wifi status`)\n", args[2].c_str());
+            std::printf("wifi select accepted, '%s' (poll `ef-cli wifi status`)\n", args[2].c_str());
         return 0;
     }
     if (cmd == "set-password" && args.size() > 1) {

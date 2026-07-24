@@ -1,9 +1,10 @@
-# Efference SDK — Linux (C++). Self-contained CMake project:
+# Efference SDK, Linux (C++). Self-contained CMake project:
 #
 #   ./build.sh                       # or:
 #   cmake -S . -B build && cmake --build build
 #
-# Produces the `ef` library, the command-line tools, and the examples.
+# Produces the `ef` library and the `ef-cli` control tool. Tutorials under
+# ../../tutorials build separately against this build tree (find_package(ef)).
 # libusb-1.0 is the only required dependency.
 cmake_minimum_required(VERSION 3.16)
 project(efference_sdk_linux VERSION 1.0.0 LANGUAGES C CXX)
@@ -15,8 +16,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-
-option(EF_BUILD_EXAMPLES "Build the example programs" ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
@@ -99,21 +98,47 @@ if(EF_ENABLE_BLE)
 endif()
 
 # ---- tools ------------------------------------------------------------------
-# ef: the control tool — one subcommand per SDK verb (info/health/record/...).
+# ef-cli: the control tool, one subcommand per SDK verb (info/health/record/...).
+# The binary is ef-cli; the library keeps the ef/ef::ef name.
 add_executable(ef-cli tools/ef.cpp)
-set_target_properties(ef-cli PROPERTIES OUTPUT_NAME ef)
 target_link_libraries(ef-cli PRIVATE ef::ef)
 
-# ef-grab: the open/grab/retrieve loop demo.
-add_executable(ef-grab tools/ef_grab.cpp)
-target_link_libraries(ef-grab PRIVATE ef::ef)
-
-# OpenCV: used by the live viewer and the OpenCV example. OPTIONAL — the core
+# OpenCV: used by the live viewer and the OpenCV example. OPTIONAL, the core
 # SDK (ef) never links it; only display/interop tooling does. The ef::toCvMat
-# bridge (include/ef/opencv.hpp) is header-only. Install: apt install libopencv-dev.
+# bridge (include/ef/OpenCV.hpp) is header-only. Install: apt install libopencv-dev.
 find_package(OpenCV QUIET COMPONENTS core imgproc highgui)
 
-# efference-viewer: live video + IMU viewer. OPTIONAL — needs OpenCV + the ffmpeg
+# ---- calibration solvers (prebuilt, closed source) --------------------------------
+# The camera and IMU field-calibration solvers ship as per-architecture BINARIES,
+# built from sdk/linux/calibration/ (private source; copybara excludes it from the
+# public repo, which carries only these .so + the public headers ef/Checkerboard.h
+# and ef/ImuCalib.h). Two independent libs, each bundling the shared linalg. When a
+# .so is absent, the things that need it are skipped and the rest builds as usual.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(EF_CAL_ARCH linux-aarch64)      # arm64 Linux
+else()
+    set(EF_CAL_ARCH linux-x86_64)
+endif()
+set(EF_CAMERA_CAL_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/${EF_CAL_ARCH}/libcamera_cal.so)
+set(EF_IMU_CAL_LIB    ${CMAKE_CURRENT_SOURCE_DIR}/lib/${EF_CAL_ARCH}/libimu_cal.so)
+if(EXISTS ${EF_CAMERA_CAL_LIB})
+    add_library(camera_cal SHARED IMPORTED)
+    set_target_properties(camera_cal PROPERTIES IMPORTED_LOCATION ${EF_CAMERA_CAL_LIB})
+    add_library(ef::camera_cal ALIAS camera_cal)
+    message(STATUS "camera_cal: enabled (${EF_CAL_ARCH})")
+else()
+    message(STATUS "camera_cal: skipped (no ${EF_CAMERA_CAL_LIB})")
+endif()
+if(EXISTS ${EF_IMU_CAL_LIB})
+    add_library(imu_cal SHARED IMPORTED)
+    set_target_properties(imu_cal PROPERTIES IMPORTED_LOCATION ${EF_IMU_CAL_LIB})
+    add_library(ef::imu_cal ALIAS imu_cal)
+    message(STATUS "imu_cal: enabled (${EF_CAL_ARCH})")
+else()
+    message(STATUS "imu_cal: skipped (no ${EF_IMU_CAL_LIB})")
+endif()
+
+# efference-viewer: live video + IMU viewer. OPTIONAL, needs OpenCV + the ffmpeg
 # decode path (retrieve_image with VIEW::BGR). Install: apt install libopencv-dev
 # libavcodec-dev libavutil-dev libswscale-dev.
 if(OpenCV_FOUND AND EF_AV_FOUND)
@@ -125,48 +150,30 @@ else()
     message(STATUS "efference-viewer: skipped (need libopencv-dev + libavcodec-dev)")
 endif()
 
-# ---- examples (<repo>/examples/, one executable per .cpp) -------------------
-# Examples live at the repository root (../../examples relative to this file),
-# not under sdk/linux. Every examples/<group>/<name>.cpp builds to a binary
-# named <group>_<name> (e.g. wired_01_serial_number). Drop in a new .cpp and
-# re-run cmake — it is picked up automatically.
-set(EF_EXAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../examples")
-if(EF_BUILD_EXAMPLES)
-    file(GLOB EF_EXAMPLE_SRCS CONFIGURE_DEPENDS
-         "${EF_EXAMPLES_DIR}/wired/*.cpp"
-         "${EF_EXAMPLES_DIR}/wireless/*.cpp")
-    foreach(src ${EF_EXAMPLE_SRCS})
-        get_filename_component(name ${src} NAME_WE)         # 01_serial_number
-        get_filename_component(dir  ${src} DIRECTORY)
-        get_filename_component(grp  ${dir} NAME)            # wired | wireless
-        set(out "${grp}_${name}")                           # wired_01_serial_number
-        add_executable(example_${out} ${src})
-        set_target_properties(example_${out} PROPERTIES OUTPUT_NAME ${out})
-        target_link_libraries(example_${out} PRIVATE ef::ef)
-    endforeach()
-
-    # examples/opencv/*.cpp additionally link OpenCV (they use ef::toCvMat +
-    # cv::imshow) and decode over USB via retrieve_image(VIEW::BGR), so they need
-    # the ffmpeg path too. Built only when BOTH are present; otherwise skipped.
-    if(OpenCV_FOUND AND EF_AV_FOUND)
-        file(GLOB EF_OPENCV_EXAMPLE_SRCS CONFIGURE_DEPENDS
-             "${EF_EXAMPLES_DIR}/opencv/*.cpp")
-        foreach(src ${EF_OPENCV_EXAMPLE_SRCS})
-            get_filename_component(name ${src} NAME_WE)
-            set(out "opencv_${name}")
-            add_executable(example_${out} ${src})
-            set_target_properties(example_${out} PROPERTIES OUTPUT_NAME ${out})
-            target_link_libraries(example_${out} PRIVATE ef::ef ${OpenCV_LIBS})
-            target_include_directories(example_${out} PRIVATE ${OpenCV_INCLUDE_DIRS})
-        endforeach()
-    else()
-        message(STATUS "examples/opencv: skipped (need libopencv-dev + libavcodec-dev)")
-    endif()
-endif()
+# ---- tutorials build-tree export -------------------------------------------
+# Tutorials (../../tutorials/<topic>/cpp) are standalone mini-projects that link
+# the SDK via find_package(ef). Export the targets from the build tree so a
+# tutorial resolves against this in-repo build with no install step: point its
+# CMAKE_PREFIX_PATH at build/ (env.sh does this), then find_package(ef) works.
+# The generated efConfig.cmake also re-declares the imported calibration targets
+# when their per-arch .so is present, so OpenCV/IMU tutorials can link them.
+export(TARGETS ef NAMESPACE ef:: FILE "${CMAKE_BINARY_DIR}/efTargets.cmake")
+set(EF_EXPORT_CAL_LIB "${EF_CAMERA_CAL_LIB}")
+set(EF_EXPORT_IMU_LIB "${EF_IMU_CAL_LIB}")
+configure_file(cmake/efConfig.cmake.in "${CMAKE_BINARY_DIR}/efConfig.cmake" @ONLY)
 
 # ---- install ---------------------------------------------------------------
+# Optional (build.sh --install): places ef-cli on PATH system-wide. The library,
+# headers, and calibration .so ship too so find_package(ef) works off-tree.
 include(GNUInstallDirs)
+install(TARGETS ef-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS ef
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(TARGET camera_cal)
+    install(FILES ${EF_CAMERA_CAL_LIB} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+if(TARGET imu_cal)
+    install(FILES ${EF_IMU_CAL_LIB} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()

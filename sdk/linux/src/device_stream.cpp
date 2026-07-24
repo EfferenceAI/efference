@@ -133,12 +133,19 @@ ERROR_CODE Device::retrieve_image(Mat& mat, VIEW view) {
     // On decode failure, flush reference state so a later frame that lost its refs
     // (e.g. superseded while a consumer stalled) doesn't keep erroring; it resyncs
     // at the next keyframe (assembler's PLI-on-supersede already requests it over UDP).
-    if (avcodec_send_packet(impl_->decoder.dec, pkt) < 0) {
+    int sent = avcodec_send_packet(impl_->decoder.dec, pkt);
+    if (sent < 0 && sent != AVERROR(EAGAIN)) {
         avcodec_flush_buffers(impl_->decoder.dec);
         return ERROR_CODE::CORRUPTED_FRAME;
     }
     AVFrame* frm = impl_->decoder.frm;
-    if (avcodec_receive_frame(impl_->decoder.dec, frm) < 0) {
+    int rc = avcodec_receive_frame(impl_->decoder.dec, frm);
+    // Frame-threaded decoding pipelines the first few packets and returns
+    // EAGAIN until the pipeline fills. That is "no frame YET", not an error:
+    // flushing here would restart the priming and no frame would ever surface.
+    // Surface it as the non-fatal GRAB_TIMEOUT ("retry next grab") instead.
+    if (rc == AVERROR(EAGAIN)) return ERROR_CODE::GRAB_TIMEOUT;
+    if (rc < 0) {
         avcodec_flush_buffers(impl_->decoder.dec);
         return ERROR_CODE::CORRUPTED_FRAME;
     }

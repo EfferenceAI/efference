@@ -54,7 +54,7 @@ enum class Status : int {
     BUSY                = 22,
     INVALID_STATE       = 23,
     WIFI_NOT_CONNECTED  = 24,
-    ORCHESTRATOR_UNREACHABLE = 25,
+    DEVICE_SERVICE_UNREACHABLE = 25,
     CAMERA_UNAVAILABLE  = 26,
     BANDWIDTH_EXCEEDED  = 27,
     AUTH_REQUIRED       = 28,

@@ -72,6 +72,9 @@ message Request {
     GetState             get_state              = 75;
     SetLocation          set_location           = 76;  // persist device location on the device
     GetLocation          get_location           = 77;  // read current effective device location
+    // calibration (per-sensor; get is folded into GetDeviceInformation.camera/imu)
+    SetCalibration       set_calibration        = 78;  // write intrinsics (IDLE only, next session)
+    ResetCalibration     reset_calibration      = 79;  // restore factory default (IDLE only)
     // auth / access control (BLE password is user-facing)
     GetAuthChallenge     get_auth_challenge     = 92;  // device -> nonce (BLE auth handshake)
     Authenticate         authenticate           = 93;  // prove the BLE password (HMAC over nonce)
@@ -121,7 +124,7 @@ enum ErrorCode {
   TIMEOUT                  = 8;
   NOT_SUPERSPEED           = 9;
   CORRUPTED_FRAME          = 10;
-  ORCHESTRATOR_UNREACHABLE = 11;
+  DEVICE_SERVICE_UNREACHABLE = 11;
   INVALID_STATE            = 12;
   WIFI_NOT_CONNECTED       = 13;
   NOT_FOUND                = 14;
@@ -157,12 +160,16 @@ enum RateControl { RC_UNKNOWN = 0; RC_CBR = 1; RC_VBR = 2; RC_FIXQP = 3; }
 
 // ============================ Config ============================
 message VideoConfig {
-  uint32 width = 1; uint32 height = 2; uint32 fps = 3;   // 1920x1080x60
+  uint32 width = 1; uint32 height = 2; uint32 fps = 3;   // e.g. 1920x1200x30
   PixelFormat pixel_format = 4;                          // NV12 v1
   Codec codec = 5;                                       // only meaningful in BULK_COLLECT
   uint32 quality = 6;                                    // encoder quality 1-100 (0 = device default); HQ presets use a high value
 }
-message ImuConfig { bool enabled = 1; uint32 rate_hz = 2; uint32 accel_range_g = 3; uint32 gyro_range_dps = 4; }
+// IMU capture mode. Default IMU_RAW: record uncalibrated samples + carry the full
+// ImuCalibration params as metadata (consumer applies M·S·(x−b)). IMU_CALIBRATED: the
+// device applies the calibration to the samples on-device. IMU_BOTH: emit both (dual topics).
+enum ImuData { IMU_RAW = 0; IMU_CALIBRATED = 1; IMU_BOTH = 2; }
+message ImuConfig { bool enabled = 1; uint32 rate_hz = 2; uint32 accel_range_g = 3; uint32 gyro_range_dps = 4; ImuData data = 5; }
 message Configure { Mode mode = 1; VideoConfig video = 2; ImuConfig imu = 3; }
 
 // ============================ Stream control ============================
@@ -301,10 +308,9 @@ message WifiList {}        message WifiListResult { repeated string ssids = 1; }
 message StartWifiCheck {}  message GetWifiStatus {}
 message WifiStatus { bool connected = 1; string ssid = 2; int32 rssi = 3; string ip = 4;
                      bool internet = 5; double mbps_down = 6; double mbps_up = 7;
-                     // Association phase bucketed from wpa_state: "connected" /
-                     // "connecting" / "disconnected". Lets the host tell a mid-
-                     // association attempt from a genuinely idle link (connected
-                     // stays for back-compat = state == "connected").
+                     // Association phase from wpa_state: "connected" / "connecting"
+                     // / "disconnected" / "auth_failed" (last connect rejected, e.g.
+                     // wrong password). "connected" stays for back-compat.
                      string state = 8;
                      int32  link_speed = 9;    // negotiated PHY link rate, Mbps (0 = unknown)
                      int32  freq_mhz   = 10;   // associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz)
@@ -359,11 +365,31 @@ message Capabilities {
 message CameraIntrinsics {  // Double-Sphere
   double fx = 1; double fy = 2; double cx = 3; double cy = 4; double xi = 5; double alpha = 6;
   uint32 width = 7; uint32 height = 8; repeated double extrinsics_quat = 9;
+  bool rectify = 10;   // perform rectification on-device via FEC hardware (default false); intrinsics are always published as metadata regardless
+  double fov_scale = 11;  // rectified-output FOV scale (rectify path); default 1.0, <1 widens (more periphery), >1 zooms the clean center
 }
 message ImuCalibration {
   repeated double accel_bias = 1; repeated double gyro_bias = 2;
   double accel_noise_density = 3; double gyro_noise_density = 4; repeated double imu_to_camera = 5;
+  // ---- additive (6+): full per-sensor M·S·(x−b) model + noise-model + temporal (IMU lane, 2026-07-21).
+  // Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
+  // uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream.
+  repeated double accel_scale_misalign = 6;   // accel 3x3 M·S, row-major (empty = identity)
+  repeated double gyro_scale_misalign  = 7;   // gyro  3x3 M·S, row-major (empty = identity; model is bias-only)
+  double accel_bias_random_walk = 8;          // Allan +1/2 slope
+  double gyro_bias_random_walk  = 9;
+  double accel_tau = 10;                       // bias-instability correlation time (Gauss-Markov), s
+  double gyro_tau  = 11;
+  int64  time_offset_ns = 12;                  // IMU->camera temporal offset (0 when HW-sync only)
 }
+// Write calibration for one sensor (IDLE only; applied on the next capture
+// session). Get is folded into GetDeviceInformation (camera/imu fields).
+message SetCalibration {
+  oneof target { CameraIntrinsics camera = 1; ImuCalibration imu = 2; }
+}
+// Restore factory-default calibration for the selected sensor(s) (IDLE only).
+// Camera factory default is currently all-zeros (uncalibrated).
+message ResetCalibration { bool camera = 1; bool imu = 2; }
 
 
 // ============================ Auth / access control ============================

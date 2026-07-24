@@ -67,6 +67,17 @@ public:
 
     DEVICE_STATE get_state() const;
 
+    // Live fault poll. Refreshes the device state from the device firmware's state machine (so a
+    // subsequent get_state() is fresh too). Returns true iff a fault is LATCHED (the
+    // device is in SAFE and needs a health-gated recovery); a latched device projects
+    // DEVICE_STATE::CLOSED (the 4-value enum has no FAULT value), which is how a client
+    // tells a fault-CLOSED from a not-open CLOSED. When `reason` is non-null it receives
+    // the most recent anomaly cause -- populated for a latched fault AND for an unlatched
+    // abnormal session end (e.g. disk_full, capture_stopped), and empty once a new
+    // session starts clean -- so check `reason` even when the return is false. Best-effort:
+    // on a communication failure it returns the last-known cached values.
+    bool poll_fault(std::string* reason = nullptr);
+
     DeviceInformation get_device_information() const;
 
     ERROR_CODE grab(RuntimeParameters params = RuntimeParameters());
@@ -116,6 +127,10 @@ public:
     ERROR_CODE wifi_remove(const std::string& ssid);
     ERROR_CODE wifi_select(const std::string& ssid);
 
+    // Access points in range, strongest first. DEVICE_BUSY while recording or
+    // livestreaming (a scan would disrupt the link); retry once idle.
+    ERROR_CODE scan_wifi_networks(std::vector<WifiNetwork>& out);
+
     // Rekey the BLE control password. Over BLE the old password is required;
     // over USB old_password may be "" (physical access resets a forgotten one).
     ERROR_CODE set_ble_password(const std::string& old_password,
@@ -143,6 +158,27 @@ public:
     // come from get_device_information().capabilities.
     ERROR_CODE set_configuration(int width, int height, int fps,
                                  COMPRESSION_MODE codec);
+    // Overload that also selects on-device IMU handling for the session (proto
+    // ImuConfig.data): RAW records uncalibrated (default), CALIBRATED applies the
+    // stored M*S*(x-b) per sample, BOTH emits both. Geometry/codec as above.
+    ERROR_CODE set_configuration(int width, int height, int fps,
+                                 COMPRESSION_MODE codec, IMU_DATA imu_data);
+
+    // Persist the camera intrinsics (Double Sphere). IDLE only; applied on the
+    // next capture session. The values come from the OpenCV calibration tool.
+    // Read them back via get_device_information().camera_configuration.calibration.
+    ERROR_CODE set_camera_calibration(const CalibrationParameters& calibration,
+                                      int width, int height);
+    // Persist the IMU field calibration (bias + M*S + noise/temporal). IDLE only;
+    // applied on the next capture session. All fields round-trip via
+    // get_device_information().sensors_configuration: accel_bias/gyro_bias,
+    // accel_scale_misalign/gyro_scale_misalign, per-sensor noise_density/
+    // bias_random_walk/tau, camera_imu_transform, and time_offset_ns. Values come
+    // from the host-side IMU calibration solve.
+    ERROR_CODE set_imu_calibration(const ImuCalibrationParameters& calibration);
+    // Restore factory-default calibration for the selected sensor(s). IDLE only.
+    // The camera factory default is currently all-zeros (uncalibrated).
+    ERROR_CODE reset_calibration(bool camera, bool imu = false);
 
 private:
     struct Impl;

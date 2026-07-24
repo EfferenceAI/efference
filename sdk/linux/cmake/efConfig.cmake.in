@@ -1,0 +1,34 @@
+# efConfig.cmake - package config for the Efference SDK, generated into the build
+# tree by configure_file(). Lets a standalone tutorial link the SDK with:
+#
+#   find_package(ef REQUIRED)
+#   target_link_libraries(main PRIVATE ef::ef)
+#
+# Resolved via CMAKE_PREFIX_PATH pointing at this build tree (env.sh sets it).
+
+include(CMakeFindDependencyMacro)
+
+# ef is a static library, so its private link dependencies are transitive usage
+# requirements. Re-create those imported targets before loading ef's own. This is
+# a build-tree export (same machine that built the SDK), so every dependency the
+# SDK linked is present here; the optional ones are matched non-fatally.
+find_dependency(Threads)
+find_dependency(PkgConfig)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
+pkg_check_modules(EF_AV QUIET IMPORTED_TARGET libavcodec libavutil libswscale)  # FFmpeg decode
+pkg_check_modules(GIO   QUIET IMPORTED_TARGET gio-2.0 gio-unix-2.0)             # BLE (BlueZ)
+find_package(OpenSSL QUIET)                                                     # BLE crypto
+
+include("${CMAKE_CURRENT_LIST_DIR}/efTargets.cmake")
+
+# Re-declare the prebuilt calibration solvers as imported targets when their
+# per-arch .so was found at configure time. Tutorials that need them
+# (calibrate_camera, calibrate_imu) link ef::camera_cal / ef::imu_cal.
+if(EXISTS "@EF_EXPORT_CAL_LIB@" AND NOT TARGET ef::camera_cal)
+    add_library(ef::camera_cal SHARED IMPORTED)
+    set_target_properties(ef::camera_cal PROPERTIES IMPORTED_LOCATION "@EF_EXPORT_CAL_LIB@")
+endif()
+if(EXISTS "@EF_EXPORT_IMU_LIB@" AND NOT TARGET ef::imu_cal)
+    add_library(ef::imu_cal SHARED IMPORTED)
+    set_target_properties(ef::imu_cal PROPERTIES IMPORTED_LOCATION "@EF_EXPORT_IMU_LIB@")
+endif()

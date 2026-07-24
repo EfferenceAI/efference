@@ -240,7 +240,13 @@ PB_BIND(ef_v1_Capabilities, ef_v1_Capabilities, 2)
 PB_BIND(ef_v1_CameraIntrinsics, ef_v1_CameraIntrinsics, AUTO)
 
 
-PB_BIND(ef_v1_ImuCalibration, ef_v1_ImuCalibration, AUTO)
+PB_BIND(ef_v1_ImuCalibration, ef_v1_ImuCalibration, 2)
+
+
+PB_BIND(ef_v1_SetCalibration, ef_v1_SetCalibration, 2)
+
+
+PB_BIND(ef_v1_ResetCalibration, ef_v1_ResetCalibration, AUTO)
 
 
 PB_BIND(ef_v1_GetAuthChallenge, ef_v1_GetAuthChallenge, AUTO)
@@ -253,6 +259,8 @@ PB_BIND(ef_v1_Authenticate, ef_v1_Authenticate, AUTO)
 
 
 PB_BIND(ef_v1_SetBlePassword, ef_v1_SetBlePassword, AUTO)
+
+
 
 
 

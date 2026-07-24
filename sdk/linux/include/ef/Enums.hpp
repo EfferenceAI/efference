@@ -44,6 +44,7 @@ enum class ERROR_CODE : int {
     INVALID_PASSWORD = 25,              // BLE control password rejected (challenge-response failed).
     INSUFFICIENT_PERMISSIONS = 26,      // Cannot access the device; add the udev rule / grant USB access.
     UNSUPPORTED = 27,                   // Operation not supported in this build.
+    DEVICE_BUSY = 28,                   // Device busy (e.g. recording or livestreaming); retry once it is idle.
 
     // --- 40-59: sensor parameters & calibration ---
     INVALID_RESOLUTION = 40,            // Resolution not in the device's supported set.
@@ -58,6 +59,7 @@ enum class ERROR_CODE : int {
     CANNOT_START_CAMERA_STREAM = 61,    // Camera stream failed to start (may already be in use).
     COMMUNICATION_ERROR = 62,           // A control-plane round trip failed (USB or BLE I/O).
     WIFI_NOT_CONNECTED = 63,            // Operation requires WiFi but the device is not connected (e.g. upload before provisioning).
+    INSUFFICIENT_WIFI_BANDWIDTH = 64,   // Selected format is too large for the WiFi/UDP online link (e.g. raw NV12 ~830 Mbit/s); use an encoded codec, or stream raw over USB.
 
     // --- 80-99: streaming & recording ---
     CORRUPTED_FRAME = 80,               // Frame decoded with invalid colors; a hardware/driver fault.
@@ -97,6 +99,16 @@ enum class COMPRESSION_MODE {
     H264_HQ = 2,  // high quality (near-lossless)
     H265    = 3,
     H265_HQ = 4,  // high quality (near-lossless)
+};
+
+// On-device IMU sample handling for a capture session (proto ImuConfig.data).
+// RAW: record uncalibrated samples + carry the full ImuCalibration params as
+// metadata (data-collection default; consumer applies M*S*(x-b)). CALIBRATED:
+// the device applies M*S*(x-b) per sample. BOTH: emit both.
+enum class IMU_DATA {
+    RAW        = 0,
+    CALIBRATED = 1,
+    BOTH       = 2,
 };
 
 enum class SENSOR_TYPE {
@@ -193,12 +205,16 @@ enum class UPLOAD_STATE {
     OFF     = 1,
 };
 
-// Firmware update phases.
+// Firmware update phases. New values are appended; 0-3 keep their values.
 enum class UPDATE_STATE {
     DOWNLOADING    = 0,
     VERIFYING      = 1,
     READY_TO_APPLY = 2,
     APPLYING       = 3,
+    CHECKING       = 4,   // reading the update manifest
+    UPLOADING      = 5,   // host pushing a local .eff over the wire
+    REBOOTING      = 6,   // booting into the new slot
+    RECONNECTING   = 7,   // waiting for the device after reboot
 };
 
 enum class MAT_TYPE {
@@ -213,6 +229,7 @@ const char* to_string(MODEL);
 const char* to_string(INPUT_TYPE);
 const char* to_string(RESOLUTION);
 const char* to_string(COMPRESSION_MODE);
+const char* to_string(IMU_DATA);
 const char* to_string(SENSOR_TYPE);
 const char* to_string(SENSOR_UNIT);
 const char* to_string(LENS_DISTORTION_MODEL);

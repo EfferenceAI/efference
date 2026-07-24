@@ -45,9 +45,8 @@
 
 #include <libusb-1.0/libusb.h>
 
-// Transport/reader internals speak ef::Status (fine-grained ISOC result set;
-// left the public headers when the API went ERROR_CODE-only). Translated to
-// ERROR_CODE at this layer; nothing above speaks Status.
+// Transport/reader internals speak ef::Status (fine-grained ISOC result set);
+// translated to ERROR_CODE at this layer, nothing above speaks Status.
 #include "internal_status.hpp"
 
 #include "connection.hpp"
@@ -79,8 +78,7 @@ extern "C" {
 namespace ef {
 
 // Readable aliases for the C types nanopb generates from proto/ef.proto
-// (package ef.v1 -> ef_v1_*). Enum values, body tags, and the _init_zero /
-// _fields macros keep their generated names.
+// (ef.v1 -> ef_v1_*). Enum values, body tags, and macros keep generated names.
 using WireRequest       = ef_v1_Request;
 using WireResponse      = ef_v1_Response;
 using WireErrorCode     = ef_v1_ErrorCode;
@@ -129,8 +127,8 @@ inline WireCodec pb_codec(COMPRESSION_MODE c) {
     return ef_v1_Codec_CODEC_RAW;
 }
 
-// _HQ presets ride the same wire codec plus explicit encoder quality. 90 ≈
-// perceptually lossless; named so the two presets can't drift. Tune here.
+// _HQ presets ride the same wire codec plus explicit encoder quality;
+// 90 is perceptually near-lossless. Tune here.
 inline constexpr uint32_t kHqQuality = 90;
 
 inline uint32_t quality_for(COMPRESSION_MODE c) {
@@ -139,9 +137,8 @@ inline uint32_t quality_for(COMPRESSION_MODE c) {
                : 0;   // 0 = device default
 }
 
-// HQ never round-trips: wire carries codec and quality separately but the
-// device reports only the codec, so a read-back collapses to the base mode.
-// The requested mode survives in the InitParameters cache.
+// HQ never round-trips: the device reports only the codec, so a read-back
+// collapses to the base mode. The requested mode survives in InitParameters.
 inline COMPRESSION_MODE compression_from(WireCodec c) {
     switch (c) {
         case ef_v1_Codec_H264: return COMPRESSION_MODE::H264;
@@ -150,14 +147,15 @@ inline COMPRESSION_MODE compression_from(WireCodec c) {
     }
 }
 
-// What kind of request produced a device error. The wire enum is smaller than
-// ERROR_CODE, so errors are translated per call site into a documented subset.
+// What kind of request produced a device error; selects the ERROR_CODE subset
+// to translate into, since the wire enum is smaller than ERROR_CODE.
 enum class Ctx {
-    CONTROL,     // queries, wifi, health, time, reboot
+    CONTROL,     // queries, health, time, reboot
     SESSION,     // configure / start_stream during open()
     RECORDING,   // device-local recording verbs (incl. download)
     UPLOAD,      // upload verbs
     UPDATE,      // OTA verbs
+    WIFI,        // wifi verbs; BUSY surfaces as a retryable ERROR_CODE::BUSY
 };
 
 // Device ErrorCode + request context -> ERROR_CODE. The device's message
@@ -171,7 +169,7 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         case ef_v1_ErrorCode_BANDWIDTH_EXCEEDED:
         case ef_v1_ErrorCode_NOT_SUPERSPEED:           return ERROR_CODE::LOW_USB_BANDWIDTH;
         case ef_v1_ErrorCode_CAMERA_UNAVAILABLE:       return ERROR_CODE::CANNOT_START_CAMERA_STREAM;
-        case ef_v1_ErrorCode_ORCHESTRATOR_UNREACHABLE: return ERROR_CODE::DEVICE_NOT_AVAILABLE;
+        case ef_v1_ErrorCode_DEVICE_SERVICE_UNREACHABLE: return ERROR_CODE::DEVICE_NOT_AVAILABLE;
         case ef_v1_ErrorCode_STORAGE_FULL:             return ERROR_CODE::STORAGE_FULL;
         // Name conflict on record start (recording-specific, same meaning in any ctx).
         case ef_v1_ErrorCode_ALREADY_EXISTS:           return ERROR_CODE::RECORDING_ALREADY_EXISTS;
@@ -221,6 +219,18 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
                 case ef_v1_ErrorCode_BUSY:
                 case ef_v1_ErrorCode_INVALID_STATE:     return ERROR_CODE::INVALID_FUNCTION_CALL;
                 default:                                return ERROR_CODE::FAILED_TO_UPDATE;
+            }
+        case Ctx::WIFI:
+            switch (c) {
+                // The device is recording/livestreaming; the caller can retry
+                // once it stops, so keep BUSY distinct from a generic failure.
+                case ef_v1_ErrorCode_BUSY:              return ERROR_CODE::DEVICE_BUSY;
+                case ef_v1_ErrorCode_WIFI_NOT_CONNECTED: return ERROR_CODE::WIFI_NOT_CONNECTED;
+                // wifi remove of an ssid that was never saved.
+                case ef_v1_ErrorCode_NOT_FOUND:
+                case ef_v1_ErrorCode_INVALID_PARAMETER:
+                case ef_v1_ErrorCode_INVALID_STATE:     return ERROR_CODE::INVALID_FUNCTION_CALL;
+                default:                                return ERROR_CODE::UNKNOWN_FAILURE;
             }
         case Ctx::CONTROL:
         default:
@@ -332,6 +342,11 @@ struct VideoDecoder {
         if (!codec) return false;
         dec = avcodec_alloc_context3(codec);
         if (!dec) return false;
+        // A single decode thread (FFmpeg's default) can't keep 1200p30 HEVC
+        // real-time, and falling behind triggers a drop-until-IDR resync stall
+        // (no PLI back-channel over USB). Frame threading adds one frame of
+        // latency per thread, so 2 is the sweet spot: real-time at ~66 ms.
+        dec->thread_count = 2;
         if (avcodec_open2(dec, codec, nullptr) < 0) { avcodec_free_context(&dec); return false; }
         pkt = av_packet_alloc(); frm = av_frame_alloc();
         cur = c; have = pkt && frm;
@@ -340,10 +355,28 @@ struct VideoDecoder {
     bool convert(const uint8_t* const src[4], const int srcstride[4], int w, int h,
                  AVPixelFormat srcfmt, VIEW view, std::vector<uint8_t>& buf, int* step) {
         AVPixelFormat df = av_of(view);
+        // The H.264/H.265 decoder reports full-range 4:2:0 as the deprecated
+        // YUVJ420P. Remap it to YUV420P and signal full range explicitly below,
+        // so swscale does not print the "deprecated pixel format" warning. The
+        // converted pixels are identical.
+        bool src_full = true;
+        AVPixelFormat eff;
+        switch (srcfmt) {
+            case AV_PIX_FMT_YUVJ420P: eff = AV_PIX_FMT_YUV420P; break;
+            case AV_PIX_FMT_YUVJ422P: eff = AV_PIX_FMT_YUV422P; break;
+            case AV_PIX_FMT_YUVJ444P: eff = AV_PIX_FMT_YUV444P; break;
+            case AV_PIX_FMT_YUVJ440P: eff = AV_PIX_FMT_YUV440P; break;
+            default: eff = srcfmt; src_full = false; break;
+        }
         if (!sws || sw != w || sh != h || sfmt != (int)srcfmt || dfmt != (int)df) {
             if (sws) sws_freeContext(sws);
-            sws = sws_getContext(w, h, srcfmt, w, h, df, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            sws = sws_getContext(w, h, eff, w, h, df, SWS_BILINEAR, nullptr, nullptr, nullptr);
             sw = w; sh = h; sfmt = (int)srcfmt; dfmt = (int)df;
+            if (sws && src_full) {
+                // Full-range in and out; neutral brightness/contrast/saturation.
+                const int* coef = sws_getCoefficients(SWS_CS_DEFAULT);
+                sws_setColorspaceDetails(sws, coef, 1, coef, 1, 0, 1 << 16, 1 << 16);
+            }
         }
         if (!sws) return false;
         int need = av_image_get_buffer_size(df, w, h, 1);
@@ -359,9 +392,9 @@ struct VideoDecoder {
 };
 
 // Host-side recorder: bounded queue + writer thread so a slow disk never
-// back-pressures the grab loop. Writes a real MCAP container (video + IMU) in
-// the same schema/topic layout as a device-local recording (see mcap.hpp), so
-// both recording targets replay through the same MCAP reader.
+// back-pressures the grab loop. Writes an MCAP container (video + IMU) in the
+// same schema/topic layout as a device-local recording (see mcap.hpp), so both
+// targets replay through the same reader.
 struct HostRecorder {
     struct Item {
         bool                 imu = false;
@@ -514,18 +547,16 @@ struct Device::Impl {
     HealthStatus      health;          // last completed sweep
     Caps              caps;            // internal validation menu
 
-    // USB isoc StreamReader, WiFi UdpStreamReader, or MCAP replay: one
-    // reassembly core behind a shared consumer API (grab/current_video/drain_imu).
-    // shared_ptr + reader_mtx so a grab() blocked in the assembler can't be freed
-    // by a concurrent update()/close()/reboot(): teardown swaps the pointer out
-    // under the lock and stop() wakes the waiter; the last snapshot holder frees
-    // it (see stop_streaming / reader_snapshot).
+    // USB isoc StreamReader, WiFi UdpStreamReader, or MCAP replay behind one
+    // shared consumer API (grab/current_video/drain_imu). shared_ptr + reader_mtx
+    // so a concurrent update()/close()/reboot() can't free a reader while a grab()
+    // is blocked in it: teardown swaps the pointer out under the lock and stop()
+    // wakes the waiter, then the last snapshot holder frees it.
     std::shared_ptr<internal::StreamAssembler> reader;
     mutable std::mutex            reader_mtx;
     VideoDecoder                  decoder;
-    // shared_ptr + data_mtx (below), same discipline as `reader`: a grab() teeing
-    // into the recorder pins it with a snapshot, so a control-thread reset frees
-    // the object only once no data-plane call still holds it.
+    // shared_ptr + data_mtx (below), same discipline as `reader`: a control-thread
+    // reset frees the recorder only once no data-plane call still holds a snapshot.
     std::shared_ptr<HostRecorder> host_rec;
     std::string                   device_rec_name;   // active DEVICE_LOCAL session
     bool                          device_rec = false;
@@ -533,8 +564,14 @@ struct Device::Impl {
     // Raw activity facets, refreshed by refresh_device_state() alongside `state`.
     // They preserve the recording-vs-uploading distinction that DEVICE_STATE
     // collapses into STREAMING, keeping the illegal-state guards precise.
-    bool                          dev_recording = false;  // device-side capture in flight (FSM COLLECT / device_state RECORDING)
-    bool                          dev_uploading = false;  // device-side upload in flight (device_state UPLOADING)
+    bool                          dev_recording = false;  // device-side capture in flight (FSM COLLECT / reported_status RECORDING)
+    bool                          dev_uploading = false;  // device-side upload in flight (reported_status UPLOADING)
+
+    // Fault surfaced by the device firmware, refreshed alongside `state`. The 4-value
+    // DEVICE_STATE has no FAULT value (SAFE projects to CLOSED per the state model),
+    // so a client observes a device fault through these fields, not the state enum.
+    bool                          device_fault_latch = false;
+    std::string                   device_last_fault;
 
     Resolution stream_res{};   // validated at open(), applied when streaming starts
 
@@ -552,11 +589,10 @@ struct Device::Impl {
     uint64_t last_frame_ts_ns = 0;
     uint32_t corr = 0;
 
-    // Serializes control round trips against transport teardown: libusb_close
-    // (or BlueZ teardown) under an in-flight request is UB, so close_transport()
-    // takes this too. Multi-round-trip loops (download_recording, ota_push, polls)
-    // re-take it per call(), so a concurrent close() aborts them at the next chunk
-    // boundary with DEVICE_NOT_INITIALIZED instead of crashing.
+    // Serializes control round trips against transport teardown (libusb_close or
+    // BlueZ teardown under an in-flight request is UB). Multi-round-trip loops
+    // (download_recording, ota_push, polls) re-take it per call(), so a concurrent
+    // close() aborts them at the next chunk boundary instead of crashing.
     std::mutex ctl_mtx;
 
     std::shared_ptr<internal::StreamAssembler> reader_snapshot() const {
@@ -633,6 +669,22 @@ struct Device::Impl {
         (void)call(req, resp);
     }
 
+    // StopStream, then poll get_state (bounded ~1 s) until the device leaves
+    // STREAMING. Online (UDP) teardown is asynchronous, so a Configure right after
+    // StopStream can race it and be rejected INVALID_STATE; settling first makes
+    // the follow-up deterministic (one round trip, no sleep, when already idle).
+    // A recording/upload owned by another client is not ours to interrupt.
+    void stop_stream_and_settle() {
+        refresh_device_state();
+        if (dev_recording || dev_uploading) return;
+        stop_stream_quiet();
+        for (int i = 0; i < 10; ++i) {
+            refresh_device_state();
+            if (state != DEVICE_STATE::STREAMING) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
     // Align the device clock with the host wall clock. Best-effort at open()
     // (a device that rejects it still streams; timestamps just stay device-epoch).
     void set_time_quiet() {
@@ -653,24 +705,35 @@ struct Device::Impl {
         WireResponse resp;
         if (call(req, resp, ef_v1_Response_state_info_tag) != ERROR_CODE::SUCCESS)
             return;
-        const char* fsm = resp.body.state_info.state;         // device activity state
-        const char* dev = resp.body.state_info.device_state;  // device data-plane state
+        const char* fsm = resp.body.state_info.state;         // authoritative device firmware state
+        const char* dev = resp.body.state_info.device_state;  // reported_status (BLE projection)
 
-        // Raw facets for the illegal-state guards. Recording shows as activity
-        // state COLLECT (data-plane RECORDING is a redundant echo); uploading is
-        // reported only by the data-plane state.
+        // Fault ride-along: the device firmware's fault_latch + last_fault arrive on the
+        // same reply. Cache them so a client can observe a fault even though the
+        // 4-value DEVICE_STATE deliberately has no FAULT value.
+        device_fault_latch = resp.body.state_info.fault_latch;
+        device_last_fault  = resp.body.state_info.last_fault;
+
+        // Raw facets for the illegal-state guards. Recording shows as FSM COLLECT
+        // (reported_status RECORDING echoes it); uploading only on reported_status.
         dev_recording = !std::strcmp(fsm, "COLLECT") || !std::strcmp(dev, "RECORDING");
         dev_uploading = !std::strcmp(dev, "UPLOADING");
 
-        // Public 4-value projection: STREAMING = moving data in any form (live,
-        // recording, upload, or "CAL" calibration); OTA is UPDATING; anything
-        // quiet (or a health sweep) is IDLE.
+        // Public 4-value projection of the authoritative FSM state (see docs
+        // architecture/device-state-model). SAFE and a latched fault -> CLOSED;
+        // transitional states (INIT/RESET/HEALTH_TEST/SLEEP) -> CLOSED; OTA ->
+        // UPDATING; COLLECT/CAL or a live host stream -> STREAMING; IDLE -> IDLE.
+        // CLOSED therefore means "present but not in a usable data state"; a client
+        // disambiguates a fault via fault_latch/last_fault, not the state enum.
         auto r = reader_snapshot();
         const bool reader_live = (r && r->is_running());
-        if      (!std::strcmp(fsm, "OTA"))  state = DEVICE_STATE::UPDATING;
+        if      (device_fault_latch || !std::strcmp(fsm, "SAFE"))
+                                            state = DEVICE_STATE::CLOSED;
+        else if (!std::strcmp(fsm, "OTA"))  state = DEVICE_STATE::UPDATING;
         else if (reader_live || dev_recording || dev_uploading ||
                  !std::strcmp(fsm, "CAL"))  state = DEVICE_STATE::STREAMING;
-        else                                state = DEVICE_STATE::IDLE;
+        else if (!std::strcmp(fsm, "IDLE")) state = DEVICE_STATE::IDLE;
+        else                                state = DEVICE_STATE::CLOSED;  // INIT/RESET/HEALTH_TEST/SLEEP
     }
 
     // Configure the ISO_LIVE session: geometry, NV12, codec + HQ quality, IMU.
@@ -722,7 +785,7 @@ struct Device::Impl {
             req.body.start_stream.mode = ef_v1_Mode_ISO_LIVE;
             WireResponse resp;
             ec = call(req, resp, 0, Ctx::SESSION);
-            if (ec != ERROR_CODE::SUCCESS) { r->stop(); return ec; }
+            if (ec != ERROR_CODE::SUCCESS) { r->stop(); stop_stream_quiet(); return ec; }
         }
         set_reader(std::move(r));
         return ERROR_CODE::SUCCESS;
@@ -731,7 +794,17 @@ struct Device::Impl {
     // BLE + WiFi: configure + StartStream(ONLINE -> udp_host:udp_port over UDP)
     // + the host UDP reader bound on udp_port.
     ERROR_CODE start_streaming_online(const Resolution& res) {
+        // A device left STREAMING by a crashed online session rejects Configure
+        // with INVALID_STATE. stop_stream_and_settle() clears it, but teardown is
+        // asynchronous, so retry across a few settle cycles; any other result
+        // (success, or a genuine codec/resolution error) returns at once.
         ERROR_CODE ec = configure_session(res);
+        for (int attempt = 0; attempt < 3 &&
+                              ec == ERROR_CODE::INVALID_FUNCTION_CALL &&
+                              !dev_recording && !dev_uploading; ++attempt) {
+            stop_stream_and_settle();
+            ec = configure_session(res);
+        }
         if (ec != ERROR_CODE::SUCCESS) return ec;
         // Bind the UDP socket before StartStream, same reason the isoc reader
         // starts first: the opening access unit (SPS/PPS) is sent immediately
@@ -740,8 +813,10 @@ struct Device::Impl {
         r->set_video_codec(codec_gate_id());   // drop-until-IDR resync classifier
         Status st = r->start(init.udp_port, /*video=*/true,
                              init.enable_imu, init.verbose);
-        if (st != Status::SUCCESS)
+        if (st != Status::SUCCESS) {
+            stop_stream_quiet();   // never leave the device armed on our failure
             return ERROR_CODE::CANNOT_START_CAMERA_STREAM;
+        }
         {
             WireRequest req = ef_v1_Request_init_zero;
             req.which_body                    = ef_v1_Request_start_stream_tag;
@@ -755,7 +830,7 @@ struct Device::Impl {
             req.body.start_stream.target.protocol  = ef_v1_Protocol_UDP;
             WireResponse resp;
             ec = call(req, resp, 0, Ctx::SESSION);
-            if (ec != ERROR_CODE::SUCCESS) { r->stop(); return ec; }
+            if (ec != ERROR_CODE::SUCCESS) { r->stop(); stop_stream_quiet(); return ec; }
         }
         set_reader(std::move(r));
         return ERROR_CODE::SUCCESS;
@@ -770,12 +845,15 @@ struct Device::Impl {
             return ERROR_CODE::INVALID_FUNCTION_CALL;      // replay reader is gone
         // Clear a stale stream left armed by a client that died mid-stream
         // (StopStream is harmless when idle). Done here, not at open(), so it
-        // never touches a DEVICE_LOCAL recording from another process.
+        // never touches another process's DEVICE_LOCAL recording.
         stop_stream_quiet();
+        // udp_host picks WiFi/UDP for either control transport; BLE without one
+        // has no data plane (isoc needs USB).
         ERROR_CODE ec;
-        if (init.input_type == INPUT_TYPE::STREAM) {
-            if (init.udp_host.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
+        if (!init.udp_host.empty()) {
             ec = start_streaming_online(stream_res);
+        } else if (init.input_type == INPUT_TYPE::STREAM) {
+            return ERROR_CODE::INVALID_FUNCTION_CALL;
         } else {
             ec = start_streaming(stream_res);
         }
@@ -796,12 +874,10 @@ struct Device::Impl {
             reader.reset();
         }
         if (r) {
-            r->stop();   // wakes any blocked grab(); the object stays alive
-                         // until the last in-flight snapshot drops it
-            stop_stream_quiet();   // only this session's stream: StopStream==
-                                   // StopCollect on the device, so an
-                                   // unconditional call would also stop a
-                                   // DEVICE_LOCAL recording.
+            r->stop();   // wakes any blocked grab(); freed by last snapshot holder
+            // Only when a reader existed: StopStream == StopCollect on the device,
+            // so an unconditional call would also stop a DEVICE_LOCAL recording.
+            stop_stream_quiet();
         }
     }
 
@@ -814,10 +890,9 @@ struct Device::Impl {
         state = DEVICE_STATE::CLOSED;
     }
 
-    // After a provisioning verb, refresh the cached wireless snapshot so
-    // get_device_information().wireless reflects the change (best-effort):
-    // live association from GetWifiStatus, saved networks from WifiList. Uses
-    // device truth so the cache can't drift on re-adds or miss earlier sessions.
+    // Refresh the cached wireless snapshot from device truth (best-effort) so
+    // get_device_information().wireless reflects a provisioning change: live
+    // association from GetWifiStatus, saved networks from WifiList.
     void refresh_wireless() {
         {
             WireRequest req = ef_v1_Request_init_zero;
@@ -834,9 +909,8 @@ struct Device::Impl {
                 info.wireless.wifi_freq_mhz      = w.freq_mhz;
                 info.wireless.wifi_security      = w.security;
                 // Back-compat: firmware predating WifiStatus.state (field 8)
-                // leaves it empty; derive the 3-state from the legacy `connected`
-                // bool so the host never shows a blank state. (link_speed/freq/
-                // security stay 0/"" on old firmware; the printers omit them.)
+                // leaves it empty, so derive the 3-state from the legacy
+                // `connected` bool rather than show a blank state.
                 info.wireless.wifi_state =
                     w.state[0] ? w.state : (w.connected ? "connected" : "disconnected");
             }
@@ -855,9 +929,8 @@ struct Device::Impl {
     }
 
     // Every IMU drain goes through here so a host recording sees every sample
-    // whether or not the app calls retrieve_imu. Samples stay raw IMAGE-frame
-    // (recorder gets device truth; the user-facing transform is in retrieve_imu).
-    // Consumer-thread only.
+    // whether or not the app calls retrieve_imu. Samples stay raw IMAGE-frame;
+    // the user-facing transform is in retrieve_imu. Consumer-thread only.
     void drain_imu_tee(std::vector<ImuSample>& out, uint64_t* dropped,
                        const std::shared_ptr<HostRecorder>& hr) {
         out.clear();
@@ -880,18 +953,17 @@ struct Device::Impl {
     }
 
 #ifdef EF_HAVE_BLE
-    // BLE control-plane auth: prove the password with a PBKDF2 + HMAC-SHA256
-    // challenge-response so it never crosses the air. Runs once right after the
-    // link is up; without it the device answers AUTH_REQUIRED to every verb.
+    // BLE control-plane auth: prove the password via PBKDF2 + HMAC-SHA256
+    // challenge-response so it never crosses the air. Runs once after link-up;
+    // without it the device answers AUTH_REQUIRED to every verb.
     ERROR_CODE ble_auth(const std::string& pw) {
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_get_auth_challenge_tag;
         WireResponse resp;
         ERROR_CODE ec = call(req, resp, ef_v1_Response_auth_challenge_tag);
-        // Only AUTH_REQUIRED/AUTH_FAILED mean "wrong password" (err_from maps
-        // those). Everything else (UNSUPPORTED, NOT_OPENED mid-OTA, transport
-        // loss) surfaces untranslated: no password was tested, so INVALID_PASSWORD
-        // would send the user chasing the wrong problem.
+        // Only AUTH_REQUIRED/AUTH_FAILED mean "wrong password". Everything else
+        // (UNSUPPORTED, NOT_OPENED mid-OTA, transport loss) surfaces untranslated,
+        // since no password was tested and INVALID_PASSWORD would mislead.
         if (ec != ERROR_CODE::SUCCESS) return ec;
 
         const ef_v1_AuthChallenge& ch = resp.body.auth_challenge;
@@ -912,9 +984,8 @@ struct Device::Impl {
 #endif
 
     // Sideload a local .eff over the control link: OtaPushBegin announces
-    // {name,total}; each OtaPushChunk carries <= 7168 B (so the request fits the
-    // 8192 control-frame cap); the eof chunk triggers device-side reassembly +
-    // verification.
+    // {name,total}, each OtaPushChunk carries <= 7168 B (fits the 8192 control-
+    // frame cap), and the eof chunk triggers device-side reassembly + verify.
     ERROR_CODE ota_push(const std::string& path,
                         const std::function<void(uint64_t, uint64_t)>& progress) {
         std::FILE* f = std::fopen(path.c_str(), "rb");
