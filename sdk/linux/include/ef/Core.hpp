@@ -181,6 +181,11 @@ struct DeviceInformation {
     std::string serial;             // full device serial (may be non-numeric)
     unsigned int serial_number = 0; // numeric form; 0 when the serial is not numeric
     MODEL model = MODEL::M1;
+    std::string model_name;         // model exactly as the device reports it ("M1")
+    // Board revision the device reports. Currently baked per firmware build, so every
+    // unit on a given image returns the same value ("1.00"); it identifies a board spin
+    // only once provisioned per-unit. Treat "1.00" as "unknown revision".
+    std::string hw_rev;
     unsigned int firmware_version = 0;      // OTA monotonic int (anti-rollback)
     std::string  firmware_version_str;      // human-readable "XX.XX.XX" (display only)
     INPUT_TYPE input_type = INPUT_TYPE::USB;
@@ -292,6 +297,22 @@ struct RecordingStatus {
     uint64_t     upload_bytes_sent  = 0;
     uint64_t     upload_bytes_total = 0;
     ERROR_CODE   last_error         = ERROR_CODE::SUCCESS;
+};
+
+// What the update-check service says this device should be running. Resolved on the
+// HOST: the device holds no update policy and never contacts the service itself.
+struct UpdateAvailability {
+    bool         available = false;
+    unsigned int target_version = 0;     // version_int of the bundle AT `url`, which is
+                                         // not necessarily the newest release: the
+                                         // service may route an old device through an
+                                         // intermediate hop.
+    std::string  target_version_str;     // display only ("00.09.13")
+    std::string  url;                    // empty unless `available`
+    std::string  notes;                  // optional one-line service message
+    // Why no answer was usable: the service's own {error, details}, or the transport
+    // failure. The ERROR_CODE cannot tell "unreachable" from "it refused our request".
+    std::string  service_error;
 };
 
 struct UpdateStatus {

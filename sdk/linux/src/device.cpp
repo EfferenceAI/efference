@@ -97,7 +97,11 @@ namespace {
 void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
                     const std::string& usb_serial, DeviceInformation* out, Caps* caps) {
     DeviceInformation di;
-    di.model            = MODEL::M1;
+    // Report what the device said: the update-check service keys on this string, so
+    // asserting M1 would offer M1 firmware to a board that said otherwise.
+    di.model_name = d.model[0] ? d.model : "";
+    di.model      = MODEL::M1;                  // only value in the enum today
+    di.hw_rev     = d.hw_rev[0] ? d.hw_rev : "";
     di.firmware_version     = d.firmware_version_int;
     di.firmware_version_str = d.firmware_version;   // "XX.XX.XX" from the device version file
     di.input_type       = transport;

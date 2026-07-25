@@ -31,6 +31,7 @@ add_library(ef
     src/device_recording.cpp
     src/device_ota.cpp
     src/device_system.cpp
+    src/update_check.cpp
     src/enums.cpp
     src/mat.cpp
     src/usb_connection.cpp
@@ -54,6 +55,17 @@ target_include_directories(ef
             ${EF_PROTO_DIR} ${EF_NANOPB_DIR}
 )
 target_link_libraries(ef PRIVATE PkgConfig::LIBUSB)
+
+# The update-check client POSTs to the update service (src/update_check.cpp), so
+# libcurl is required: apt install libcurl4-openssl-dev.
+find_package(CURL REQUIRED)
+target_link_libraries(ef PRIVATE CURL::libcurl)
+# Overridable at configure time for a self-hosted check service:
+#   cmake -DEF_UPDATE_CHECK_URL=https://my-host/ota/check
+if(EF_UPDATE_CHECK_URL)
+    target_compile_definitions(ef PRIVATE
+        EF_UPDATE_CHECK_URL_DEFAULT="${EF_UPDATE_CHECK_URL}")
+endif()
 target_compile_features(ef PUBLIC cxx_std_17)
 target_compile_options(ef PRIVATE -Wall -Wextra)
 # Static lib is linked into PIE executables; nanopb's message descriptors need

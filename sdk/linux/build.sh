@@ -48,7 +48,7 @@ for arg in "$@"; do
 done
 
 # --- dependencies -----------------------------------------------------------
-# Core (required): a C++17 compiler, cmake, pkg-config, libusb-1.0.
+# Core (required): a C++17 compiler, cmake, pkg-config, libusb-1.0, libcurl.
 # Optional (features degrade gracefully, the core build still succeeds):
 #   * OpenCV                                   -> efference-viewer + opencv tutorials
 #   * FFmpeg (libavcodec/libavutil/libswscale) -> H264/H265 decode in retrieve_image
@@ -58,6 +58,7 @@ command -v cmake      >/dev/null 2>&1      || missing_core=1
 command -v pkg-config >/dev/null 2>&1      || missing_core=1
 command -v c++        >/dev/null 2>&1      || missing_core=1
 pkg-config --exists libusb-1.0 2>/dev/null || missing_core=1
+pkg-config --exists libcurl 2>/dev/null    || missing_core=1
 
 opt_missing=""
 pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null \
@@ -74,17 +75,17 @@ if [ "$INSTALL_DEPS" = 1 ]; then
         echo ">> installing build dependencies (needs sudo)"
         sudo apt-get update
         sudo apt-get install -y build-essential cmake pkg-config \
-            libusb-1.0-0-dev libssl-dev libopencv-dev \
+            libusb-1.0-0-dev libcurl4-openssl-dev libssl-dev libopencv-dev \
             libavcodec-dev libavutil-dev libswscale-dev libglib2.0-dev
     else
         echo "!! --deps needs apt-get, which is not on this system." >&2
-        echo "!! install dev headers for: a C++17 compiler, cmake, pkg-config, libusb-1.0" >&2
-        echo "!!   (required) and OpenCV, FFmpeg, libglib2.0 + libssl (optional)." >&2
+        echo "!! install dev headers for: a C++17 compiler, cmake, pkg-config, libusb-1.0," >&2
+        echo "!!   libcurl (required) and OpenCV, FFmpeg, libglib2.0 + libssl (optional)." >&2
         exit 1
     fi
 elif [ "$missing_core" = 1 ]; then
     echo "!! missing core build dependencies (cmake, pkg-config, a C++17 compiler," >&2
-    echo "!!   libusb-1.0). Install them, or re-run with --deps on Debian/Ubuntu." >&2
+    echo "!!   libusb-1.0, libcurl). Install them, or re-run with --deps on Debian/Ubuntu." >&2
     exit 1
 fi
 # Skip the note after --deps: the install above just satisfied the optional ones.

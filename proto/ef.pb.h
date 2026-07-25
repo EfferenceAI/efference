@@ -388,7 +388,7 @@ typedef struct _ef_v1_GetOtaStatus {
 } ef_v1_GetOtaStatus;
 
 typedef struct _ef_v1_SetOtaConfig {
-    char base_url[512];
+    char base_url[512]; /* reserved: ignored, the URL is per-run */
     uint32_t max_retries;
     bool stage_mode;
 } ef_v1_SetOtaConfig;
@@ -396,8 +396,7 @@ typedef struct _ef_v1_SetOtaConfig {
 /* OTA push: relay a self-contained .eff to the device over the wire (no-WiFi update).
    USB (B1): OtaPushBegin -> raw .eff bytes on the bulk-OUT push endpoint -> OtaPushEnd.
    BLE (B2): OtaPushBegin -> OtaPushChunk{offset,data,eof} over the command channel (delta-sized).
- The device stores it locally, extracts manifest+sig, sets
- OTA_BASE_URL=file://, and consumes via the existing file:// path (no consumer change). */
+ The device stores it locally and consumes it via the existing file:// path. */
 typedef struct _ef_v1_OtaPushBegin {
     char name[64];
     uint64_t total_size;

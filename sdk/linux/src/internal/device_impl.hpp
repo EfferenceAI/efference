@@ -546,6 +546,7 @@ struct Device::Impl {
     DeviceInformation info;            // cached at open()
     HealthStatus      health;          // last completed sweep
     Caps              caps;            // internal validation menu
+    std::string       last_dev_msg;    // Response.message from the last failed call
 
     // USB isoc StreamReader, WiFi UdpStreamReader, or MCAP replay behind one
     // shared consumer API (grab/current_video/drain_imu). shared_ptr + reader_mtx
@@ -643,6 +644,7 @@ struct Device::Impl {
             return ERROR_CODE::UNKNOWN_FAILURE;
         std::string reply;
         uint8_t type = 0;
+        last_dev_msg.clear();   // else a transport failure reports the PREVIOUS reason
         if (connection->request_raw(std::string((const char*)buf, os.bytes_written),
                                     reply, &type) != Status::SUCCESS)
             return ERROR_CODE::COMMUNICATION_ERROR;
@@ -651,7 +653,9 @@ struct Device::Impl {
         if (!pb_decode(&is, ef_v1_Response_fields, &resp))
             return ERROR_CODE::COMMUNICATION_ERROR;
         if (resp.code != ef_v1_ErrorCode_SUCCESS) {
-            // The device's message carries the specific reason a code collapsed.
+            // The device's message carries the specific reason a code collapsed. Keep it
+            // for last_error_message(); an ERROR_CODE alone often is not actionable.
+            last_dev_msg = resp.message;
             if (init.verbose && resp.message[0])
                 std::fprintf(stderr, "[ef] device error %d: %s\n",
                              (int)resp.code, resp.message);

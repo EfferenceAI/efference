@@ -252,17 +252,17 @@ message ChunkUploadStatus    { string name = 1; repeated ChunkResult results = 2
 // ============================ OTA (thin front-end over the device OTA) ============================
 // Thin front-end over the device OTA. Commit and rollback happen automatically
 // after boot; the host observes OTA_SUCCESS / OTA_ROLLEDBACK via OtaStatus.
-message OtaCheck     {}                      // fetch manifest+sig, ECC-verify, version-gate; no download
-message OtaDownload  { string base_url = 1; }// empty => configured OTA_BASE_URL; stages to inactive slot
+message OtaCheck     {}                      // RETIRED: the host queries the update-check service
+message OtaDownload  { string base_url = 1; }// required, one-shot; stages to the inactive slot
 message OtaApply     {}                      // apply the staged (verified) download, then reboot
 message OtaAbort     {}                      // kill a running download (apply = point of no return)
 message GetOtaStatus {}
-message SetOtaConfig { string base_url = 1; uint32 max_retries = 2; bool stage_mode = 3; }
+message SetOtaConfig { string base_url = 1;   // reserved: ignored, the URL is per-run
+                       uint32 max_retries = 2; bool stage_mode = 3; }
 // OTA push: relay a self-contained .eff to the device over the wire (no-WiFi update).
 //   USB (B1): OtaPushBegin -> raw .eff bytes on the bulk-OUT push endpoint -> OtaPushEnd.
 //   BLE (B2): OtaPushBegin -> OtaPushChunk{offset,data,eof} over the command channel (delta-sized).
-// The device stores it locally, extracts manifest+sig, sets
-// OTA_BASE_URL=file://, and consumes via the existing file:// path (no consumer change).
+// The device stores it locally and consumes it via the existing file:// path.
 message OtaPushBegin { string name = 1; uint64 total_size = 2; }   // total_size => storage pre-check
 message OtaPushChunk { uint64 offset = 1; bytes data = 2; bool eof = 3; }  // BLE; data <= ~7 KB
 message OtaPushEnd   { bool ok = 1; }                              // USB: raw stream done (false => abort)

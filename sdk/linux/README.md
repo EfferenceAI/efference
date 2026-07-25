@@ -12,7 +12,7 @@ library API, the command-line tools, the transports, and the common workflows.
 
 ## Requirements
 
-Linux · C++17 · CMake ≥ 3.16 · pkg-config · `libusb-1.0`.
+Linux · C++17 · CMake ≥ 3.16 · pkg-config · `libusb-1.0` · `libcurl`.
 
 ## Build
 
@@ -115,8 +115,10 @@ commands
   download <name> [dest]         pull a recording over USB/BLE (default <name>.mcap)
   upload <name> <url>            device uploads a recording to a pre-signed URL (over WiFi)
   stop-upload <name>             cancel a running upload
-  check-update                   report whether newer firmware is available
-  update [url|file.eff]          download+apply firmware; a local .eff path sideloads over the wire
+  check-update                   ask the update service what this device should run
+  update                         update to whatever the service offers
+  update --url <url>             update from an explicit URL, skipping the service
+  update --file <update.eff>     update from a local bundle, pushed over USB
   abort-update                   cancel an update in progress
   wifi add <ssid> <psk> [country]  save + connect a WiFi network (country = ISO regdomain code)
   wifi select <ssid>               force a specific saved network (overrides the auto-best pick)

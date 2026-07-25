@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>  // stat: tell a local bundle from a URL before dispatching
 #include <unistd.h>   // isatty
 
 #include <ef/Device.hpp>
@@ -81,8 +82,10 @@ void usage() {
         "  download <name> [dest]            pull a recording over USB/BLE (default <name>.mcap)\n"
         "  upload <name> <url>               upload a recording to a pre-signed URL\n"
         "  stop-upload <name>                kill a running upload\n"
-        "  check-update                      is newer firmware available?\n"
-        "  update [url|file.eff]             download + apply firmware (local .eff sideloads)\n"
+        "  check-update                      ask the update service what to run\n"
+        "  update                            update to whatever the service offers\n"
+        "  update --url <url>                update from an explicit URL (no service call)\n"
+        "  update --file <update.eff>        update from a local bundle over USB\n"
         "  abort-update                      cancel an update in progress\n"
         "  wifi add <ssid> <psk> [country]   provision a WiFi network (\"US\" unlocks 5 GHz)\n"
         "  wifi remove <ssid> | select <ssid>\n"
@@ -98,8 +101,11 @@ void usage() {
         "  reboot                            reboot the device\n");
 }
 
-int fail(ERROR_CODE ec, const char* what) {
+// `detail` is whoever refused saying why (the device, or the update service): the
+// ERROR_CODE is a category, and the specific reason is usually the actionable part.
+int fail(ERROR_CODE ec, const char* what, const std::string& detail = "") {
     std::fprintf(stderr, "%s failed: %s\n", what, to_string(ec));
+    if (!detail.empty()) std::fprintf(stderr, "  reason: %s\n", detail.c_str());
     // A permissions failure means the device is on the bus but not openable, almost
     // always a missing udev rule. Point the user at the fix.
     if (ec == ERROR_CODE::INSUFFICIENT_PERMISSIONS)
@@ -755,24 +761,87 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "check-update") {
-        bool available = false;
-        ec = dev.check_update(available);
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "check-update");
-        std::puts(available ? "update available" : "up to date");
+        UpdateAvailability a;
+        ec = dev.check_update(a);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "check-update", a.service_error);
+        const DeviceInformation di = dev.get_device_information();
+        if (!a.available) {
+            std::printf("up to date (running v%s)\n", di.firmware_version_str.c_str());
+        } else {
+            std::printf("update available: v%s (running v%s)\n",
+                        a.target_version_str.empty() ? std::to_string(a.target_version).c_str()
+                                                     : a.target_version_str.c_str(),
+                        di.firmware_version_str.c_str());
+            std::printf("  from %s\n", a.url.c_str());
+        }
+        if (!a.notes.empty()) std::printf("  note: %s\n", a.notes.c_str());
+        // The service can answer "nothing for you" (404) for a misconfiguration, not just
+        // because the device is current. Say which, or a stalled fleet looks up to date.
+        if (!a.available && !a.service_error.empty())
+            std::printf("  service: %s\n", a.service_error.c_str());
         return 0;
     }
     if (cmd == "update") {
+        // Source is explicit: --url downloads that URL (no service call), --file
+        // sideloads a local bundle over the wire, neither asks the service. A bare
+        // positional is still accepted for compatibility, where a path that exists on
+        // disk means sideload and anything else is a URL.
+        std::string src = args.size() > 1 && args[1].rfind("--", 0) != 0 ? args[1] : "";
+        for (size_t i = 1; i < args.size(); i++) {
+            if (args[i] != "--url" && args[i] != "--file") continue;
+            // A flag with no value must not fall back to "ask the service": the user
+            // named a source, and quietly updating from a different one is worse than
+            // refusing. Same for naming two sources.
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "update: %s needs a value\n", args[i].c_str());
+                return 1;
+            }
+            if (!src.empty()) {
+                std::fprintf(stderr, "update: give only one of --url / --file / a path\n");
+                return 1;
+            }
+            const bool want_file = (args[i] == "--file");
+            src = args[++i];
+            // Downstream still infers sideload-vs-download by stat()ing the string, so a
+            // mistyped --file path would be fetched as a URL. Check the flag here instead.
+            struct stat sb{};
+            const bool is_file = ::stat(src.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
+            if (want_file && !is_file) {
+                std::fprintf(stderr, "update: --file '%s' is not a readable file\n", src.c_str());
+                return 1;
+            }
+            // Pushing ~400 MB in 7 KB chunks over BLE takes hours and cannot resume, so
+            // the SDK refuses it. Say so here rather than returning a bare error code.
+            if (want_file && init.input_type == INPUT_TYPE::STREAM) {
+                std::fprintf(stderr,
+                    "update: --file needs USB; a local bundle cannot be pushed over BLE\n"
+                    "  Connect over USB, or use --url so the device downloads it itself.\n");
+                return 1;
+            }
+            if (!want_file && src.rfind("http://", 0) != 0 && src.rfind("https://", 0) != 0) {
+                std::fprintf(stderr,
+                    "update: --url '%s' is not an http(s) URL%s\n", src.c_str(),
+                    is_file ? " (use --file for a local bundle)" : "");
+                return 1;
+            }
+        }
         UpdatePrinter pr;
-        ec = dev.update(args.size() > 1 ? args[1] : "",
-                        [&pr](const UpdateStatus& u) { pr.on(u); });
+        ec = dev.update(src, [&pr](const UpdateStatus& u) { pr.on(u); });
         if (ec == ERROR_CODE::DEVICE_UP_TO_DATE) {
             pr.done();   // close the open line before the summary
             std::puts("already up to date");
             return 0;
         }
+        if (ec == ERROR_CODE::WIFI_NOT_CONNECTED) {
+            std::fprintf(stderr,
+                "update failed: the device is not on WiFi, so it cannot fetch the update\n"
+                "  Put it on a network:  ef-cli wifi add <ssid> <psk>\n"
+                "  Or update over USB:   ef-cli update --file ./update.eff\n");
+            return 1;
+        }
         if (ec != ERROR_CODE::SUCCESS) {
             if (pr.have) pr.commit("FAIL", pr.last_msg);
-            const std::string url = args.size() > 1 ? args[1] : "";
+            const std::string& url = src;
             switch (classify_update_failure(ec, pr.last_msg)) {
                 case UpdateFailure::BUSY:
                     std::fprintf(stderr,
@@ -794,7 +863,7 @@ int main(int argc, char** argv) {
                     // crashed / rolled back / never came back: lead with the reason.
                     if (!pr.last_msg.empty())
                         std::fprintf(stderr, "error: %s\n", pr.last_msg.c_str());
-                    return fail(ec, "update");
+                    return fail(ec, "update", dev.last_error_message());
             }
         }
         pr.done();

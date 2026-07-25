@@ -114,13 +114,22 @@ public:
     ERROR_CODE upload_recording(const std::string& name, const std::string& url);
     ERROR_CODE stop_upload(const std::string& name);
 
+    // Ask the update-check service what this device should be running. A host-side
+    // network call (see check_for_update below); the device is only read, never asked.
     ERROR_CODE check_update(bool& available);
-    // url: "" = the device's configured update server, an http(s) URL, or a
-    // local .eff file path; a local file is sideloaded over the control link.
+    ERROR_CODE check_update(UpdateAvailability& out);
+    // url: "" = ask the update-check service and use what it returns; an http(s) URL
+    // = download exactly that, no service call; a local .eff path = push it over the
+    // wire, which requires USB. A bundle that is not strictly newer than the running
+    // version is rejected on-device by the signed-manifest anti-rollback gate,
+    // whichever route it arrived by.
     ERROR_CODE update(const std::string& url = "",
                       const std::function<void(const UpdateStatus&)>& on_progress = {});
     ERROR_CODE abort_update();
     ERROR_CODE get_update_status(UpdateStatus& out);
+    // Device's own words for the last failure, when it sent any. The ERROR_CODE is a
+    // category; this is the specific reason and is often the only actionable part.
+    const std::string& last_error_message() const;
 
     ERROR_CODE wifi_add(const std::string& ssid, const std::string& psk,
                         const std::string& country = "");  // e.g. "US" unlocks 5 GHz
@@ -184,6 +193,21 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// ---- update-check service ------------------------------------------------------------
+// Maps {model, running version, board, unit} to the bundle a device should install next.
+// The answer is not trusted: the device still ECDSA-verifies the bundle and refuses
+// anything not strictly newer, so a wrong answer wastes a download, nothing more.
+
+// $EF_UPDATE_CHECK_URL if set, else the compiled-in default.
+std::string update_check_url();
+
+// One POST, no retries. Empty `service_url` means update_check_url(). SUCCESS with
+// available == false covers both "current" and "nothing published for this model";
+// COMMUNICATION_ERROR means unreachable or unparsable.
+ERROR_CODE check_for_update(const DeviceInformation& info, UpdateAvailability& out,
+                            const std::string& channel = "stable",
+                            const std::string& service_url = "");
 
 }  // namespace ef
 

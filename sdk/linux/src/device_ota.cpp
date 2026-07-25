@@ -73,47 +73,22 @@ ERROR_CODE Device::get_update_status(UpdateStatus& out) {
     return ERROR_CODE::SUCCESS;
 }
 
-ERROR_CODE Device::check_update(bool& available) {
-    available = false;
+// One POST, using the info cached at open(); the device is not consulted.
+ERROR_CODE Device::check_update(UpdateAvailability& out) {
+    out = UpdateAvailability{};
     if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
-    {
-        WireRequest req = ef_v1_Request_init_zero;
-        req.which_body = ef_v1_Request_ota_check_tag;
-        WireResponse resp;
-        ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::UPDATE);
-        if (ec != ERROR_CODE::SUCCESS) return ec;
-    }
-    // Poll the check (manifest fetch + signature verify) to completion. It runs
-    // DETACHED and acks before the status file is rewritten, so early polls can read
-    // a PRE-check phase (OTA_UNKNOWN, or a stale terminal phase from a prior attempt).
-    // Trust nothing until CHECKING is seen, or a start grace elapses without it (a
-    // fast check can finish between two polls).
-    auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    auto start_grace = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    bool seen_checking = false;
-    for (;;) {
-        WireRequest req = ef_v1_Request_init_zero;
-        req.which_body = ef_v1_Request_get_ota_status_tag;
-        WireResponse resp;
-        ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_ota_status_tag);
-        if (ec != ERROR_CODE::SUCCESS) return ec;
-        const WireOta& s = resp.body.ota_status;
-        if (s.phase == ef_v1_OtaPhase_OTA_CHECKING) {
-            seen_checking = true;
-        } else if (seen_checking ||
-                   std::chrono::steady_clock::now() >= start_grace) {
-            if (s.phase == ef_v1_OtaPhase_OTA_AVAILABLE) { available = true;  break; }
-            if (s.phase == ef_v1_OtaPhase_OTA_UPTODATE)  { available = false; break; }
-            if (s.phase == ef_v1_OtaPhase_OTA_ERROR)     return ERROR_CODE::FAILED_TO_UPDATE;
-            if (s.staged)                                { available = true;  break; }
-            break;   // some other settled phase: nothing further in flight
-        }
-        if (std::chrono::steady_clock::now() >= deadline)
-            return ERROR_CODE::UNKNOWN_FAILURE;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    impl_->refresh_device_state();
-    return ERROR_CODE::SUCCESS;
+    // An MCAP replay has no device behind it, so info is default-constructed and there
+    // is nothing to ask the service about. Same guard update() applies.
+    if (impl_->init.input_type == INPUT_TYPE::MCAP)
+        return ERROR_CODE::INVALID_FUNCTION_CALL;
+    return check_for_update(impl_->info, out);
+}
+
+ERROR_CODE Device::check_update(bool& available) {
+    UpdateAvailability a;
+    ERROR_CODE ec = check_update(a);
+    available = a.available;
+    return ec;
 }
 
 // Drive the whole A/B update: acquire (URL download or local-file sideload) ->
@@ -139,6 +114,24 @@ ERROR_CODE Device::update(const std::string& url,
     struct stat st{};
     const bool sideload = !url.empty() && ::stat(url.c_str(), &st) == 0 &&
                           S_ISREG(st.st_mode);
+
+    // Sideload is USB-only: ~7 KB chunks means ~56k round trips for a 400 MB bundle, with
+    // no resume, so over a BLE control link it takes hours and restarts from zero.
+    if (sideload && impl_->connection && !impl_->connection->has_stream())
+        return ERROR_CODE::INVALID_FUNCTION_CALL;
+
+    // Resolve first, so an up-to-date device never has its stream paused for nothing.
+    std::string fetch_url = url;
+    if (!sideload && url.empty()) {
+        UpdateAvailability avail;
+        ERROR_CODE ec = check_for_update(impl_->info, avail);
+        // Carry the service's reason across, or the caller sees a bare
+        // COMMUNICATION_ERROR here while check_update() explains itself.
+        impl_->last_dev_msg = avail.service_error;
+        if (ec != ERROR_CODE::SUCCESS) return ec;
+        if (!avail.available)          return ERROR_CODE::DEVICE_UP_TO_DATE;
+        fetch_url = avail.url;
+    }
 
     // A host-file recording can't span the update (transport close + reboot):
     // finish the .mcap now instead of concatenating two firmware sessions or
@@ -191,20 +184,19 @@ ERROR_CODE Device::update(const std::string& url,
              cur.state == UPDATE_STATE::VERIFYING ||
              cur.state == UPDATE_STATE::READY_TO_APPLY);
         if (!in_flight) {
-            // Only the "" = configured-server path is gated by check_update(): OtaCheck
-            // consults the device's CONFIGURED server (proto carries no URL), so gating an
-            // explicit caller URL on it could skip a reachable LAN mirror. Explicit URL
-            // goes straight to ota_download.
-            if (url.empty()) {
-                bool available = false;
-                ERROR_CODE ec = check_update(available);
-                if (ec != ERROR_CODE::SUCCESS) return bail(ec);
-                if (!available)                return bail(ERROR_CODE::DEVICE_UP_TO_DATE);
-            }
+            // Only gate on WiFi when actually starting a download. An in-flight one is
+            // already past this, and its own retry loop waits out a blip, so checking
+            // earlier would refuse the re-run that attaches to it.
+            impl_->refresh_wireless();
+            if (!impl_->info.wireless.wifi_connected) return bail(ERROR_CODE::WIFI_NOT_CONNECTED);
+            // The wire field is a fixed array and snprintf truncates silently, so refuse
+            // a URL that would not survive rather than sending a mangled one.
             WireRequest req = ef_v1_Request_init_zero;
             req.which_body = ef_v1_Request_ota_download_tag;
+            if (fetch_url.size() >= sizeof req.body.ota_download.base_url)
+                return bail(ERROR_CODE::INVALID_FUNCTION_CALL);
             std::snprintf(req.body.ota_download.base_url,
-                          sizeof req.body.ota_download.base_url, "%s", url.c_str());
+                          sizeof req.body.ota_download.base_url, "%s", fetch_url.c_str());
             WireResponse resp;
             ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::UPDATE);
             if (ec != ERROR_CODE::SUCCESS) return bail(ec);
@@ -297,6 +289,8 @@ ERROR_CODE Device::update(const std::string& url,
     }
     return ERROR_CODE::SUCCESS;
 }
+
+const std::string& Device::last_error_message() const { return impl_->last_dev_msg; }
 
 ERROR_CODE Device::abort_update() {
     if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
