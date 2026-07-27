@@ -115,6 +115,29 @@ endif()
 add_executable(ef-cli tools/ef.cpp)
 target_link_libraries(ef-cli PRIVATE ef::ef)
 
+# ef-decrypt: turn an encrypted recording back into the plain container. Built
+# from the vendored device sources under tools/vendor/ (see its README), so the
+# host reads exactly the format the device writes. OPTIONAL: needs libcrypto,
+# which BLE also uses. Install: apt install libssl-dev.
+find_package(OpenSSL QUIET)   # also probed under EF_ENABLE_BLE below
+if(OPENSSL_FOUND)
+    add_executable(ef-decrypt
+        tools/ef_decrypt.c
+        tools/vendor/enc_sink.c
+        tools/vendor/efr_keyid.c)
+    target_include_directories(ef-decrypt PRIVATE tools/vendor)
+    target_link_libraries(ef-decrypt PRIVATE OpenSSL::Crypto)
+    # O_CLOEXEC: upstream builds these with _GNU_SOURCE, so ask for it rather
+    # than inheriting it from whatever C dialect happens to be the default.
+    target_compile_definitions(ef-decrypt PRIVATE _GNU_SOURCE)
+    set_target_properties(ef-decrypt PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    # Vendored as-is; -Werror here would make an upstream refresh a build break.
+    target_compile_options(ef-decrypt PRIVATE -Wall -Wextra)
+    message(STATUS "ef-decrypt: enabled (OpenSSL found)")
+else()
+    message(STATUS "ef-decrypt: skipped (need libssl-dev)")
+endif()
+
 # OpenCV: used by the live viewer and the OpenCV example. OPTIONAL, the core
 # SDK (ef) never links it; only display/interop tooling does. The ef::toCvMat
 # bridge (include/ef/OpenCV.hpp) is header-only. Install: apt install libopencv-dev.
@@ -179,6 +202,9 @@ configure_file(cmake/efConfig.cmake.in "${CMAKE_BINARY_DIR}/efConfig.cmake" @ONL
 # headers, and calibration .so ship too so find_package(ef) works off-tree.
 include(GNUInstallDirs)
 install(TARGETS ef-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET ef-decrypt)
+    install(TARGETS ef-decrypt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(TARGETS ef
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

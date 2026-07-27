@@ -34,14 +34,20 @@
 #                    needing --password). factory-reset is never run here: it
 #                    clears wifi credentials and recordings the harness cannot
 #                    restore.
-#   TEST_ENCRYPTION  set to 1 to exercise at-rest encryption on/off and the
-#                    encrypted/unencrypted marker (off by default; it records,
-#                    then deletes what it recorded, and leaves encryption OFF).
+#   TEST_ENCRYPTION  set to 1 to exercise at-rest encryption: the on/off toggle,
+#                    the encrypted/unencrypted marker, and a full decrypt round
+#                    trip through ef-decrypt back to a parseable MCAP (off by
+#                    default; it records, then deletes what it recorded, and
+#                    leaves encryption OFF). The round trip is skipped when
+#                    ef-decrypt was not built, which needs libssl-dev.
 
 set -u
 export LC_ALL=C   # stable %.2f / strtod formatting so the float greps below don't drift
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EF="${EF:-$HERE/../build/ef-cli}"
+# Built next to ef-cli, but only when libcrypto was found, so the encryption
+# section checks for it rather than assuming it.
+EFDEC="${EFDEC:-$HERE/../build/ef-decrypt}"
 EFARGS="${EFARGS:-}"
 GARGS="$EFARGS"                          # global flags the helpers use (USB by default; BLE section swaps this)
 TIMEOUT="${TIMEOUT:-330}"                # per-command cap (s): covers deep health ~3min; a hung verb is killed so we move on
@@ -904,6 +910,112 @@ if [ "${TEST_ENCRYPTION:-0}" = 1 ]; then
             printf '%s[encryption enabled but the recording is not marked encrypted]%s\n' \
                 "$c_err" "$c_off"; fail=$((fail+1))
         fi
+        # The round trip is the point of the feature: a recording nobody can read
+        # back is indistinguishable from a lost one, so prove the ciphertext
+        # actually decrypts to a parseable MCAP before deleting it.
+        ENC_DL="$DLDIR/ef-smoke-enc.enc"
+        ENC_KEY="$DLDIR/ef-smoke-enc.key"
+        ENC_OUT="$DLDIR/ef-smoke-enc.mcap"
+        run "download the encrypted recording" download ef-smoke-enc "$ENC_DL"
+        # --out writes 0600 and never echoes the key, which is the form an
+        # operator is told to use; it also covers the refuse-to-overwrite guard.
+        run "write the key to a file"      key show --out "$ENC_KEY"
+        if [ -f "$ENC_KEY" ]; then
+            KEYMODE=$(stat -c%a "$ENC_KEY" 2>/dev/null)
+            if [ "$KEYMODE" = 600 ]; then
+                printf '%s[key file is 0600]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+            else
+                printf '%s[key file mode %s, expected 600]%s\n' "$c_err" "$KEYMODE" "$c_off"
+                fail=$((fail+1))
+            fi
+        fi
+        # Overwriting would silently destroy what may be another device's only key.
+        xfail_rc "key show --out refuses to overwrite" key show --out "$ENC_KEY"
+
+        if [ ! -x "$EFDEC" ]; then
+            echo "${c_dim}(skip decrypt round trip: no ef-decrypt at $EFDEC; needs libssl-dev)${c_off}"
+        elif [ ! -s "$ENC_DL" ]; then
+            echo "${c_dim}(skip decrypt round trip: the download produced nothing)${c_off}"
+        else
+            # Downloaded bytes are the stored bytes, so an encrypted recording must
+            # NOT already be a plain MCAP. If it is, encryption did not happen.
+            if head -c 5 "$ENC_DL" | grep -q 'MCAP'; then
+                printf '%s[downloaded "encrypted" recording is plaintext MCAP]%s\n' \
+                    "$c_err" "$c_off"; fail=$((fail+1))
+            else
+                printf '%s[stored recording is ciphertext, not MCAP]%s\n' "$c_ok" "$c_off"
+                pass=$((pass+1))
+            fi
+
+            printf '\n%s# decrypt it with the saved key%s\n%s$ ef-decrypt %s %s %s%s\n' \
+                "$c_dim" "$c_off" "$c_cmd" "$ENC_DL" "$ENC_KEY" "$ENC_OUT" "$c_off"
+            DEC_OUT="$("$EFDEC" "$ENC_DL" "$ENC_KEY" "$ENC_OUT" 2>&1)"; DEC_RC=$?
+            printf '%s\n' "$DEC_OUT"
+            # 0 is a clean file; 1 means truncated, which a cleanly stopped
+            # recording must never be, so only 0 passes here.
+            if [ $DEC_RC -eq 0 ]; then
+                printf '%s[exit 0, clean end marker]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+            else
+                printf '%s[ef-decrypt exit %d, expected 0]%s\n' "$c_err" "$DEC_RC" "$c_off"
+                fail=$((fail+1))
+            fi
+            # The header names the key, so a mismatch here means the device stamped
+            # an id that does not match the key it handed out.
+            DEC_KEYID=$(printf '%s' "$DEC_OUT" | sed -n 's/^key_id *: *\([0-9a-f]*\).*/\1/p')
+            INFO_KEYID=$(EFX $GARGS info 2>&1 | sed -n 's/^encryption key *: \([0-9a-f]*\).*/\1/p')
+            if [ -n "$DEC_KEYID" ] && [ "$DEC_KEYID" = "$INFO_KEYID" ]; then
+                printf '%s[file key_id %s matches the device]%s\n' "$c_ok" "$DEC_KEYID" "$c_off"
+                pass=$((pass+1))
+            else
+                printf '%s[file key_id "%s" != device "%s"]%s\n' \
+                    "$c_err" "$DEC_KEYID" "$INFO_KEYID" "$c_off"; fail=$((fail+1))
+            fi
+            if head -c 5 "$ENC_OUT" 2>/dev/null | grep -q 'MCAP'; then
+                printf '%s[decrypted output is a plain MCAP]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+            else
+                printf '%s[decrypted output is not an MCAP]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+            fi
+            # Strongest available check: the decrypted bytes parse as a real
+            # recording, not merely a file that starts with the right magic.
+            if have python3 && python3 -c "import mcap" >/dev/null 2>&1; then
+                if python3 -c "
+import sys
+from mcap.reader import make_reader
+with open(sys.argv[1],'rb') as f:
+    n = sum(1 for _ in make_reader(f).iter_messages())
+print('messages:', n)
+sys.exit(0 if n > 0 else 1)
+" "$ENC_OUT"; then
+                    printf '%s[decrypted MCAP parses and carries messages]%s\n' "$c_ok" "$c_off"
+                    pass=$((pass+1))
+                else
+                    printf '%s[decrypted MCAP did not parse]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+                fi
+            else
+                echo "${c_dim}(skip MCAP parse: need python3 + the mcap lib)${c_off}"
+            fi
+
+            # A wrong key must be refused at the header (exit 2), not produce
+            # garbage, and must leave no partial output behind to be mistaken for
+            # a decrypt.
+            printf '\n%s# EXPECT-FAIL: decrypt with the wrong key%s\n' "$c_dim" "$c_off"
+            # A fixed 64-hex-char key: the device generates random ones, so this
+            # is never the installed key, and it keeps the run reproducible.
+            printf '%s' \
+              'baddecafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecaf' \
+              > "$DLDIR/wrong.key"
+            BAD_OUT="$("$EFDEC" "$ENC_DL" "$DLDIR/wrong.key" "$DLDIR/wrong.mcap" 2>&1)"; BAD_RC=$?
+            printf '%s\n' "$BAD_OUT"
+            if [ $BAD_RC -eq 2 ] && [ ! -e "$DLDIR/wrong.mcap" ]; then
+                printf '%s[correctly refused, exit 2, no output left behind]%s\n' "$c_ok" "$c_off"
+                xfail_ok=$((xfail_ok+1))
+            else
+                printf '%s[wrong key: exit %d, output present=%s; want exit 2 and no file]%s\n' \
+                    "$c_err" "$BAD_RC" "$([ -e "$DLDIR/wrong.mcap" ] && echo yes || echo no)" "$c_off"
+                xfail_bad=$((xfail_bad+1))
+            fi
+        fi
+
         run "delete"                       record delete ef-smoke-enc
         # A toggle must apply to the NEXT recording with no Configure in between;
         # resolving it only at Configure once made "encryption on" silently record
@@ -920,6 +1032,17 @@ if [ "${TEST_ENCRYPTION:-0}" = 1 ]; then
         else
             printf '%s[encryption off did not take effect on the next recording]%s\n' \
                 "$c_err" "$c_off"; fail=$((fail+1))
+        fi
+        # The mirror of the ciphertext check above: with encryption off the
+        # download must already be a plain MCAP, needing no key at all.
+        run "download the unencrypted recording" \
+            download ef-smoke-plain "$DLDIR/ef-smoke-plain.mcap"
+        if head -c 5 "$DLDIR/ef-smoke-plain.mcap" 2>/dev/null | grep -q 'MCAP'; then
+            printf '%s[unencrypted recording downloads as plain MCAP]%s\n' "$c_ok" "$c_off"
+            pass=$((pass+1))
+        else
+            printf '%s[unencrypted recording is not a plain MCAP]%s\n' "$c_err" "$c_off"
+            fail=$((fail+1))
         fi
         run "delete"                       record delete ef-smoke-plain
 

@@ -23,7 +23,9 @@ Linux · C++17 · CMake ≥ 3.16 · pkg-config · `libusb-1.0` · `libcurl`.
 ```
 
 Or plain CMake: `cmake -S . -B build && cmake --build build`. Binaries land in
-`build/`: `ef-cli` and `efference-viewer`. Tutorials build separately; see
+`build/`: `ef-cli`, `efference-viewer` and `ef-decrypt`. The last two are built
+only when their optional dependencies are present, and the configure output says
+which were found. Tutorials build separately; see
 [`tutorials/README.md`](../../tutorials/README.md).
 
 ## USB device permissions (required)
@@ -73,6 +75,7 @@ line to your `~/.bashrc`.
 |---|---|
 | `ef-cli` | Control CLI, one subcommand per SDK verb (info, health, record, wifi, update, …). |
 | `efference-viewer` | Live decoded video window + live IMU values (accel/gyro). |
+| `ef-decrypt` | Turn an encrypted recording back into the plain container. Needs libssl-dev. |
 
 > **Tool naming:** the health check is `ef-cli health`; the viewer is `efference-viewer`.
 
@@ -84,7 +87,8 @@ ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--udp <host[:port]>] [--
 global flags
   --ble <MAC>            connect over Bluetooth LE instead of USB
   --device <id>          pick one of several USB devices
-  --password <pw>        BLE control password (factory default 123456)
+  --password <pw>        control password (factory default 123456); always needed on BLE,
+                         and on USB once locked
   --udp <host[:port]>    with --ble: device streams video+IMU to this host over WiFi/UDP (default port 5005)
   --verbose              print the control-plane traffic
 
@@ -134,14 +138,16 @@ commands
   wifi status                      current association (connecting / connected / not connected)
   set-password <new>             rekey the control password (over UNLOCKED USB, no old password)
   set-password <old> <new>       rekey the control password (over BLE, or locked USB)
-  lock on|off                    lock/unlock the USB control plane (needs the current password)
+  lock on|off [--session]        lock/unlock the USB control plane (needs the current password;
+                                 --session applies to this power session only, and re-locks
+                                 when power is lost)
   encryption on|off              AES-256 encrypt new recordings (refused with no key)
   encryption create              generate the device's key; SHOWN ONCE, save it
   encryption delete              show the key and how to destroy it (destroys nothing)
-  encryption delete --confirm <key_id>
+  encryption delete --confirm <key_id> [--yes]
                                  destroy the key; recordings under it become unreadable
   key show [--out <file>]        print the key, or write it to a new 0600 file
-  factory-reset                  restore defaults; DESTROYS the encryption key. USB-only escape
+  factory-reset [--yes]          restore defaults; DESTROYS the encryption key. USB-only escape
   sync-time                      set the device clock from the host
   time                           read the device wall clock
   location                       read the device's current location (session_meta.json, else default)
@@ -261,8 +267,45 @@ readable.
 
 `record list` marks each recording `[encrypted]` or `[unencrypted]` by reading
 the container magic off the file, so it reports what is on disk rather than the
-current setting. A recording truncated by power loss still decrypts up to its
-last complete chunk.
+current setting.
+
+### Reading an encrypted recording
+
+Download it as usual, then decrypt on the host:
+
+```sh
+ef-cli download clip1 clip1.enc      # download writes bytes as-is; name it yourself
+ef-decrypt clip1.enc device1.key clip1.mcap
+```
+
+`download` does not decrypt and does not rename: with no destination it writes
+`<name>.mcap` whatever the contents are, so an encrypted recording lands in a
+file called `.mcap` that no MCAP reader will open. Give it a destination, as
+above, when the recording is encrypted.
+
+The key file is what `key show --out` wrote: 32 raw bytes, or 64 hex characters
+with an optional trailing newline. `ef-decrypt` prints the file's `device_id`,
+`key_id`, algorithm and chunk count to stderr and the plaintext to the named
+output, so it can be read in a pipeline without the summary contaminating it.
+
+Its exit status distinguishes the two failures worth acting on, because a
+recording cut short by power loss is a normal outcome and must not look like
+corruption:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Clean: the end marker was present and every chunk verified. |
+| 1 | Truncated, or a chunk failed its tag. Everything written before that point is valid and is kept. |
+| 2 | Unusable input: bad header, wrong key, an algorithm this build does not implement, or I/O failure. No output file is left behind. |
+
+A wrong key is caught at the header rather than as a wall of failing chunks, and
+the error names the `key_id` the file actually wants, so you can tell which of
+your saved keys it needs.
+
+`ef-decrypt` is built from the device's own format sources, vendored under
+`tools/vendor/` so the host reads exactly what the device writes; see the README
+there before changing them. It needs libcrypto (`apt install libssl-dev`), which
+BLE also uses, and is skipped by the build when that is missing.
 
 ### Destroying the key
 

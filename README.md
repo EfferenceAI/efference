@@ -52,6 +52,16 @@ With an Efference device connected over USB:
 ./sdk/linux/build/ef-cli info
 ```
 
+Recordings can be AES-256-GCM encrypted at rest under a key the device generates
+and hands over exactly once, and the USB control plane can be locked behind the
+same password that already gates Bluetooth LE. Both are off on a factory device:
+
+```sh
+./sdk/linux/build/ef-cli encryption create   # generates the key and PRINTS IT, once
+./sdk/linux/build/ef-cli encryption on
+./sdk/linux/build/ef-cli lock on             # USB now needs --password too
+```
+
 For installation, device setup, transports, examples, and the complete CLI
 reference, visit **[docs.efference.ai](https://docs.efference.ai)**.
 

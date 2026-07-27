@@ -5,8 +5,10 @@
 | `ef-smoke-test.sh` | exercise the whole control-plane CLI against a live device |
 | `mcap_to_video.py` | pull the video out of a recorded `.mcap` |
 
-`ef-cli` and `efference-viewer` are built from `ef.cpp` and `efference_viewer.cpp`
-here; both are documented in the [SDK README](../README.md).
+`ef-cli`, `efference-viewer` and `ef-decrypt` are built from `ef.cpp`,
+`efference_viewer.cpp` and `ef_decrypt.c` here; all three are documented in the
+[SDK README](../README.md). `ef-decrypt` compiles against the device's own format
+sources under [`vendor/`](vendor/README.md); read that before touching them.
 
 ---
 
@@ -42,9 +44,20 @@ Opt-in sections, off by default because they change device state:
 
 ```sh
 TEST_LOCK=1 ./tools/ef-smoke-test.sh        # USB lock + key read (self-restoring)
-TEST_ENCRYPTION=1 ./tools/ef-smoke-test.sh  # at-rest encryption on/off
+TEST_ENCRYPTION=1 ./tools/ef-smoke-test.sh  # at-rest encryption + decrypt round trip
 TEST_REBOOT=1 ./tools/ef-smoke-test.sh      # reboot the device as the last step
 ```
+
+`TEST_ENCRYPTION` records encrypted, downloads it, saves the key with
+`key show --out`, and decrypts through `ef-decrypt` back to an MCAP it then
+parses, which is the check that matters: a recording nobody can read back is
+indistinguishable from a lost one. It also asserts the stored bytes are *not*
+plaintext, that the file's `key_id` matches the device's, and that a wrong key is
+refused with exit 2 leaving no output behind. The round trip is skipped when
+`ef-decrypt` was not built (it needs libssl-dev); the MCAP parse is skipped
+without python3 and the `mcap` package. If the device has no key the test creates
+one and destroys that one at the end, and it never deletes a key that was already
+there, since doing so would make every recording on the device unreadable.
 
 What it deliberately does **not** do: apply a firmware update, or run
 `factory-reset`. The reset clears wifi credentials, recordings and the encryption
@@ -57,8 +70,10 @@ password. Clear it with `ef-cli --password <pw> lock off`.
 
 ## mcap_to_video.py
 
-Extract the raw video elementary stream from a recording. The output is the coded
-bitstream, not a container, so name it to match how the recording was made:
+Extract the raw video elementary stream from a recording. It reads a plain
+container, so run an encrypted recording through `ef-decrypt` first. The output is
+the coded bitstream, not a container, so name it to match how the recording was
+made:
 
 ```sh
 python3 tools/mcap_to_video.py recording.mcap out.h265
