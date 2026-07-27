@@ -20,7 +20,9 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>     // O_EXCL: never overwrite an existing key file
 #include <sys/stat.h>  // stat: tell a local bundle from a URL before dispatching
 #include <unistd.h>   // isatty
 
@@ -37,6 +40,67 @@
 using namespace ef;
 
 namespace {
+
+// A key must not survive in this process longer than it is needed. Not a security
+// guarantee (the bytes were already on a socket and possibly a terminal), but it
+// keeps them out of a core dump or a later allocation of the same page.
+void wipe(std::vector<uint8_t>& k) {
+    volatile uint8_t* p = k.data();
+    for (size_t i = 0; i < k.size(); i++) p[i] = 0;
+    k.clear();
+}
+
+// "<hex>\n", the one representation of a key, shared by the terminal and the
+// file path so they can never drift.
+std::string key_hex_line(const std::vector<uint8_t>& k) {
+    std::string s;
+    s.reserve(k.size() * 2 + 1);
+    char b[3];
+    for (uint8_t byte : k) { std::snprintf(b, sizeof b, "%02x", byte); s += b; }
+    s += '\n';
+    return s;
+}
+
+// Key to stdout, everything else to stderr, so `ef-cli key show > k` yields a file
+// holding the key and nothing else.
+void print_key_hex(const std::vector<uint8_t>& k) {
+    std::string line = key_hex_line(k);
+    std::fwrite(line.data(), 1, line.size(), stdout);
+    // Flush before the caller writes more to stderr. Piped, stdout is block
+    // buffered and the key would otherwise surface AFTER the instructions that
+    // are meant to follow it.
+    std::fflush(stdout);
+    std::memset(&line[0], 0, line.size());
+}
+
+// Write "<hex>\n" to `path`, 0600 at creation so it is never briefly world
+// readable, and never echo the key itself.
+//
+// O_EXCL rather than truncate: overwriting an existing key file is far more likely
+// a wrong path or the wrong device than an intended re-export, and the file it
+// would destroy may be the only copy of another device's key.
+int write_key_file(const std::string& path, const std::vector<uint8_t>& k) {
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (errno == EEXIST)
+            std::fprintf(stderr, "key show: %s already exists; "
+                                 "remove it first if you mean to replace it\n", path.c_str());
+        else
+            std::fprintf(stderr, "key show: %s: %s\n", path.c_str(), std::strerror(errno));
+        return 1;
+    }
+    std::string line = key_hex_line(k);
+    bool ok = write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size());
+    close(fd);
+    std::memset(&line[0], 0, line.size());
+    if (!ok) {
+        std::fprintf(stderr, "key show: writing %s failed\n", path.c_str());
+        unlink(path.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "key written to %s (mode 0600)\n", path.c_str());
+    return 0;
+}
 
 void usage() {
     std::puts(
@@ -48,7 +112,8 @@ void usage() {
         "flags:\n"
         "  --ble <MAC>                       connect over Bluetooth instead of USB\n"
         "  --device <id>                     pick one of several USB devices\n"
-        "  --password <pw>                   BLE control password (default 123456)\n"
+        "  --password <pw>                   control password, default 123456; needed on\n"
+        "                                    BLE always and on USB once locked\n"
         "  --udp <host[:port]>               with --ble: device streams video+IMU to\n"
         "                                    this host over WiFi/UDP (default port 5005)\n"
         "\n"
@@ -92,13 +157,30 @@ void usage() {
         "  wifi list                         saved networks (marks the connected one)\n"
         "  wifi scan                         access points in range (not while recording)\n"
         "  wifi status                       current association\n"
-        "  set-password <new>                rekey the BLE password (over USB)\n"
-        "  set-password <old> <new>          rekey the BLE password (over BLE)\n"
+        "  set-password <new>                rekey the control password (unlocked USB)\n"
+        "  set-password <old> <new>          rekey the control password (BLE or locked USB)\n"
+        "  lock on|off [--session]           lock/unlock the USB control plane\n"
+        "                                    (--session: this power session only,\n"
+        "                                     re-locks when power is lost)\n"
+        "  encryption on|off                 AES-256 encrypt new recordings\n"
+        "  encryption create                 generate the key; SHOWN ONCE, keep it\n"
+        "  encryption delete                 show the key and how to destroy it\n"
+        "  encryption delete --confirm <id>  destroy it (recordings become unreadable)\n"
+        "  key show [--out <file>]           print the key, or write it to a 0600 file\n"
+        "  factory-reset [--yes]             defaults + unlock; DESTROYS the encryption key\n"
         "  sync-time                         set the device clock from the host\n"
         "  time                              read the device wall clock\n"
         "  location                          read the device's current location\n"
         "  location set <lat> <lon> [alt]    persist the device location (all recordings)\n"
         "  reboot                            reboot the device\n");
+}
+
+// True when the device gates this link and we failed to authenticate: the point
+// where a human should be told, since the library stays silent by design.
+bool di_locked_unauth(const Device& dev) {
+    if (dev.is_authenticated()) return false;
+    const DeviceInformation& i = dev.get_device_information();
+    return i.usb_locked || i.input_type == INPUT_TYPE::STREAM;
 }
 
 // `detail` is whoever refused saying why (the device, or the update service): the
@@ -305,6 +387,24 @@ void print_info(const DeviceInformation& i) {
         std::printf("wifi             : not connected\n");
     for (const auto& n : w.saved_networks)
         std::printf("saved network    : %s\n", n.c_str());
+    // Access + at-rest state. Both come from the ungated GetDeviceInformation, so
+    // `info` answers even on a locked device you cannot otherwise talk to; that is
+    // how an operator discovers WHY everything else is refusing them.
+    // Three states, not two: reporting a session-unlocked device as "LOCKED" would
+    // send an operator hunting for a password it is not currently asking for.
+    std::printf("usb access       : %s\n",
+                !i.usb_locked      ? "unlocked"
+                : i.session_unlocked ? "LOCKED, open for this session "
+                                       "(re-locks when power is lost)"
+                                     : "LOCKED (password required)");
+    std::printf("encryption       : %s\n",
+                i.encryption_enabled ? "ON (new recordings encrypted)" : "off");
+    // The key_id, never the key: it is how an operator matches a device against
+    // the copy they saved, and how they tell which key opens a given recording.
+    if (i.encryption_key_present)
+        std::printf("encryption key   : %s (AES-256-GCM)\n", i.encryption_key_id.c_str());
+    else
+        std::printf("encryption key   : none (run 'encryption create')\n");
 }
 
 // Parse "LAT,LON[,ALT]" into a Location (exception-free). Returns false on any
@@ -338,6 +438,7 @@ void print_recording(const RecordingStatus& r, bool show_target = true) {
                 r.recording ? "RECORDING" : "complete",
                 r.bytes / (1024.0 * 1024.0), (unsigned long long)r.frames,
                 (unsigned long long)r.duration_ms);
+    std::printf("  %s", r.encrypted ? "[encrypted]" : "[unencrypted]");
     if (r.upload == UPLOAD_STATE::RUNNING)
         std::printf("  [upload %.1f/%.1f MB]",
                     r.upload_bytes_sent  / (1024.0 * 1024.0),
@@ -417,6 +518,12 @@ int main(int argc, char** argv) {
     ERROR_CODE ec = dev.open(init);
     if (ec != ERROR_CODE::SUCCESS) return fail(ec, "open");
 
+    // The library keeps quiet about a refused password (no stderr from a lib);
+    // the CLI is where a human is, so warn here instead.
+    if (di_locked_unauth(dev))
+        std::fprintf(stderr,
+            "ef-cli: control password not accepted; only info, state, storage"
+            " and factory-reset will answer\n");
     if (cmd == "info") {
         print_info(dev.get_device_information());
         return 0;
@@ -454,6 +561,11 @@ int main(int argc, char** argv) {
         std::printf("current          : %dx%d @ %d fps, %s\n",
                     c.resolution.width, c.resolution.height, c.fps,
                     to_string(c.compression));
+        // Both change the bytes on disk, and neither shows in the mode list.
+        std::printf("encryption       : %s\n",
+                    di.encryption_enabled ? "on (AES-256)" : "off");
+        std::printf("rectify          : %s   fov-scale = %.2f\n",
+                    c.calibration.rectify ? "on" : "off", c.calibration.fov_scale);
         const Capabilities& caps = di.capabilities;
         if (caps.modes.empty()) {
             std::puts("supported modes  : (none advertised)");
@@ -975,7 +1087,155 @@ int main(int argc, char** argv) {
         std::string new_pw = args.size() > 2 ? args[2] : args[1];
         ec = dev.set_ble_password(old_pw, new_pw);
         if (ec != ERROR_CODE::SUCCESS) return fail(ec, "set-password");
-        std::puts("BLE password updated");
+        std::puts("control password updated (BLE and USB)");
+        return 0;
+    }
+    if (cmd == "lock" && args.size() > 1) {
+        bool want = (args[1] == "on" || args[1] == "true" || args[1] == "1");
+        if (!want && args[1] != "off" && args[1] != "false" && args[1] != "0") {
+            std::fprintf(stderr, "lock: expected 'on' or 'off'\n");
+            return 2;
+        }
+        // --session leaves the stored policy alone, so losing power closes the
+        // device again with nothing to undo.
+        bool session = std::find(args.begin(), args.end(), "--session") != args.end();
+        ec = dev.set_usb_lock(want, session);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "lock", dev.last_error_message());
+        if (session)
+            std::printf("USB %s\n", want
+                ? "session unlock ended: password required again"
+                : "open for this session: no password needed until you re-lock it "
+                  "or the device loses power (still LOCKED after a reboot)");
+        else
+            std::printf("USB %s\n", want
+                ? "LOCKED: every command except info/state/storage/factory-reset now needs --password"
+                : "unlocked: full privileges over USB");
+        return 0;
+    }
+    if (cmd == "encryption" && args.size() > 1 && args[1] == "create") {
+        EncryptionKey k;
+        ec = dev.create_encryption_key(k);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "encryption create", dev.last_error_message());
+        std::fprintf(stderr,
+            "This is the ONLY time this key is shown. Save it now.\n"
+            "Without it, recordings made under it cannot be decrypted by anyone,\n"
+            "including us. A factory reset destroys the device's copy.\n\n");
+        std::printf("key_id %s\n", k.key_id.c_str());
+        print_key_hex(k.key);
+        wipe(k.key);
+        return 0;
+    }
+    if (cmd == "encryption" && args.size() > 1 && args[1] == "delete") {
+        // Two steps on purpose. The first shows the key and destroys nothing, so
+        // an operator who still needs to read old recordings can save it before
+        // the key is gone; only --confirm with the matching id destroys, and the
+        // device enforces that match too.
+        std::string confirm_id;
+        for (size_t a = 2; a + 1 < args.size(); a++)
+            if (args[a] == "--confirm") confirm_id = args[a + 1];
+
+        if (confirm_id.empty()) {
+            EncryptionKey k;
+            ec = dev.get_encryption_key(k);
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "encryption delete", dev.last_error_message());
+            if (!k.present) { std::puts("no encryption key to delete"); return 0; }
+            std::fprintf(stderr,
+                "Key %s is about to be destroyed. Save it FIRST if you still need to\n"
+                "read recordings made under it, including ones already uploaded, which\n"
+                "become permanently undecryptable.\n\n", k.key_id.c_str());
+            print_key_hex(k.key);
+            wipe(k.key);
+            std::fprintf(stderr,
+                "\nNothing has been destroyed yet. To go ahead:\n"
+                "  ef-cli encryption delete --confirm %s\n", k.key_id.c_str());
+            return 0;
+        }
+
+        bool assume_yes = std::find(args.begin(), args.end(), "--yes") != args.end();
+        if (!assume_yes) {
+            // No tty REFUSES rather than falling through: ssh box 'ef-cli ...', a
+            // cron job, or a redirected stdin is exactly where an unprompted
+            // destroy goes unnoticed. --yes is the only way to mean it.
+            if (!isatty(fileno(stdin))) {
+                std::fprintf(stderr, "encryption delete: refusing to destroy a key "
+                                     "without a terminal to confirm on; pass --yes "
+                                     "to mean it\n");
+                return 1;
+            }
+            std::fprintf(stderr, "Destroy key %s? Type 'destroy' to confirm: ",
+                         confirm_id.c_str());
+            char line[32] = {0};
+            if (!std::fgets(line, sizeof line, stdin) ||
+                std::strncmp(line, "destroy", 7) != 0) {
+                std::fprintf(stderr, "aborted\n");
+                return 1;
+            }
+        }
+        EncryptionKey gone;
+        ec = dev.delete_encryption_key(confirm_id, gone);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "encryption delete", dev.last_error_message());
+        std::fprintf(stderr, "key %s destroyed. Encryption is now off; "
+                             "'encryption create' makes a new one.\n", gone.key_id.c_str());
+        wipe(gone.key);
+        return 0;
+    }
+    if (cmd == "encryption" && args.size() > 1) {
+        bool on = (args[1] == "on" || args[1] == "true" || args[1] == "1");
+        if (!on && args[1] != "off" && args[1] != "false" && args[1] != "0") {
+            std::fprintf(stderr, "encryption: expected 'on', 'off', 'create' or 'delete'\n");
+            return 2;
+        }
+        ec = dev.set_encryption(on);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "encryption", dev.last_error_message());
+        std::printf("encryption %s for new recordings\n", on ? "ON" : "OFF");
+        return 0;
+    }
+    if (cmd == "key" && args.size() > 1 && args[1] == "show") {
+        std::string out_path;
+        for (size_t a = 2; a + 1 < args.size(); a++)
+            if (args[a] == "--out") out_path = args[a + 1];
+
+        EncryptionKey k;
+        ec = dev.get_encryption_key(k);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "key show", dev.last_error_message());
+        if (!k.present) { std::puts("no encryption key"); return 0; }
+        if (out_path.empty()) { print_key_hex(k.key); wipe(k.key); return 0; }
+        int rc = write_key_file(out_path, k.key);
+        wipe(k.key);
+        return rc;
+    }
+    if (cmd == "factory-reset") {
+        // Ungated on the device by design (the escape when the password is lost),
+        // so the CLI is the only place a typo can be caught. Confirm on a TTY;
+        // --yes keeps it scriptable.
+        bool assume_yes = std::find(args.begin(), args.end(), "--yes") != args.end();
+        if (!assume_yes) {
+            if (!isatty(fileno(stdin))) {
+                std::fprintf(stderr, "factory-reset: refusing to destroy the encryption "
+                                     "key without a terminal to confirm on; pass --yes "
+                                     "to mean it\n");
+                return 1;
+            }
+            std::fprintf(stderr,
+                "This erases recordings, wifi credentials, calibration, capture config\n"
+                "and the control password.\n"
+                "It also DESTROYS the encryption key. Every recording ever made under\n"
+                "it becomes permanently undecryptable, including copies already\n"
+                "uploaded elsewhere. Save the key first ('ef-cli key show --out <file>')\n"
+                "if you will ever need to read those recordings.\n"
+                "Type 'reset' to confirm: ");
+            char line[32] = {0};
+            if (!std::fgets(line, sizeof line, stdin) ||
+                std::strncmp(line, "reset", 5) != 0) {
+                std::fprintf(stderr, "aborted\n");
+                return 1;
+            }
+        }
+        ec = dev.factory_reset();
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "factory-reset");
+        std::puts("factory settings restored "
+                  "(password default, USB unlocked, encryption off; "
+                  "encryption key DESTROYED)");
         return 0;
     }
     if (cmd == "sync-time") {

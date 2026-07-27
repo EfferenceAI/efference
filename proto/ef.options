@@ -12,6 +12,7 @@ ef.v1.DeviceInformation.hw_rev            max_size:16
 ef.v1.DeviceInformation.firmware_version  max_size:32
 ef.v1.DeviceInformation.wifi_mac          max_size:18
 ef.v1.DeviceInformation.bt_mac            max_size:18
+ef.v1.DeviceInformation.encryption_key_id max_size:16
 ef.v1.CameraIntrinsics.extrinsics_quat    max_count:4
 ef.v1.ImuCalibration.accel_bias           max_count:3
 ef.v1.ImuCalibration.gyro_bias            max_count:3
@@ -107,3 +108,6 @@ ef.v1.AuthChallenge.salt                  max_size:16     # PBKDF2 salt (not sec
 ef.v1.Authenticate.response               max_size:32     # HMAC-SHA256 = 32 bytes
 ef.v1.SetBlePassword.old_password         max_size:64
 ef.v1.SetBlePassword.new_password         max_size:64
+ef.v1.EncryptionKey.key                   max_size:32     # AES-256 = 32 bytes; widen with the enum
+ef.v1.EncryptionKey.key_id                max_size:16     # 8 hex chars + NUL, room to widen
+ef.v1.DeleteEncryptionKey.key_id          max_size:16

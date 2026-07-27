@@ -112,6 +112,7 @@ void recording_from_wire(const WireRecording& s, RecordingStatus* out) {
     out->bytes       = s.bytes;
     out->frames      = s.frames;
     out->duration_ms = s.duration_ms;
+    out->encrypted   = s.encrypted;
 }
 
 }  // namespace

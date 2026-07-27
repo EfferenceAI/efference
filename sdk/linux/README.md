@@ -51,13 +51,19 @@ root, in increasing order of commitment:
 ```sh
 sdk/linux/build/ef-cli info     # run it by its full path; nothing to set up
 source env.sh                   # add ef-cli to PATH for this shell, then: ef-cli info
-sdk/linux/build.sh --install    # install ef-cli to /usr/local/bin, always on PATH (sudo once)
+sdk/linux/build.sh --install    # copy ef-cli to /usr/local/bin, on PATH for every shell (sudo)
 ```
+
+`--install` copies the binary rather than linking it, so re-run it after every
+rebuild. A plain `./build.sh` writes only to `sdk/linux/build/`, and an `ef-cli`
+installed earlier goes on running the older code without complaining. If you are
+changing the SDK and rebuilding often, `source env.sh` puts `build/` on PATH
+directly and is current as soon as a build finishes.
 
 `source env.sh` also sets `CMAKE_PREFIX_PATH` so the tutorials resolve
 `find_package(ef)`, and it works from any directory if you give its full path
 (`source /path/to/efference/env.sh`). To source it in every new shell, add that
-line to your `~/.bashrc`; to skip sourcing entirely, use `--install` above.
+line to your `~/.bashrc`.
 
 ---
 
@@ -110,7 +116,7 @@ commands
                                  --location overrides the LocationFix for this recording only)
   record stop                    stop the current device recording
   record status [name]           session status (+ storage + upload)
-  record list                    list device recordings
+  record list                    list device recordings (each marked [encrypted]/[unencrypted])
   record delete <name>           delete a device recording
   download <name> [dest]         pull a recording over USB/BLE (default <name>.mcap)
   upload <name> <url>            device uploads a recording to a pre-signed URL (over WiFi)
@@ -126,8 +132,16 @@ commands
   wifi remove <ssid>               forget a saved network (disconnects it if it's the current one)
   wifi scan                        access points in range, strongest first (top 10)
   wifi status                      current association (connecting / connected / not connected)
-  set-password <new>             rekey the BLE password (over USB, no old password)
-  set-password <old> <new>       rekey the BLE password (over BLE)
+  set-password <new>             rekey the control password (over UNLOCKED USB, no old password)
+  set-password <old> <new>       rekey the control password (over BLE, or locked USB)
+  lock on|off                    lock/unlock the USB control plane (needs the current password)
+  encryption on|off              AES-256 encrypt new recordings (refused with no key)
+  encryption create              generate the device's key; SHOWN ONCE, save it
+  encryption delete              show the key and how to destroy it (destroys nothing)
+  encryption delete --confirm <key_id>
+                                 destroy the key; recordings under it become unreadable
+  key show [--out <file>]        print the key, or write it to a new 0600 file
+  factory-reset                  restore defaults; DESTROYS the encryption key. USB-only escape
   sync-time                      set the device clock from the host
   time                           read the device wall clock
   location                       read the device's current location (session_meta.json, else default)
@@ -166,6 +180,124 @@ applies its own).
 
 USB isoc video is sized to the negotiated link speed automatically (SuperSpeed
 32 KB/interval, high-speed 1 KB); live streaming works at both.
+
+---
+
+## Access control and at-rest encryption
+
+One password covers both transports (factory default `123456`, passed as
+`--password`). BLE always requires it. USB is fully open until you lock it:
+
+```sh
+ef-cli lock on                       # USB now gates exactly like BLE
+ef-cli --password 123456 record list
+ef-cli --password 123456 lock off
+```
+
+`info`, `state`, `storage` and `factory-reset` answer regardless, so a locked
+device still tells you what it is and can always be recovered. `ef-cli info`
+shows `usb access` and `encryption`; `ef-cli config` shows `encryption` and
+`rectify` alongside the capture mode.
+
+Authentication is per link, not per command: authenticate once and the rest of
+that session is authenticated. USB and BLE authenticate independently of each
+other.
+
+A grant does not last forever, because USB gives the device no way to tell that
+the client which earned it has gone away. It ends at whichever comes first: two
+minutes idle, ten minutes from the moment it was granted (traffic does not extend
+this), a new authentication attempt on the same link, or the cable cycling. The
+SDK re-runs the handshake and retries transparently, so a long-lived `Device`
+never sees this; a client speaking the wire protocol itself must be ready to
+re-authenticate on `AUTH_REQUIRED`.
+
+If you are going to work on a locked device for a while, open it deliberately
+instead of passing a password to every command:
+
+```sh
+ef-cli lock off --session      # open until re-locked or the device loses power
+ef-cli lock on  --session      # close it again
+```
+
+This does not change the stored policy. The device still reports `usb_locked`, so
+losing power closes it with nothing to remember, and `ef-cli info` shows
+`LOCKED, open for this session` rather than claiming to be either. It is refused
+on a device that is not locked, and a plain `lock on` from any transport ends it.
+
+Authenticating never does this implicitly. A password proves one caller for one
+call; opening the device is a separate decision an operator makes, because a
+grant that spread from one client to every other client on the cable is exactly
+the defect this replaced.
+
+Recordings can be AES-256-GCM encrypted at rest with a per-device key. The device
+generates that key itself and returns it exactly once, at creation:
+
+```sh
+ef-cli encryption create             # generates the key and PRINTS IT, once
+ef-cli encryption on                 # applies to the NEXT recording
+ef-decrypt clip1.mcap key.txt clip1.plain.mcap
+```
+
+**Save the key when `create` prints it.** The device keeps a working copy, but
+nothing ever prints it again except `key show`, and a factory reset destroys it.
+Without your copy, recordings made under that key cannot be read by anyone.
+
+```sh
+ef-cli key show                      # print it (stdout, so it can be piped)
+ef-cli key show --out device1.key    # or write it to a 0600 file, never echoed
+```
+
+`--out` refuses to overwrite an existing file rather than truncating it: the file
+it would destroy may be the only copy of another device's key.
+
+`encryption on` is refused when no key exists, so a session can never be told it
+is encrypting while it records in the clear. `ef-cli info` reports the key's ID
+(the first four bytes of its SHA-256, never the key), which is how you tell which
+of your saved keys opens a given recording; the ID is also written into each
+file's header. On a locked device the ID needs the password like any other gated
+field, since the same value in a file header would otherwise let anyone in range
+link a device to recordings they hold. Whether a key exists at all is always
+readable.
+
+`record list` marks each recording `[encrypted]` or `[unencrypted]` by reading
+the container magic off the file, so it reports what is on disk rather than the
+current setting. A recording truncated by power loss still decrypts up to its
+last complete chunk.
+
+### Destroying the key
+
+Two commands destroy it, and both are irreversible for every recording written
+under it, including copies already uploaded elsewhere.
+
+```sh
+ef-cli encryption delete             # shows the key and what will happen; destroys NOTHING
+ef-cli encryption delete --confirm <key_id>   # actually destroys it
+```
+
+The first form is there so you can still save the key if you need to read old
+recordings. The device requires the `key_id` to match, so an SDK caller cannot
+destroy a key it never identified either, and it refuses unless the device is
+idle: a running session holds the key in memory and would otherwise keep writing
+under a key the device had just reported destroyed.
+
+Both destructive commands prompt for typed confirmation on a terminal. With no
+terminal (`ssh box 'ef-cli …'`, cron, redirected stdin) they **refuse** instead of
+prompting, so add `--yes` to mean it in a script:
+
+```sh
+ef-cli encryption delete --confirm <key_id> --yes
+ef-cli factory-reset --yes
+```
+
+`factory-reset` restores defaults (password, lock, encryption, wifi, calibration,
+capture config, recordings) and **destroys the encryption key too**. It does not
+show you the key first, deliberately: it is ungated over USB, and handing a key
+to an unauthenticated caller is exactly what destroying it prevents. Save the key
+with `key show --out` before resetting if you still need it. Over BLE the reset
+requires the password like any other verb.
+
+The key lives on `/userdata`, so a full reflash destroys it as surely as a reset
+does. Your saved copy is the only thing that survives either.
 
 ---
 
@@ -226,9 +358,13 @@ live link); `select` is how you switch to a different *saved* network on demand.
 
 **Update firmware**
 ```sh
-ef-cli update https://updates.example/latest.eff   # URL: device downloads over WiFi
-ef-cli update path/to/update.eff                    # local file: sideload over the wire
+ef-cli update                                          # ask the update service (device needs WiFi)
+ef-cli update --url https://updates.example/latest.eff # device downloads this URL over WiFi
+ef-cli update --file path/to/update.eff                # push a local bundle over USB
 ```
+Name the source explicitly. A bare path still works for compatibility, but it is
+inferred: the CLI treats it as a local bundle only if it exists on disk, so a
+mistyped path is fetched as a URL instead of being reported.
 
 **IMU field calibration**
 

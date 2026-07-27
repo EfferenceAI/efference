@@ -56,15 +56,6 @@ public:
     Status request_raw(const std::string& payload, std::string& out,
                        uint8_t* out_type) override;
 
-    // True if the device exposed a 2nd bulk IN (the MCAP stream endpoint, ep3).
-    // Pre-M0 firmware has only the control IN, so streaming is unavailable.
-    bool has_stream() const override { return ep_stream_ != 0; }
-
-    // Read up to `len` raw bytes off the stream IN (ep3). Returns the libusb rc (0 on
-    // success or timeout), *got the byte count (0 on timeout). No throw; the drain loop
-    // interprets timeouts vs errors itself.
-    int read_stream(uint8_t* buf, int len, unsigned timeout_ms, int* got) override;
-
     // USB iSerialNumber string descriptor (empty if none). Used as a fallback
     // serial source when the firmware reply omits serial_number.
     const std::string& serial_descriptor() const { return serial_; }
@@ -74,8 +65,7 @@ private:
     libusb_device_handle* handle_  = nullptr;
     int                   iface_    = -1;
     uint8_t               ep_out_   = 0;
-    uint8_t               ep_in_    = 0;  // 1st bulk IN: control responses (ep2)
-    uint8_t               ep_stream_ = 0; // 2nd bulk IN: MCAP byte stream (ep3)
+    uint8_t               ep_in_    = 0;  // bulk IN: control responses
     uint32_t              corr_     = 0;
     int                   verbose_ = 0;
     std::string           serial_;

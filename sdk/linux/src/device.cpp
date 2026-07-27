@@ -165,6 +165,13 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
                 sc.camera_imu_transform.m[(size_t)i] = d.imu.imu_to_camera[i];
     }
 
+    di.usb_locked         = d.usb_locked;
+    di.session_unlocked   = d.session_unlocked;
+    di.encryption_enabled = d.encryption_enabled;
+    di.encryption_key_present = d.encryption_key_present;
+    di.encryption_key_id      = d.encryption_key_id;
+    di.encryption_algorithm   = static_cast<ENCRYPTION_ALGORITHM>(d.encryption_algorithm);
+
     di.wireless.wifi_mac_address = d.wifi_mac;   // vendor storage; "" if unprovisioned
     di.wireless.bt_mac_address   = d.bt_mac;
     if (d.has_wifi) {
@@ -254,10 +261,14 @@ ERROR_CODE Device::open(InitParameters params) {
             std::lock_guard<std::mutex> lk(impl_->ctl_mtx);
             impl_->connection = std::move(ble);
         }
-        // Authenticate before any gated verb (including the stale StopStream
-        // below), or the device answers AUTH_REQUIRED to everything.
-        ERROR_CODE ac = impl_->ble_auth(params.ble_password);
-        if (ac != ERROR_CODE::SUCCESS) { impl_->close_transport(); return ac; }
+        // Authenticate before any gated verb, or the device answers
+        // AUTH_REQUIRED to everything.
+        //
+        // A wrong password does not fail the open, matching the USB path: the
+        // device still answers info/state/storage unauthenticated on either
+        // transport, and those are what an operator needs to diagnose a device
+        // whose password they have lost. Gated verbs report INVALID_PASSWORD.
+        (void)impl_->control_auth(params.ble_password);
 #else
         return ERROR_CODE::INVALID_FUNCTION_CALL;   // built without BLE support
 #endif
@@ -285,6 +296,35 @@ ERROR_CODE Device::open(InitParameters params) {
         if (ec != ERROR_CODE::SUCCESS) { impl_->close_transport(); return ec; }
         info_from_wire(resp.body.device_information, params.input_type, usb_serial,
                        &impl_->info, &impl_->caps);
+
+        // A locked USB link gates exactly like BLE. GetDeviceInformation is
+        // ungated, so this is the earliest we can know, and authenticating here
+        // means every later verb sees an authed session. Unlocked USB (the
+        // factory default) skips this entirely and behaves as it always has.
+        //
+        // A wrong password does NOT fail the open: the device still answers
+        // info/state/storage/factory-reset unauthenticated, and those are exactly
+        // what an operator needs to diagnose a device whose password they have
+        // lost. Failing here would hide them behind the very credential they are
+        // trying to recover from. Gated verbs then report INVALID_PASSWORD on
+        // their own.
+        if (params.input_type != INPUT_TYPE::STREAM &&
+            resp.body.device_information.usb_locked) {
+            if (impl_->control_auth(params.ble_password) == ERROR_CODE::SUCCESS) {
+                // Re-read now that the session is authed. The snapshot above was
+                // necessarily taken pre-auth (it is what tells us the link is
+                // locked), so it is missing every gated field -- encryption_key_id
+                // today. Without this, a locked device never reports its key_id
+                // however correct the operator's password is.
+                WireRequest req2 = ef_v1_Request_init_zero;
+                req2.which_body = ef_v1_Request_get_device_information_tag;
+                WireResponse resp2;
+                if (impl_->call(req2, resp2, ef_v1_Response_device_information_tag)
+                        == ERROR_CODE::SUCCESS)
+                    info_from_wire(resp2.body.device_information, params.input_type,
+                                   usb_serial, &impl_->info, &impl_->caps);
+            }
+        }
     }
 
     // ---- validate the session configuration against the advertised menu ------
@@ -362,6 +402,7 @@ void Device::close() {
 }
 
 bool         Device::is_open() const { return impl_ && impl_->state != DEVICE_STATE::CLOSED; }
+bool         Device::is_authenticated() const { return impl_ && impl_->authenticated; }
 DEVICE_STATE Device::get_state() const {
     return impl_ ? impl_->state.load() : DEVICE_STATE::CLOSED;
 }

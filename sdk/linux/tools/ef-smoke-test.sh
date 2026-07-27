@@ -29,6 +29,14 @@
 #   SKIP_WIFI/SKIP_BLE/SKIP_DEEP/SKIP_RECORD/SKIP_GRAB  set to 1 to skip a section
 #   TEST_REBOOT      set to 1 to reboot the device as the LAST step (off by default;
 #                    OTA update/apply is out of scope, test it separately)
+#   TEST_LOCK        set to 1 to exercise the USB lock + key-read verbs (off by
+#                    default; a run that dies while locked leaves later verbs
+#                    needing --password). factory-reset is never run here: it
+#                    clears wifi credentials and recordings the harness cannot
+#                    restore.
+#   TEST_ENCRYPTION  set to 1 to exercise at-rest encryption on/off and the
+#                    encrypted/unencrypted marker (off by default; it records,
+#                    then deletes what it recorded, and leaves encryption OFF).
 
 set -u
 export LC_ALL=C   # stable %.2f / strtod formatting so the float greps below don't drift
@@ -39,6 +47,8 @@ GARGS="$EFARGS"                          # global flags the helpers use (USB by 
 TIMEOUT="${TIMEOUT:-330}"                # per-command cap (s): covers deep health ~3min; a hung verb is killed so we move on
 EFX() { timeout -k 5 "$TIMEOUT" "$EF" "$@"; }   # every ef call goes through this so nothing can stall the run
 TEST_BLE_PASSWORD="${TEST_BLE_PASSWORD:-123456}"
+# For negative auth tests. Must never equal the real one, hence the pid suffix.
+WRONG_PW="ef-smoke-wrong-$$"
 TEST_WIFI_SSID="${TEST_WIFI_SSID:-ef-smoke-fake}"
 TEST_WIFI_PSK="${TEST_WIFI_PSK:-bogus-password-123}"
 TEST_WIFI_COUNTRY="${TEST_WIFI_COUNTRY:-US}"
@@ -50,7 +60,10 @@ usage() {
     cat <<EOF
 Usage: ef-smoke-test.sh [options]
   --wifi-ssid SSID      real SSID to join (default: throwaway -> only tests connecting/disconnected)
-  --wifi-psk PSK        WiFi password (required for a real join)
+  --wifi-psk PSK        WiFi password (required for a real join). Visible in \`ps\`
+                        and your shell history -- prefer --wifi-psk-stdin, or set
+                        TEST_WIFI_PSK in the environment.
+  --wifi-psk-stdin      read the WiFi password from stdin instead of argv
   --wifi-country CC     regdomain (default $TEST_WIFI_COUNTRY; needed for 5 GHz)
   --ble-password PW     BLE control password (default 123456)
   --grab-secs N         data-plane live-capture seconds (default 5)
@@ -76,6 +89,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --wifi-ssid)    TEST_WIFI_SSID="$2";    shift 2;;
         --wifi-psk)     TEST_WIFI_PSK="$2";     shift 2;;
+        --wifi-psk-stdin)
+            # -r so a backslash in the PSK survives; no echo.
+            IFS= read -r TEST_WIFI_PSK || true
+            shift;;
         --wifi-country) TEST_WIFI_COUNTRY="$2"; shift 2;;
         --ble-password) TEST_BLE_PASSWORD="$2"; shift 2;;
         --grab-secs)    GRAB_SECS="$2";         shift 2;;
@@ -198,6 +215,14 @@ cleanup() {
     # Calibration: restore the pre-test snapshot and drop the embed-test recording
     # (only the destructive path touches these).
     [ "${TEST_CALIB:-0}" = 1 ] && restore_calibration
+    # A run that dies mid-lock would otherwise leave the device gated and every
+    # later verb failing for a reason unrelated to the code under test. Both are
+    # no-ops when the lock test never ran.
+    if [ "${TEST_LOCK:-0}" = 1 ]; then
+        EFX $EFARGS --password "$TEST_BLE_PASSWORD" lock on --session >/dev/null 2>&1
+        EFX $EFARGS --password "$TEST_BLE_PASSWORD" lock off >/dev/null 2>&1 \
+            && echo "restored USB to unlocked"
+    fi
     EFX $EFARGS record delete ef-smoke-cal >/dev/null 2>&1 && echo "deleted ef-smoke-cal"
     EFX $EFARGS record stop            >/dev/null 2>&1
     EFX $EFARGS record delete "$SESSION" >/dev/null 2>&1 && echo "deleted test session $SESSION"
@@ -614,6 +639,15 @@ run "state during recording (STREAMING)"  state
 xfail "location set while recording (must reject)"  INVALID_FUNCTION_CALL  location set 1.0 2.0
 run "stop recording"              record stop
 run "list recordings"             record list
+# record list must say, per recording, whether the stored segments are encrypted.
+# The device answers by reading the container magic off a segment, so this also
+# proves the recorder and the reporter agree about what actually landed on disk.
+LISTOUT=$(EFX $GARGS record list 2>&1 || true)
+if printf '%s' "$LISTOUT" | grep -qE "\[(encrypted|unencrypted)\]"; then
+    printf '%s[record list reports encryption state]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+else
+    printf '%s[record list is missing the encrypted/unencrypted marker]%s\n' "$c_err" "$c_off"; fail=$((fail+1))
+fi
 xfail "start with a duplicate name (must reject, not overwrite)" \
       RECORDING_ALREADY_EXISTS    record start "$SESSION"
 run "download $SESSION"           download "$SESSION" "$DLDIR/$SESSION.mcap"
@@ -816,10 +850,12 @@ else
     run "BLE: wifi list"                 wifi list
     run "BLE: recording list"            record list
     run "BLE: shallow health"            health
-    # Explicit wrong-password check (bypasses $GARGS to force a bad password):
-    printf '\n%s# EXPECT-FAIL (INVALID_PASSWORD): BLE wrong password%s\n%s$ ef-cli --ble %s --password WRONGPASS state%s\n' \
-        "$c_dim" "$c_off" "$c_cmd" "$BLE_MAC" "$c_off"
-    if out="$(EFX --ble "$BLE_MAC" --password WRONGPASS state 2>&1)"; then
+    # Explicit wrong-password check (bypasses $GARGS to force a bad password).
+    # It MUST probe a gated verb: info/state/storage/factory-reset answer pre-auth
+    # by design, so `state` here always succeeded and proved nothing about the gate.
+    printf '\n%s# EXPECT-FAIL (INVALID_PASSWORD): BLE wrong password%s\n%s$ ef-cli --ble %s --password %s record list%s\n' \
+        "$c_dim" "$c_off" "$c_cmd" "$BLE_MAC" "$WRONG_PW" "$c_off"
+    if out="$(EFX --ble "$BLE_MAC" --password "$WRONG_PW" record list 2>&1)"; then
         printf '%s\n%s[UNEXPECTEDLY SUCCEEDED, expected INVALID_PASSWORD]%s\n' "$out" "$c_err" "$c_off"; xfail_bad=$((xfail_bad+1))
     else
         printf '%s\n' "$out"
@@ -833,6 +869,103 @@ else
 fi
 else
 echo; echo "(skipped BLE section: SKIP_BLE=1)"
+fi
+
+# ---------------------------------------------------------------------------
+# USB lock: opt-in, because a run that dies while locked leaves every later verb
+# demanding --password. Recovery is always available (the default password, or
+# the ungated factory-reset), but it should be a deliberate choice, not a
+# surprise. factory-reset itself is NOT exercised here: it clears the device's
+# wifi credentials, which the harness cannot restore.
+if [ "${TEST_ENCRYPTION:-0}" = 1 ]; then
+    banner "AT-REST ENCRYPTION (opt-in: TEST_ENCRYPTION=1)"
+    # Self-restoring: leaves encryption OFF and the key exactly as it found it.
+    # if it has to create one, it destroys that one at the end and never touches a
+    # key that was already there, because destroying THAT would make every
+    # recording on the device unreadable.
+    MADE_KEY=""
+    if ! EFX $GARGS key show 2>&1 | grep -qE '^[0-9a-f]{64}$'; then
+        # No key: enabling must be refused before anything else, since "enabled"
+        # must never quietly mean "recording in the clear".
+        xfail "enabling encryption without a key" INVALID_FUNCTION_CALL encryption on
+        run "create the encryption key"    encryption create
+        MADE_KEY=$(EFX $GARGS info 2>&1 | sed -n 's/^encryption key *: \([0-9a-f]*\).*/\1/p')
+    fi
+    if EFX $GARGS key show 2>&1 | grep -qE '^[0-9a-f]{64}$'; then
+        run "enable encryption"            encryption on
+        run "record encrypted"             record start ef-smoke-enc
+        sleep 3
+        run "stop"                         record stop
+        sleep 1
+        ENCLIST=$(EFX $GARGS record list 2>&1 || true)
+        if printf '%s' "$ENCLIST" | grep -q "ef-smoke-enc.*\[encrypted\]"; then
+            printf '%s[recording reported as encrypted]%s\n' "$c_ok" "$c_off"; pass=$((pass+1))
+        else
+            printf '%s[encryption enabled but the recording is not marked encrypted]%s\n' \
+                "$c_err" "$c_off"; fail=$((fail+1))
+        fi
+        run "delete"                       record delete ef-smoke-enc
+        # A toggle must apply to the NEXT recording with no Configure in between;
+        # resolving it only at Configure once made "encryption on" silently record
+        # unencrypted.
+        run "disable encryption"           encryption off
+        run "record unencrypted"           record start ef-smoke-plain
+        sleep 3
+        run "stop"                         record stop
+        sleep 1
+        PLAINLIST=$(EFX $GARGS record list 2>&1 || true)
+        if printf '%s' "$PLAINLIST" | grep -q "ef-smoke-plain.*\[unencrypted\]"; then
+            printf '%s[toggle applies to the next recording, no Configure needed]%s\n' \
+                "$c_ok" "$c_off"; pass=$((pass+1))
+        else
+            printf '%s[encryption off did not take effect on the next recording]%s\n' \
+                "$c_err" "$c_off"; fail=$((fail+1))
+        fi
+        run "delete"                       record delete ef-smoke-plain
+
+        # The key_id guard is the device's, so a wrong id must be refused even
+        # though the CLI would have caught it too.
+        xfail "delete with the wrong key_id" INVALID_FUNCTION_CALL \
+              encryption delete --confirm deadbeef --yes
+    else
+        echo "(skipped: no encryption key and could not create one)"
+    fi
+    if [ -n "$MADE_KEY" ]; then
+        run "destroy the key this test created" \
+            encryption delete --confirm "$MADE_KEY" --yes
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+if [ "${TEST_LOCK:-0}" = 1 ]; then
+    banner "USB LOCK + SESSION UNLOCK (opt-in: TEST_LOCK=1)"
+    run "read the encryption key (unlocked)"  key show
+    run "lock USB"                            lock on
+
+    # ef-cli DEFAULTS --password to 123456 (InitParameters::ble_password), so
+    # OMITTING it still authenticates on a factory-default device. A negative test
+    # must therefore pass a deliberately WRONG password; "no --password" proves
+    # nothing and silently tested the happy path instead.
+    xfail "gated verb, wrong password"        INVALID_PASSWORD --password "$WRONG_PW" record list
+    # info stays readable, which is how a host learns it must authenticate.
+    run "info still readable while locked"    info
+    run "gated verb with --password"          --password "$TEST_BLE_PASSWORD" record list
+    run "read the encryption key (locked)"    --password "$TEST_BLE_PASSWORD" key show
+
+    # Session unlock: open the locked device for this power session. The grant is
+    # deliberately NOT tied to the client that asked, so the next call needs no
+    # password -- that is the feature, and also why it is worth asserting.
+    run "session unlock"                      --password "$TEST_BLE_PASSWORD" lock off --session
+    run "gated verb, no password needed"      record list
+    run "info reports the third state"        info
+    run "end the session unlock"              lock on --session
+    xfail "gated again after ending it"       INVALID_PASSWORD --password "$WRONG_PW" record list
+
+    run "unlock USB"                          --password "$TEST_BLE_PASSWORD" lock off
+    run "gated verb after unlock"             record list
+    # Meaningless on an open device, and refusing it is what stops an unlocked link
+    # (authed with no password) planting an override that defeats the next lock.
+    xfail "session unlock on an unlocked device" INVALID_FUNCTION_CALL lock off --session
 fi
 
 # ---------------------------------------------------------------------------

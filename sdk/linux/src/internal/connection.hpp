@@ -46,16 +46,6 @@ public:
     virtual Status request_raw(const std::string& payload, std::string& out,
                                uint8_t* out_type) = 0;
 
-    // True if this connection carries the MCAP byte stream (USB ep3). A
-    // control-only connection (e.g. BLE) returns false; the high-rate data plane
-    // then arrives over the network (WiFi) instead.
-    virtual bool has_stream() const = 0;
-
-    // Read up to `len` raw stream bytes. Returns a connection rc (0 on success or
-    // timeout); *got holds the byte count (0 on timeout). Does NOT throw. The
-    // drain loop interprets timeouts vs errors itself.
-    virtual int read_stream(uint8_t* buf, int len, unsigned timeout_ms, int* got) = 0;
-
     virtual bool is_open() const = 0;
     virtual void close()         = 0;
 };

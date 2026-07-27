@@ -69,9 +69,6 @@ public:
     Status request_raw(const std::string& payload, std::string& out,
                        uint8_t* out_type) override;
 
-    // BLE carries control only, no MCAP byte stream.
-    bool has_stream() const override { return false; }
-    int  read_stream(uint8_t*, int, unsigned, int*) override { return -1; }
 
     // Called by the Response PropertiesChanged signal handler (internal).
     void on_response_bytes(const uint8_t* data, size_t len);

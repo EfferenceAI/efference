@@ -635,6 +635,29 @@ struct Device::Impl {
     ERROR_CODE call(WireRequest& req, WireResponse& resp,
                     pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL) {
         std::lock_guard<std::mutex> lk(ctl_mtx);
+        ERROR_CODE ec = call_locked(req, resp, expect, ctx);
+        // The device expires an idle authenticated session, because USB gives it
+        // no client-disconnect event to end one on. A handle that sat idle can
+        // therefore meet AUTH_REQUIRED mid-life through no fault of the caller.
+        // Re-run the handshake once and retry, so the expiry is invisible instead
+        // of surfacing as a spurious INVALID_PASSWORD.
+        //
+        // Only when this handle authenticated before: without that, a genuinely
+        // wrong password would retry on every single call.
+        if (ec == ERROR_CODE::INVALID_PASSWORD && authenticated && !reauthing) {
+            reauthing = true;
+            ERROR_CODE re = control_auth_locked(init.ble_password);
+            reauthing = false;
+            if (re == ERROR_CODE::SUCCESS) ec = call_locked(req, resp, expect, ctx);
+        }
+        return ec;
+    }
+
+    bool reauthing = false;   // guards the retry above against recursing
+
+    // call()'s body. Assumes ctl_mtx is held, so the re-auth path can reuse it.
+    ERROR_CODE call_locked(WireRequest& req, WireResponse& resp,
+                           pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL) {
         if (!connection) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
         req.corr_id = ++corr;
         uint8_t buf[8192];   // == proto::MAX_PAYLOAD (EFR_CTL_MSG_MAX): an
@@ -956,15 +979,34 @@ struct Device::Impl {
         return flip_latched == 1;   // AUTO: unresolved (no gravity fix yet) = OFF
     }
 
-#ifdef EF_HAVE_BLE
-    // BLE control-plane auth: prove the password via PBKDF2 + HMAC-SHA256
-    // challenge-response so it never crosses the air. Runs once after link-up;
-    // without it the device answers AUTH_REQUIRED to every verb.
-    ERROR_CODE ble_auth(const std::string& pw) {
+    // Control-plane auth: prove the password via PBKDF2 + HMAC-SHA256
+    // challenge-response so it never crosses the wire. Runs once after link-up;
+    // without it the device answers AUTH_REQUIRED to every gated verb.
+    //
+    // Not BLE-only: a locked USB link gates identically, so this is compiled
+    // unconditionally and both transports use it.
+    //
+    // Records the outcome in `authenticated` so open() can succeed on a wrong
+    // password (keeping info/state/storage reachable) without hiding from the
+    // caller that gated verbs will refuse.
+    //
+    // Atomic because is_authenticated() reads it outside ctl_mtx while call()
+    // writes it under the lock.
+    std::atomic<bool> authenticated{false};
+
+    ERROR_CODE control_auth(const std::string& pw) {
+        std::lock_guard<std::mutex> lk(ctl_mtx);
+        return control_auth_locked(pw);
+    }
+
+    // Assumes ctl_mtx is held. The handshake is two round trips that must not be
+    // interleaved with another thread's, and call()'s retry path already holds
+    // the lock when it needs to re-run this.
+    ERROR_CODE control_auth_locked(const std::string& pw) {
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_get_auth_challenge_tag;
         WireResponse resp;
-        ERROR_CODE ec = call(req, resp, ef_v1_Response_auth_challenge_tag);
+        ERROR_CODE ec = call_locked(req, resp, ef_v1_Response_auth_challenge_tag);
         // Only AUTH_REQUIRED/AUTH_FAILED mean "wrong password". Everything else
         // (UNSUPPORTED, NOT_OPENED mid-OTA, transport loss) surfaces untranslated,
         // since no password was tested and INVALID_PASSWORD would mislead.
@@ -983,9 +1025,10 @@ struct Device::Impl {
         std::memcpy(areq.body.authenticate.response.bytes, mac, 32);
         WireResponse aresp;
         // A wrong password answers AUTH_FAILED -> INVALID_PASSWORD via err_from.
-        return call(areq, aresp);
+        ERROR_CODE rc = call_locked(areq, aresp);
+        authenticated = (rc == ERROR_CODE::SUCCESS);
+        return rc;
     }
-#endif
 
     // Sideload a local .eff over the control link: OtaPushBegin announces
     // {name,total}, each OtaPushChunk carries <= 7168 B (fits the 8192 control-

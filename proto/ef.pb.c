@@ -261,6 +261,29 @@ PB_BIND(ef_v1_Authenticate, ef_v1_Authenticate, AUTO)
 PB_BIND(ef_v1_SetBlePassword, ef_v1_SetBlePassword, AUTO)
 
 
+PB_BIND(ef_v1_SetUsbLock, ef_v1_SetUsbLock, AUTO)
+
+
+PB_BIND(ef_v1_SetEncryption, ef_v1_SetEncryption, AUTO)
+
+
+PB_BIND(ef_v1_GetEncryptionKey, ef_v1_GetEncryptionKey, AUTO)
+
+
+PB_BIND(ef_v1_CreateEncryptionKey, ef_v1_CreateEncryptionKey, AUTO)
+
+
+PB_BIND(ef_v1_DeleteEncryptionKey, ef_v1_DeleteEncryptionKey, AUTO)
+
+
+PB_BIND(ef_v1_EncryptionKey, ef_v1_EncryptionKey, AUTO)
+
+
+PB_BIND(ef_v1_FactoryReset, ef_v1_FactoryReset, AUTO)
+
+
+
+
 
 
 

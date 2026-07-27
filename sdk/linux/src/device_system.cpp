@@ -335,6 +335,83 @@ ERROR_CODE Device::reset_calibration(bool camera, bool imu) {
     return impl_->call(req, resp);
 }
 
+ERROR_CODE Device::set_usb_lock(bool locked, bool session_only) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_set_usb_lock_tag;
+    req.body.set_usb_lock.locked       = locked;
+    req.body.set_usb_lock.session_only = session_only;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
+ERROR_CODE Device::set_encryption(bool enabled) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_set_encryption_tag;
+    req.body.set_encryption.enabled = enabled;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
+// All three key verbs answer with the same EncryptionKey body, so they share one
+// unpack; only the request differs.
+static void unpack_key(const WireResponse& resp, EncryptionKey& out) {
+    out.algorithm = static_cast<ENCRYPTION_ALGORITHM>(resp.body.encryption_key.algorithm);
+    out.present   = resp.body.encryption_key.present;
+    out.key_id    = resp.body.encryption_key.key_id;
+    out.key.assign(resp.body.encryption_key.key.bytes,
+                   resp.body.encryption_key.key.bytes + resp.body.encryption_key.key.size);
+}
+
+ERROR_CODE Device::get_encryption_key(EncryptionKey& out) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    out = EncryptionKey{};
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_get_encryption_key_tag;
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_encryption_key_tag);
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    unpack_key(resp, out);
+    return ERROR_CODE::SUCCESS;
+}
+
+ERROR_CODE Device::create_encryption_key(EncryptionKey& out) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    out = EncryptionKey{};
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_create_encryption_key_tag;
+    // Leave algorithm at UNSPECIFIED: the device picks its default, which is what
+    // a caller with no opinion should get.
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_encryption_key_tag);
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    unpack_key(resp, out);
+    return ERROR_CODE::SUCCESS;
+}
+
+ERROR_CODE Device::delete_encryption_key(const std::string& key_id, EncryptionKey& out) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    out = EncryptionKey{};
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_delete_encryption_key_tag;
+    std::snprintf(req.body.delete_encryption_key.key_id,
+                  sizeof req.body.delete_encryption_key.key_id, "%s", key_id.c_str());
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_encryption_key_tag);
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    unpack_key(resp, out);
+    return ERROR_CODE::SUCCESS;
+}
+
+ERROR_CODE Device::factory_reset() {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_factory_reset_tag;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
 ERROR_CODE Device::reboot() {
     if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     WireRequest req = ef_v1_Request_init_zero;

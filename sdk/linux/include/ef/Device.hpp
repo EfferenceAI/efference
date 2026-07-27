@@ -63,6 +63,13 @@ public:
     ERROR_CODE     open(InitParameters params = InitParameters());
     InitParameters get_init_parameters() const;
     bool           is_open() const;
+    // Whether this session proved the control password. Meaningful only when the
+    // device reports itself locked (DeviceInformation::usb_locked, or any BLE
+    // link). open() deliberately SUCCEEDS with a wrong password, because the
+    // device still answers info/state/storage and those are what an operator
+    // needs when recovering a lost password; check this to know whether gated
+    // verbs will work before calling one.
+    bool           is_authenticated() const;
     void           close();
 
     DEVICE_STATE get_state() const;
@@ -140,10 +147,67 @@ public:
     // livestreaming (a scan would disrupt the link); retry once idle.
     ERROR_CODE scan_wifi_networks(std::vector<WifiNetwork>& out);
 
-    // Rekey the BLE control password. Over BLE the old password is required;
-    // over USB old_password may be "" (physical access resets a forgotten one).
+    // Rekey the device control password (shared by BLE and USB). The old password
+    // is required, except on an UNLOCKED USB link where it may be "" (physical
+    // access resets a forgotten one). Once USB is locked that shortcut is gone
+    // and factory_reset() is the escape.
     ERROR_CODE set_ble_password(const std::string& old_password,
                                 const std::string& new_password);
+
+    // Lock or unlock the USB control plane. Unlocked (factory default) USB has
+    // full privileges; locked, it gates exactly like BLE and open() authenticates
+    // with InitParameters::ble_password. Toggling requires the current password.
+    //
+    // session_only opens a LOCKED device for this power session without changing
+    // the stored policy: gated verbs answer with no password until set_usb_lock(
+    // true, ...) or the device loses power, and it still reports usb_locked.
+    // Refused when the device is not locked. Authenticating never does this
+    // implicitly.
+    ERROR_CODE set_usb_lock(bool locked, bool session_only = false);
+
+    // Turn at-rest video encryption on/off for SUBSEQUENT recordings; existing
+    // ones keep whatever they were written with. Refused with INVALID_PARAMETER
+    // if no key exists, so "enabled" never means "recording in the clear".
+    ERROR_CODE set_encryption(bool enabled);
+
+    // Read the video-encryption key. Gated on the same password as the lock.
+    // `present` is false when no key exists, which is not an error.
+    ERROR_CODE get_encryption_key(EncryptionKey& out);
+
+    // Generate the device's encryption key and return it. This is the ONLY time
+    // the key is handed out in full at creation, so the caller must keep it: it is
+    // what decrypts every recording made from here on.
+    //
+    // Refused with INVALID_PARAMETER when a key already exists, because replacing
+    // one would make every recording written under it permanently undecryptable.
+    // Rotation is delete_encryption_key() then create, two deliberate steps.
+    ERROR_CODE create_encryption_key(EncryptionKey& out);
+
+    // Destroy the device's encryption key. `key_id` must match the installed key
+    // (see DeviceInformation::encryption_key_id), which is what stops a caller
+    // destroying a key it never identified; INVALID_PARAMETER if it does not.
+    //
+    // `out` carries the destroyed key, with present == false. That is the last
+    // chance to keep it for ciphertext already recorded under it; afterwards
+    // nothing on the device can decrypt those recordings, wherever they now live.
+    //
+    // Refused unless the device is IDLE: a running session holds the key in
+    // memory and would keep encrypting under it after the call reported it gone.
+    ERROR_CODE delete_encryption_key(const std::string& key_id, EncryptionKey& out);
+
+    // Restore factory settings: password to default, USB unlocked, encryption
+    // off, and wifi, calibration, capture config, recordings and runtime state
+    // cleared. Ungated on USB only, so physical possession is the escape when the
+    // password is lost; over BLE it needs the password like any other verb.
+    //
+    // ⚠ DESTROYS the encryption key. Every recording ever made under it becomes
+    // permanently undecryptable, including copies already uploaded elsewhere.
+    // Unlike delete_encryption_key() it does NOT return the key first: this verb
+    // answers unauthenticated over USB, and handing a key to an unauthenticated
+    // caller is exactly the exposure destroying it removes.
+    //
+    // Preserves the ADB-enable marker. Refused while a capture is active.
+    ERROR_CODE factory_reset();
 
     ERROR_CODE sync_time();   // align the device clock with the host clock
     // Read the device's current wall clock (epoch). Round-trips TimeSync; the

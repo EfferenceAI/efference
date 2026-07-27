@@ -116,8 +116,10 @@ ERROR_CODE Device::update(const std::string& url,
                           S_ISREG(st.st_mode);
 
     // Sideload is USB-only: ~7 KB chunks means ~56k round trips for a 400 MB bundle, with
-    // no resume, so over a BLE control link it takes hours and restarts from zero.
-    if (sideload && impl_->connection && !impl_->connection->has_stream())
+    // no resume, so over a BLE control link it takes hours and restarts from zero. Both
+    // transports push over the bulk control endpoints, so what decides this is the
+    // link's speed, not whether it has a stream endpoint.
+    if (sideload && impl_->init.input_type == INPUT_TYPE::STREAM)
         return ERROR_CODE::INVALID_FUNCTION_CALL;
 
     // Resolve first, so an up-to-date device never has its stream paused for nothing.
@@ -210,11 +212,11 @@ ERROR_CODE Device::update(const std::string& url,
     auto deadline    = std::chrono::steady_clock::now() + std::chrono::minutes(15);
     auto start_grace = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     bool seen_active = false;
-    // Poll a control-only link (BLE) gently: it is fragile and shares the radio with
-    // the WiFi download. USB (has_stream) can poll fast. Future: subscribe to the
-    // device's OTA Event notify over BLE instead of polling.
-    const bool control_only = impl_->connection && !impl_->connection->has_stream();
-    const auto poll_interval = std::chrono::seconds(control_only ? 5 : 1);
+    // Poll BLE gently: the radio is fragile and is also carrying the WiFi download
+    // this poll is waiting on. USB can poll fast. Future: subscribe to the device's
+    // OTA Event notify over BLE instead of polling.
+    const bool ble_link = (impl_->init.input_type == INPUT_TYPE::STREAM);
+    const auto poll_interval = std::chrono::seconds(ble_link ? 5 : 1);
     for (;;) {
         UpdateStatus u;
         ERROR_CODE ec = get_update_status(u);

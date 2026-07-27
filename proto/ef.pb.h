@@ -151,6 +151,14 @@ typedef enum _ef_v1_ImuData {
     ef_v1_ImuData_IMU_BOTH = 2
 } ef_v1_ImuData;
 
+/* Which cipher a key is for, and which one a recording was written with. Carried
+ explicitly from the start so the format is not pigeonholed to one algorithm; the
+ container header spends a byte on the same id. */
+typedef enum _ef_v1_EncryptionAlgorithm {
+    ef_v1_EncryptionAlgorithm_ENC_ALG_UNSPECIFIED = 0, /* "device default" on a request; AES_256_GCM in a file */
+    ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM = 1
+} ef_v1_EncryptionAlgorithm;
+
 typedef enum _ef_v1_StreamTarget_Kind {
     ef_v1_StreamTarget_Kind_LOCAL = 0,
     ef_v1_StreamTarget_Kind_ONLINE = 1
@@ -251,6 +259,10 @@ typedef struct _ef_v1_RecordingStatus {
     uint64_t bytes;
     uint64_t frames;
     uint64_t duration_ms;
+    /* Whether the stored segments are AES-256-GCM encrypted. Determined by reading
+ the container magic off a segment, not from metadata, so it stays true for
+ files written by an older build and cannot drift from what is on disk. */
+    bool encrypted;
 } ef_v1_RecordingStatus;
 
 typedef struct _ef_v1_ListRecordings {
@@ -683,6 +695,13 @@ typedef struct _ef_v1_DeviceInformation {
     bool must_change_password; /* BLE password is still the factory default (123456) */
     char wifi_mac[18]; /* WiFi MAC from vendor storage (item 2), "" if unprovisioned */
     char bt_mac[18]; /* BT MAC from vendor storage (item 4), "" if unprovisioned */
+    bool usb_locked; /* USB gates like BLE; host must authenticate before gated verbs */
+    bool encryption_enabled; /* new recordings will be encrypted */
+    bool encryption_key_present; /* a key exists; encryption cannot be enabled without one */
+    char encryption_key_id[16]; /* "" when absent; names the key a recording was written under */
+    ef_v1_EncryptionAlgorithm encryption_algorithm; /* the installed key's cipher (UNSPECIFIED if none) */
+    /* Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only. */
+    bool session_unlocked;
 } ef_v1_DeviceInformation;
 
 /* Write calibration for one sensor (IDLE only; applied on the next capture
@@ -721,6 +740,77 @@ typedef struct _ef_v1_AuthChallenge {
     uint32_t iters;
 } ef_v1_AuthChallenge;
 
+typedef PB_BYTES_ARRAY_T(32) ef_v1_Authenticate_response_t;
+typedef struct _ef_v1_Authenticate {
+    ef_v1_Authenticate_response_t response;
+} ef_v1_Authenticate;
+
+typedef struct _ef_v1_SetBlePassword {
+    char old_password[64];
+    char new_password[64];
+} ef_v1_SetBlePassword;
+
+/* USB access control. Unlocked (factory default) USB has full privileges, matching
+ today's behavior. Locked, a USB session is gated exactly like a BLE one: only
+ info, state, storage, the auth handshake, and FactoryReset answer without a
+ password. Toggling either way requires the current password.
+ session_only scopes it to this power session: {locked=false} opens a device that
+ is ALREADY locked (refused otherwise) until re-locked from either transport or
+ power is lost, and usb_locked stays true throughout. USB only, and never set
+ implicitly by Authenticate. Omitted = the persistent behavior. */
+typedef struct _ef_v1_SetUsbLock {
+    bool locked;
+    bool session_only;
+} ef_v1_SetUsbLock;
+
+/* Turn at-rest video encryption on or off for SUBSEQUENT recordings; existing
+ ones keep whatever they were written with. Enabling with no key is refused, so a
+ session can never silently record unencrypted after being told to encrypt.
+ `algorithm` must be one the device implements. Read the current state from
+ DeviceInformation.encryption_enabled. */
+typedef struct _ef_v1_SetEncryption {
+    bool enabled;
+    ef_v1_EncryptionAlgorithm algorithm;
+} ef_v1_SetEncryption;
+
+/* ---- key lifecycle ----
+ The device generates its own key and returns it ONCE, at creation. The operator
+ keeps that copy; the device keeps a working copy that a factory reset destroys.
+ Custody therefore moves to the operator at creation time, and there is no state
+ in which the device holds a key nobody else has.
+
+ All three are gated on the control password (unlocked USB is trusted, as ever). */
+typedef struct _ef_v1_GetEncryptionKey {
+    char dummy_field;
+} ef_v1_GetEncryptionKey;
+
+/* Refused when a key already exists: replacing one would make every recording
+ written under it permanently undecryptable, so rotation is delete-then-create,
+ two deliberate steps rather than one that can be typed by accident. */
+typedef struct _ef_v1_CreateEncryptionKey {
+    ef_v1_EncryptionAlgorithm algorithm;
+} ef_v1_CreateEncryptionKey;
+
+/* `key_id` must match the installed key. The guard lives here rather than only in
+ the CLI so an SDK or BLE caller cannot destroy a key it never identified. The
+ reply carries the destroyed key's bytes with present=false, which is the last
+ chance to keep it for ciphertext already recorded under it.
+
+ IDLE-only, like FactoryReset: a running session holds the key in memory and
+ would keep encrypting under it, so the device would report the key destroyed
+ and then finish writing a recording that needs exactly that key. */
+typedef struct _ef_v1_DeleteEncryptionKey {
+    char key_id[16];
+} ef_v1_DeleteEncryptionKey;
+
+typedef PB_BYTES_ARRAY_T(32) ef_v1_EncryptionKey_key_t;
+typedef struct _ef_v1_EncryptionKey {
+    ef_v1_EncryptionAlgorithm algorithm;
+    ef_v1_EncryptionKey_key_t key;
+    char key_id[16]; /* first 4 bytes of SHA-256(key), hex; names the key in a file header */
+    bool present; /* false on a Delete reply: `key` is what was just destroyed */
+} ef_v1_EncryptionKey;
+
 typedef struct _ef_v1_Response {
     uint32_t corr_id;
     ef_v1_ErrorCode code;
@@ -746,18 +836,30 @@ typedef struct _ef_v1_Response {
         ef_v1_StateInfo state_info;
         ef_v1_Location location; /* reply to GetLocation */
         ef_v1_AuthChallenge auth_challenge; /* reply to GetAuthChallenge */
+        ef_v1_EncryptionKey encryption_key; /* reply to Get/Create/DeleteEncryptionKey */
     } body;
 } ef_v1_Response;
 
-typedef PB_BYTES_ARRAY_T(32) ef_v1_Authenticate_response_t;
-typedef struct _ef_v1_Authenticate {
-    ef_v1_Authenticate_response_t response;
-} ef_v1_Authenticate;
+/* Restore factory settings: password back to default, USB unlocked, encryption off,
+ wifi credentials and runtime state cleared.
 
-typedef struct _ef_v1_SetBlePassword {
-    char old_password[64];
-    char new_password[64];
-} ef_v1_SetBlePassword;
+ ⚠ It also DESTROYS the encryption key, which makes every recording ever written
+ under that key permanently undecryptable, including copies already uploaded
+ elsewhere. That is deliberate: while the reset preserved the key, a reset dropped
+ the password back to the default and the key could then simply be read out, so
+ physical access defeated encryption entirely. CreateEncryptionKey handing the key
+ to the operator once is what makes destroying it here acceptable.
+
+ Preserves the ADB-enable marker (it is the deploy channel; wiping it strands the
+ board).
+
+ Ungated on USB ONLY — physical possession is the credential, and that is the
+ forgot-password escape. Over BLE it requires auth like any other verb, because an
+ unauthenticated remote reset is now an unauthenticated remote way to destroy every
+ recording's key. */
+typedef struct _ef_v1_FactoryReset {
+    char dummy_field;
+} ef_v1_FactoryReset;
 
 /* ============================ Envelope ============================ */
 typedef struct _ef_v1_Request {
@@ -823,9 +925,15 @@ typedef struct _ef_v1_Request {
         ef_v1_SetCalibration set_calibration; /* write intrinsics (IDLE only, next session) */
         ef_v1_ResetCalibration reset_calibration; /* restore factory default (IDLE only) */
         /* auth / access control (BLE password is user-facing) */
-        ef_v1_GetAuthChallenge get_auth_challenge; /* device -> nonce (BLE auth handshake) */
-        ef_v1_Authenticate authenticate; /* prove the BLE password (HMAC over nonce) */
-        ef_v1_SetBlePassword set_ble_password; /* set/rekey; USB path may reset w/o old */
+        ef_v1_GetAuthChallenge get_auth_challenge; /* device -> nonce (auth handshake, both transports) */
+        ef_v1_Authenticate authenticate; /* prove the control password (HMAC over nonce) */
+        ef_v1_SetBlePassword set_ble_password; /* set/rekey; UNLOCKED usb may reset w/o old */
+        ef_v1_SetUsbLock set_usb_lock; /* lock/unlock USB; locked USB gates like BLE */
+        ef_v1_GetEncryptionKey get_encryption_key; /* read the video-encryption key (gated) */
+        ef_v1_FactoryReset factory_reset; /* forgot-password escape; ungated on USB only */
+        ef_v1_SetEncryption set_encryption; /* turn at-rest video encryption on/off */
+        ef_v1_CreateEncryptionKey create_encryption_key; /* generate a key; returned ONCE (gated) */
+        ef_v1_DeleteEncryptionKey delete_encryption_key; /* destroy the key (gated, key_id must match) */
     } body;
 } ef_v1_Request;
 
@@ -902,6 +1010,10 @@ extern "C" {
 #define _ef_v1_ImuData_MIN ef_v1_ImuData_IMU_RAW
 #define _ef_v1_ImuData_MAX ef_v1_ImuData_IMU_BOTH
 #define _ef_v1_ImuData_ARRAYSIZE ((ef_v1_ImuData)(ef_v1_ImuData_IMU_BOTH+1))
+
+#define _ef_v1_EncryptionAlgorithm_MIN ef_v1_EncryptionAlgorithm_ENC_ALG_UNSPECIFIED
+#define _ef_v1_EncryptionAlgorithm_MAX ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM
+#define _ef_v1_EncryptionAlgorithm_ARRAYSIZE ((ef_v1_EncryptionAlgorithm)(ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM+1))
 
 #define _ef_v1_StreamTarget_Kind_MIN ef_v1_StreamTarget_Kind_LOCAL
 #define _ef_v1_StreamTarget_Kind_MAX ef_v1_StreamTarget_Kind_ONLINE
@@ -1008,6 +1120,7 @@ extern "C" {
 
 
 #define ef_v1_DeviceInformation_rate_control_ENUMTYPE ef_v1_RateControl
+#define ef_v1_DeviceInformation_encryption_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
 
 
 
@@ -1017,6 +1130,16 @@ extern "C" {
 
 
 
+
+
+
+#define ef_v1_SetEncryption_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
+
+
+#define ef_v1_CreateEncryptionKey_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
+
+
+#define ef_v1_EncryptionKey_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
 
 
 
@@ -1038,7 +1161,7 @@ extern "C" {
 #define ef_v1_StartRecording_init_default        {"", _ef_v1_RecordingTarget_MIN, false, ef_v1_UploadSpec_init_default, false, ef_v1_Location_init_default}
 #define ef_v1_StopRecording_init_default         {""}
 #define ef_v1_GetRecordingStatus_init_default    {""}
-#define ef_v1_RecordingStatus_init_default       {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0}
+#define ef_v1_RecordingStatus_init_default       {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0}
 #define ef_v1_ListRecordings_init_default        {0}
 #define ef_v1_RecordingList_init_default         {0, {ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default}}
 #define ef_v1_DeleteRecording_init_default       {""}
@@ -1095,7 +1218,7 @@ extern "C" {
 #define ef_v1_GetState_init_default              {0}
 #define ef_v1_StateInfo_init_default             {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_default  {0}
-#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", ""}
+#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0}
 #define ef_v1_CapMode_init_default               {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_default          {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default}}
 #define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1106,6 +1229,13 @@ extern "C" {
 #define ef_v1_AuthChallenge_init_default         {{0, {0}}, {0, {0}}, 0}
 #define ef_v1_Authenticate_init_default          {{0, {0}}}
 #define ef_v1_SetBlePassword_init_default        {"", ""}
+#define ef_v1_SetUsbLock_init_default            {0, 0}
+#define ef_v1_SetEncryption_init_default         {0, _ef_v1_EncryptionAlgorithm_MIN}
+#define ef_v1_GetEncryptionKey_init_default      {0}
+#define ef_v1_CreateEncryptionKey_init_default   {_ef_v1_EncryptionAlgorithm_MIN}
+#define ef_v1_DeleteEncryptionKey_init_default   {""}
+#define ef_v1_EncryptionKey_init_default         {_ef_v1_EncryptionAlgorithm_MIN, {0, {0}}, "", 0}
+#define ef_v1_FactoryReset_init_default          {0}
 #define ef_v1_Request_init_zero                  {0, 0, {ef_v1_GetDeviceInformation_init_zero}}
 #define ef_v1_Response_init_zero                 {0, _ef_v1_ErrorCode_MIN, "", 0, {ef_v1_DeviceInformation_init_zero}}
 #define ef_v1_VideoConfig_init_zero              {0, 0, 0, _ef_v1_PixelFormat_MIN, _ef_v1_Codec_MIN, 0}
@@ -1123,7 +1253,7 @@ extern "C" {
 #define ef_v1_StartRecording_init_zero           {"", _ef_v1_RecordingTarget_MIN, false, ef_v1_UploadSpec_init_zero, false, ef_v1_Location_init_zero}
 #define ef_v1_StopRecording_init_zero            {""}
 #define ef_v1_GetRecordingStatus_init_zero       {""}
-#define ef_v1_RecordingStatus_init_zero          {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0}
+#define ef_v1_RecordingStatus_init_zero          {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0}
 #define ef_v1_ListRecordings_init_zero           {0}
 #define ef_v1_RecordingList_init_zero            {0, {ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero}}
 #define ef_v1_DeleteRecording_init_zero          {""}
@@ -1180,7 +1310,7 @@ extern "C" {
 #define ef_v1_GetState_init_zero                 {0}
 #define ef_v1_StateInfo_init_zero                {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_zero     {0}
-#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", ""}
+#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0}
 #define ef_v1_CapMode_init_zero                  {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_zero             {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero}}
 #define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1191,6 +1321,13 @@ extern "C" {
 #define ef_v1_AuthChallenge_init_zero            {{0, {0}}, {0, {0}}, 0}
 #define ef_v1_Authenticate_init_zero             {{0, {0}}}
 #define ef_v1_SetBlePassword_init_zero           {"", ""}
+#define ef_v1_SetUsbLock_init_zero               {0, 0}
+#define ef_v1_SetEncryption_init_zero            {0, _ef_v1_EncryptionAlgorithm_MIN}
+#define ef_v1_GetEncryptionKey_init_zero         {0}
+#define ef_v1_CreateEncryptionKey_init_zero      {_ef_v1_EncryptionAlgorithm_MIN}
+#define ef_v1_DeleteEncryptionKey_init_zero      {""}
+#define ef_v1_EncryptionKey_init_zero            {_ef_v1_EncryptionAlgorithm_MIN, {0, {0}}, "", 0}
+#define ef_v1_FactoryReset_init_zero             {0}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define ef_v1_VideoConfig_width_tag              1
@@ -1236,6 +1373,7 @@ extern "C" {
 #define ef_v1_RecordingStatus_bytes_tag          4
 #define ef_v1_RecordingStatus_frames_tag         5
 #define ef_v1_RecordingStatus_duration_ms_tag    6
+#define ef_v1_RecordingStatus_encrypted_tag      7
 #define ef_v1_RecordingList_recordings_tag       1
 #define ef_v1_DeleteRecording_name_tag           1
 #define ef_v1_DownloadRecording_name_tag         1
@@ -1397,6 +1535,12 @@ extern "C" {
 #define ef_v1_DeviceInformation_must_change_password_tag 20
 #define ef_v1_DeviceInformation_wifi_mac_tag     21
 #define ef_v1_DeviceInformation_bt_mac_tag       22
+#define ef_v1_DeviceInformation_usb_locked_tag   23
+#define ef_v1_DeviceInformation_encryption_enabled_tag 24
+#define ef_v1_DeviceInformation_encryption_key_present_tag 25
+#define ef_v1_DeviceInformation_encryption_key_id_tag 26
+#define ef_v1_DeviceInformation_encryption_algorithm_tag 27
+#define ef_v1_DeviceInformation_session_unlocked_tag 28
 #define ef_v1_SetCalibration_camera_tag          1
 #define ef_v1_SetCalibration_imu_tag             2
 #define ef_v1_ResetCalibration_camera_tag        1
@@ -1404,6 +1548,19 @@ extern "C" {
 #define ef_v1_AuthChallenge_nonce_tag            1
 #define ef_v1_AuthChallenge_salt_tag             2
 #define ef_v1_AuthChallenge_iters_tag            3
+#define ef_v1_Authenticate_response_tag          1
+#define ef_v1_SetBlePassword_old_password_tag    1
+#define ef_v1_SetBlePassword_new_password_tag    2
+#define ef_v1_SetUsbLock_locked_tag              1
+#define ef_v1_SetUsbLock_session_only_tag        2
+#define ef_v1_SetEncryption_enabled_tag          1
+#define ef_v1_SetEncryption_algorithm_tag        2
+#define ef_v1_CreateEncryptionKey_algorithm_tag  1
+#define ef_v1_DeleteEncryptionKey_key_id_tag     1
+#define ef_v1_EncryptionKey_algorithm_tag        1
+#define ef_v1_EncryptionKey_key_tag              2
+#define ef_v1_EncryptionKey_key_id_tag           3
+#define ef_v1_EncryptionKey_present_tag          4
 #define ef_v1_Response_corr_id_tag               1
 #define ef_v1_Response_code_tag                  2
 #define ef_v1_Response_message_tag               3
@@ -1426,9 +1583,7 @@ extern "C" {
 #define ef_v1_Response_state_info_tag            75
 #define ef_v1_Response_location_tag              76
 #define ef_v1_Response_auth_challenge_tag        92
-#define ef_v1_Authenticate_response_tag          1
-#define ef_v1_SetBlePassword_old_password_tag    1
-#define ef_v1_SetBlePassword_new_password_tag    2
+#define ef_v1_Response_encryption_key_tag        97
 #define ef_v1_Request_corr_id_tag                1
 #define ef_v1_Request_get_device_information_tag 10
 #define ef_v1_Request_configure_tag              11
@@ -1481,6 +1636,12 @@ extern "C" {
 #define ef_v1_Request_get_auth_challenge_tag     92
 #define ef_v1_Request_authenticate_tag           93
 #define ef_v1_Request_set_ble_password_tag       94
+#define ef_v1_Request_set_usb_lock_tag           96
+#define ef_v1_Request_get_encryption_key_tag     97
+#define ef_v1_Request_factory_reset_tag          98
+#define ef_v1_Request_set_encryption_tag         99
+#define ef_v1_Request_create_encryption_key_tag  100
+#define ef_v1_Request_delete_encryption_key_tag  101
 
 /* Struct field encoding specification for nanopb */
 #define ef_v1_Request_FIELDLIST(X, a) \
@@ -1535,7 +1696,13 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_calibration,body.set_calibration), 
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,reset_calibration,body.reset_calibration),  79) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_auth_challenge,body.get_auth_challenge),  92) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,authenticate,body.authenticate),  93) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_ble_password,body.set_ble_password),  94)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_ble_password,body.set_ble_password),  94) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_usb_lock,body.set_usb_lock),  96) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_encryption_key,body.get_encryption_key),  97) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,factory_reset,body.factory_reset),  98) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption,body.set_encryption),  99) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,create_encryption_key,body.create_encryption_key), 100) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,delete_encryption_key,body.delete_encryption_key), 101)
 #define ef_v1_Request_CALLBACK NULL
 #define ef_v1_Request_DEFAULT NULL
 #define ef_v1_Request_body_get_device_information_MSGTYPE ef_v1_GetDeviceInformation
@@ -1589,6 +1756,12 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_ble_password,body.set_ble_password)
 #define ef_v1_Request_body_get_auth_challenge_MSGTYPE ef_v1_GetAuthChallenge
 #define ef_v1_Request_body_authenticate_MSGTYPE ef_v1_Authenticate
 #define ef_v1_Request_body_set_ble_password_MSGTYPE ef_v1_SetBlePassword
+#define ef_v1_Request_body_set_usb_lock_MSGTYPE ef_v1_SetUsbLock
+#define ef_v1_Request_body_get_encryption_key_MSGTYPE ef_v1_GetEncryptionKey
+#define ef_v1_Request_body_factory_reset_MSGTYPE ef_v1_FactoryReset
+#define ef_v1_Request_body_set_encryption_MSGTYPE ef_v1_SetEncryption
+#define ef_v1_Request_body_create_encryption_key_MSGTYPE ef_v1_CreateEncryptionKey
+#define ef_v1_Request_body_delete_encryption_key_MSGTYPE ef_v1_DeleteEncryptionKey
 
 #define ef_v1_Response_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   corr_id,           1) \
@@ -1612,7 +1785,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,time_sync_reply,body.time_sync_reply), 
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,storage_info,body.storage_info),  74) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,state_info,body.state_info),  75) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,location,body.location),  76) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,auth_challenge,body.auth_challenge),  92)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,auth_challenge,body.auth_challenge),  92) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,encryption_key,body.encryption_key),  97)
 #define ef_v1_Response_CALLBACK NULL
 #define ef_v1_Response_DEFAULT NULL
 #define ef_v1_Response_body_device_information_MSGTYPE ef_v1_DeviceInformation
@@ -1634,6 +1808,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,auth_challenge,body.auth_challenge),  9
 #define ef_v1_Response_body_state_info_MSGTYPE ef_v1_StateInfo
 #define ef_v1_Response_body_location_MSGTYPE ef_v1_Location
 #define ef_v1_Response_body_auth_challenge_MSGTYPE ef_v1_AuthChallenge
+#define ef_v1_Response_body_encryption_key_MSGTYPE ef_v1_EncryptionKey
 
 #define ef_v1_VideoConfig_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   width,             1) \
@@ -1749,7 +1924,8 @@ X(a, STATIC,   SINGULAR, BOOL,     recording,         2) \
 X(a, STATIC,   SINGULAR, UENUM,    target,            3) \
 X(a, STATIC,   SINGULAR, UINT64,   bytes,             4) \
 X(a, STATIC,   SINGULAR, UINT64,   frames,            5) \
-X(a, STATIC,   SINGULAR, UINT64,   duration_ms,       6)
+X(a, STATIC,   SINGULAR, UINT64,   duration_ms,       6) \
+X(a, STATIC,   SINGULAR, BOOL,     encrypted,         7)
 #define ef_v1_RecordingStatus_CALLBACK NULL
 #define ef_v1_RecordingStatus_DEFAULT NULL
 
@@ -2125,7 +2301,13 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  caps,             15) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  wifi,             17) \
 X(a, STATIC,   SINGULAR, BOOL,     must_change_password,  20) \
 X(a, STATIC,   SINGULAR, STRING,   wifi_mac,         21) \
-X(a, STATIC,   SINGULAR, STRING,   bt_mac,           22)
+X(a, STATIC,   SINGULAR, STRING,   bt_mac,           22) \
+X(a, STATIC,   SINGULAR, BOOL,     usb_locked,       23) \
+X(a, STATIC,   SINGULAR, BOOL,     encryption_enabled,  24) \
+X(a, STATIC,   SINGULAR, BOOL,     encryption_key_present,  25) \
+X(a, STATIC,   SINGULAR, STRING,   encryption_key_id,  26) \
+X(a, STATIC,   SINGULAR, UENUM,    encryption_algorithm,  27) \
+X(a, STATIC,   SINGULAR, BOOL,     session_unlocked,  28)
 #define ef_v1_DeviceInformation_CALLBACK NULL
 #define ef_v1_DeviceInformation_DEFAULT NULL
 #define ef_v1_DeviceInformation_camera_MSGTYPE ef_v1_CameraIntrinsics
@@ -2220,6 +2402,46 @@ X(a, STATIC,   SINGULAR, STRING,   new_password,      2)
 #define ef_v1_SetBlePassword_CALLBACK NULL
 #define ef_v1_SetBlePassword_DEFAULT NULL
 
+#define ef_v1_SetUsbLock_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     locked,            1) \
+X(a, STATIC,   SINGULAR, BOOL,     session_only,      2)
+#define ef_v1_SetUsbLock_CALLBACK NULL
+#define ef_v1_SetUsbLock_DEFAULT NULL
+
+#define ef_v1_SetEncryption_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
+X(a, STATIC,   SINGULAR, UENUM,    algorithm,         2)
+#define ef_v1_SetEncryption_CALLBACK NULL
+#define ef_v1_SetEncryption_DEFAULT NULL
+
+#define ef_v1_GetEncryptionKey_FIELDLIST(X, a) \
+
+#define ef_v1_GetEncryptionKey_CALLBACK NULL
+#define ef_v1_GetEncryptionKey_DEFAULT NULL
+
+#define ef_v1_CreateEncryptionKey_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UENUM,    algorithm,         1)
+#define ef_v1_CreateEncryptionKey_CALLBACK NULL
+#define ef_v1_CreateEncryptionKey_DEFAULT NULL
+
+#define ef_v1_DeleteEncryptionKey_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   key_id,            1)
+#define ef_v1_DeleteEncryptionKey_CALLBACK NULL
+#define ef_v1_DeleteEncryptionKey_DEFAULT NULL
+
+#define ef_v1_EncryptionKey_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UENUM,    algorithm,         1) \
+X(a, STATIC,   SINGULAR, BYTES,    key,               2) \
+X(a, STATIC,   SINGULAR, STRING,   key_id,            3) \
+X(a, STATIC,   SINGULAR, BOOL,     present,           4)
+#define ef_v1_EncryptionKey_CALLBACK NULL
+#define ef_v1_EncryptionKey_DEFAULT NULL
+
+#define ef_v1_FactoryReset_FIELDLIST(X, a) \
+
+#define ef_v1_FactoryReset_CALLBACK NULL
+#define ef_v1_FactoryReset_DEFAULT NULL
+
 extern const pb_msgdesc_t ef_v1_Request_msg;
 extern const pb_msgdesc_t ef_v1_Response_msg;
 extern const pb_msgdesc_t ef_v1_VideoConfig_msg;
@@ -2305,6 +2527,13 @@ extern const pb_msgdesc_t ef_v1_GetAuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_AuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_Authenticate_msg;
 extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
+extern const pb_msgdesc_t ef_v1_SetUsbLock_msg;
+extern const pb_msgdesc_t ef_v1_SetEncryption_msg;
+extern const pb_msgdesc_t ef_v1_GetEncryptionKey_msg;
+extern const pb_msgdesc_t ef_v1_CreateEncryptionKey_msg;
+extern const pb_msgdesc_t ef_v1_DeleteEncryptionKey_msg;
+extern const pb_msgdesc_t ef_v1_EncryptionKey_msg;
+extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define ef_v1_Request_fields &ef_v1_Request_msg
@@ -2392,6 +2621,13 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_AuthChallenge_fields &ef_v1_AuthChallenge_msg
 #define ef_v1_Authenticate_fields &ef_v1_Authenticate_msg
 #define ef_v1_SetBlePassword_fields &ef_v1_SetBlePassword_msg
+#define ef_v1_SetUsbLock_fields &ef_v1_SetUsbLock_msg
+#define ef_v1_SetEncryption_fields &ef_v1_SetEncryption_msg
+#define ef_v1_GetEncryptionKey_fields &ef_v1_GetEncryptionKey_msg
+#define ef_v1_CreateEncryptionKey_fields &ef_v1_CreateEncryptionKey_msg
+#define ef_v1_DeleteEncryptionKey_fields &ef_v1_DeleteEncryptionKey_msg
+#define ef_v1_EncryptionKey_fields &ef_v1_EncryptionKey_msg
+#define ef_v1_FactoryReset_fields &ef_v1_FactoryReset_msg
 
 /* Maximum encoded size of messages (where known) */
 #define EF_V1_EF_PB_H_MAX_SIZE                   ef_v1_Response_size
@@ -2405,12 +2641,17 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_ChunkUploadStatus_size             3011
 #define ef_v1_ChunkUrl_size                      2056
 #define ef_v1_Configure_size                     56
+#define ef_v1_CreateEncryptionKey_size           2
+#define ef_v1_DeleteEncryptionKey_size           17
 #define ef_v1_DeleteRecording_size               65
-#define ef_v1_DeviceInformation_size             1848
+#define ef_v1_DeviceInformation_size             1881
 #define ef_v1_DownloadRecording_size             82
+#define ef_v1_EncryptionKey_size                 55
+#define ef_v1_FactoryReset_size                  0
 #define ef_v1_GetAuthChallenge_size              0
 #define ef_v1_GetChunkUploadStatus_size          65
 #define ef_v1_GetDeviceInformation_size          0
+#define ef_v1_GetEncryptionKey_size              0
 #define ef_v1_GetHealthStatus_size               0
 #define ef_v1_GetLocation_size                   0
 #define ef_v1_GetOtaStatus_size                  0
@@ -2440,8 +2681,8 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_PutChunks_size                     6242
 #define ef_v1_Reboot_size                        0
 #define ef_v1_RecordingChunk_size                7184
-#define ef_v1_RecordingList_size                 4992
-#define ef_v1_RecordingStatus_size               102
+#define ef_v1_RecordingList_size                 5088
+#define ef_v1_RecordingStatus_size               104
 #define ef_v1_Request_size                       7194
 #define ef_v1_ResetCalibration_size              4
 #define ef_v1_Response_size                      7454
@@ -2449,10 +2690,12 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 #define ef_v1_SessionManifest_size               6721
 #define ef_v1_SetBlePassword_size                130
 #define ef_v1_SetCalibration_size                428
+#define ef_v1_SetEncryption_size                 4
 #define ef_v1_SetLocation_size                   38
 #define ef_v1_SetOtaConfig_size                  522
 #define ef_v1_SetSetting_size                    11
 #define ef_v1_SetTime_size                       11
+#define ef_v1_SetUsbLock_size                    4
 #define ef_v1_SettingValue_size                  13
 #define ef_v1_StartHealthCheck_size              2
 #define ef_v1_StartRecording_size                2162

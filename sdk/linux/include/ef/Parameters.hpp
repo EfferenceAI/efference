@@ -47,7 +47,9 @@ public:
     // infer it over BLE). Empty udp_host = control-only BLE session (stays IDLE).
     std::string udp_host;
     uint16_t    udp_port = 5005;
-    std::string ble_password = "123456";   // BLE control password (factory default)
+    // The device CONTROL password, not BLE-only: it also unlocks a locked USB
+    // link. Name kept for source compatibility. Factory default "123456".
+    std::string ble_password = "123456";
 
     // ---- session configuration (applied at open(); capture auto-starts) -----
     RESOLUTION       resolution  = RESOLUTION::AUTO;

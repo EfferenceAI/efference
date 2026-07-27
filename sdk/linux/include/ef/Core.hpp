@@ -168,6 +168,24 @@ struct WifiNetwork {
     bool        secured = false; // true = encrypted (WPA/WPA2/WPA3)
 };
 
+// Cipher a key is for, and that a recording was written with. Carried explicitly
+// so the format is not pigeonholed to one algorithm; UNSPECIFIED means "device
+// default" on a request, and AES-256-GCM in a file written before the field.
+enum class ENCRYPTION_ALGORITHM {
+    UNSPECIFIED = 0,
+    AES_256_GCM = 1,
+};
+
+// The device's at-rest video key. `key` is populated only by the two calls that
+// hand it over (create/get, and delete returning what it destroyed); elsewhere the
+// device reports `key_id` alone, which names a key without revealing it.
+struct EncryptionKey {
+    ENCRYPTION_ALGORITHM algorithm = ENCRYPTION_ALGORITHM::UNSPECIFIED;
+    std::vector<uint8_t> key;       // 32 bytes for AES-256-GCM
+    std::string          key_id;    // first 4 bytes of SHA-256(key), hex
+    bool                 present = false;   // false from delete: `key` is the destroyed copy
+};
+
 // For device discovery
 struct DeviceProperties {
     INPUT_TYPE input_type = INPUT_TYPE::USB;
@@ -193,6 +211,19 @@ struct DeviceInformation {
     SensorsConfiguration sensors_configuration;
     WirelessConfiguration wireless;
     Capabilities         capabilities;   // enabled capture modes + codecs (device CAPS)
+    // Access + at-rest state. Reported on the ungated GetDeviceInformation, so a
+    // host can read these before authenticating and know what it is dealing with.
+    bool usb_locked         = false;  // USB gates like BLE; authenticate first
+    // Read WITH usb_locked, not instead: the policy is still locked, but gated
+    // verbs answer without a password until re-locked or power is lost.
+    bool session_unlocked   = false;
+    bool encryption_enabled = false;  // new recordings will be encrypted
+    // Whether a key exists, and which one. encryption_enabled cannot be turned on
+    // without a key; the id names the key a recording was written under, so an
+    // operator can tell which of their saved keys opens a given file.
+    bool        encryption_key_present = false;
+    std::string encryption_key_id;    // "" when absent; never the key itself
+    ENCRYPTION_ALGORITHM encryption_algorithm = ENCRYPTION_ALGORITHM::UNSPECIFIED;
 };
 
 
@@ -287,6 +318,10 @@ struct RecordingStatus {
     uint64_t         bytes       = 0;
     uint64_t         frames      = 0;
     uint64_t         duration_ms = 0;
+    // Stored segments are AES-256-GCM encrypted. The device reports what is
+    // actually on disk (it reads the container magic), so this is right even for
+    // sessions recorded before the setting was last changed.
+    bool             encrypted   = false;
 
     // Device storage (free/total space for continued recording).
     uint64_t storage_free_bytes  = 0;

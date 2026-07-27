@@ -76,9 +76,15 @@ message Request {
     SetCalibration       set_calibration        = 78;  // write intrinsics (IDLE only, next session)
     ResetCalibration     reset_calibration      = 79;  // restore factory default (IDLE only)
     // auth / access control (BLE password is user-facing)
-    GetAuthChallenge     get_auth_challenge     = 92;  // device -> nonce (BLE auth handshake)
-    Authenticate         authenticate           = 93;  // prove the BLE password (HMAC over nonce)
-    SetBlePassword       set_ble_password       = 94;  // set/rekey; USB path may reset w/o old
+    GetAuthChallenge     get_auth_challenge     = 92;  // device -> nonce (auth handshake, both transports)
+    Authenticate         authenticate           = 93;  // prove the control password (HMAC over nonce)
+    SetBlePassword       set_ble_password       = 94;  // set/rekey; UNLOCKED usb may reset w/o old
+    SetUsbLock           set_usb_lock           = 96;  // lock/unlock USB; locked USB gates like BLE
+    GetEncryptionKey     get_encryption_key     = 97;  // read the video-encryption key (gated)
+    FactoryReset         factory_reset          = 98;  // forgot-password escape; ungated on USB only
+    SetEncryption        set_encryption         = 99;  // turn at-rest video encryption on/off
+    CreateEncryptionKey  create_encryption_key  = 100; // generate a key; returned ONCE (gated)
+    DeleteEncryptionKey  delete_encryption_key  = 101; // destroy the key (gated, key_id must match)
   }
   reserved 90, 91, 95;
 }
@@ -107,6 +113,7 @@ message Response {
     StateInfo         state_info         = 75;
     Location          location           = 76;  // reply to GetLocation
     AuthChallenge     auth_challenge     = 92;  // reply to GetAuthChallenge
+    EncryptionKey     encryption_key     = 97;  // reply to Get/Create/DeleteEncryptionKey
   }
   reserved 95;
 }
@@ -206,6 +213,10 @@ message GetRecordingStatus { string name = 1; }
 message RecordingStatus {
   string name = 1; bool recording = 2; RecordingTarget target = 3;
   uint64 bytes = 4; uint64 frames = 5; uint64 duration_ms = 6;
+  // Whether the stored segments are AES-256-GCM encrypted. Determined by reading
+  // the container magic off a segment, not from metadata, so it stays true for
+  // files written by an older build and cannot drift from what is on disk.
+  bool encrypted = 7;
 }
 message ListRecordings  {}
 message RecordingList   { repeated RecordingStatus recordings = 1; }
@@ -353,6 +364,13 @@ message DeviceInformation {
   bool         must_change_password   = 20;  // BLE password is still the factory default (123456)
   string       wifi_mac               = 21;  // WiFi MAC from vendor storage (item 2), "" if unprovisioned
   string       bt_mac                 = 22;  // BT MAC from vendor storage (item 4), "" if unprovisioned
+  bool         usb_locked             = 23;  // USB gates like BLE; host must authenticate before gated verbs
+  bool         encryption_enabled     = 24;  // new recordings will be encrypted
+  bool         encryption_key_present = 25;  // a key exists; encryption cannot be enabled without one
+  string       encryption_key_id      = 26;  // "" when absent; names the key a recording was written under
+  EncryptionAlgorithm encryption_algorithm = 27;  // the installed key's cipher (UNSPECIFIED if none)
+  // Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only.
+  bool         session_unlocked       = 28;
 }
 // Hardware capability menu, mirrors device.json (generated from CAPS[]).
 message CapMode { uint32 width = 1; uint32 height = 2; uint32 fps = 3; string binning = 4; bool usable = 5; }
@@ -404,4 +422,75 @@ message AuthChallenge    { bytes nonce = 1;                            // 32-byt
                            bytes salt = 2; uint32 iters = 3; }         // KDF params so host derives the key
 message Authenticate     { bytes response = 1; }                       // HMAC-SHA256(PBKDF2(pw,salt,iters), nonce)
 message SetBlePassword   { string old_password = 1; string new_password = 2; }
+
+// USB access control. Unlocked (factory default) USB has full privileges, matching
+// today's behavior. Locked, a USB session is gated exactly like a BLE one: only
+// info, state, storage, the auth handshake, and FactoryReset answer without a
+// password. Toggling either way requires the current password.
+// session_only scopes it to this power session: {locked=false} opens a device that
+// is ALREADY locked (refused otherwise) until re-locked from either transport or
+// power is lost, and usb_locked stays true throughout. USB only, and never set
+// implicitly by Authenticate. Omitted = the persistent behavior.
+message SetUsbLock       { bool locked = 1; bool session_only = 2; }
+// Which cipher a key is for, and which one a recording was written with. Carried
+// explicitly from the start so the format is not pigeonholed to one algorithm; the
+// container header spends a byte on the same id.
+enum EncryptionAlgorithm {
+  ENC_ALG_UNSPECIFIED = 0;   // "device default" on a request; AES_256_GCM in a file
+  ENC_ALG_AES_256_GCM = 1;
+}
+
+// Turn at-rest video encryption on or off for SUBSEQUENT recordings; existing
+// ones keep whatever they were written with. Enabling with no key is refused, so a
+// session can never silently record unencrypted after being told to encrypt.
+// `algorithm` must be one the device implements. Read the current state from
+// DeviceInformation.encryption_enabled.
+message SetEncryption    { bool enabled = 1; EncryptionAlgorithm algorithm = 2; }
+
+// ---- key lifecycle ----
+// The device generates its own key and returns it ONCE, at creation. The operator
+// keeps that copy; the device keeps a working copy that a factory reset destroys.
+// Custody therefore moves to the operator at creation time, and there is no state
+// in which the device holds a key nobody else has.
+//
+// All three are gated on the control password (unlocked USB is trusted, as ever).
+message GetEncryptionKey    {}
+// Refused when a key already exists: replacing one would make every recording
+// written under it permanently undecryptable, so rotation is delete-then-create,
+// two deliberate steps rather than one that can be typed by accident.
+message CreateEncryptionKey { EncryptionAlgorithm algorithm = 1; }   // 0 = device default
+// `key_id` must match the installed key. The guard lives here rather than only in
+// the CLI so an SDK or BLE caller cannot destroy a key it never identified. The
+// reply carries the destroyed key's bytes with present=false, which is the last
+// chance to keep it for ciphertext already recorded under it.
+//
+// IDLE-only, like FactoryReset: a running session holds the key in memory and
+// would keep encrypting under it, so the device would report the key destroyed
+// and then finish writing a recording that needs exactly that key.
+message DeleteEncryptionKey { string key_id = 1; }
+message EncryptionKey {
+  EncryptionAlgorithm algorithm = 1;
+  bytes  key      = 2;
+  string key_id   = 3;   // first 4 bytes of SHA-256(key), hex; names the key in a file header
+  bool   present  = 4;   // false on a Delete reply: `key` is what was just destroyed
+}
+
+// Restore factory settings: password back to default, USB unlocked, encryption off,
+// wifi credentials and runtime state cleared.
+//
+// ⚠ It also DESTROYS the encryption key, which makes every recording ever written
+// under that key permanently undecryptable, including copies already uploaded
+// elsewhere. That is deliberate: while the reset preserved the key, a reset dropped
+// the password back to the default and the key could then simply be read out, so
+// physical access defeated encryption entirely. CreateEncryptionKey handing the key
+// to the operator once is what makes destroying it here acceptable.
+//
+// Preserves the ADB-enable marker (it is the deploy channel; wiping it strands the
+// board).
+//
+// Ungated on USB ONLY — physical possession is the credential, and that is the
+// forgot-password escape. Over BLE it requires auth like any other verb, because an
+// unauthenticated remote reset is now an unauthenticated remote way to destroy every
+// recording's key.
+message FactoryReset     {}
 
