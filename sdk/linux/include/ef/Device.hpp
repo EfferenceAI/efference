@@ -115,6 +115,9 @@ public:
     ERROR_CODE delete_recording(const std::string& name);
 
     // Pull a device recording over the control link (USB/BLE, no WiFi needed).
+    // A failed run leaves the partial file at dest_path — not a valid .mcap
+    // until a run returns SUCCESS — and a re-run resumes it after verifying it
+    // belongs to this recording.
     ERROR_CODE download_recording(const std::string& name,
                                   const std::string& dest_path);
 

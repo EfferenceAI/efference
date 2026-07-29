@@ -33,6 +33,7 @@
 
 #include <fcntl.h>     // O_EXCL: never overwrite an existing key file
 #include <sys/stat.h>  // stat: tell a local bundle from a URL before dispatching
+#include <termios.h>   // hidden password prompt
 #include <unistd.h>   // isatty
 
 #include <ef/Device.hpp>
@@ -116,6 +117,7 @@ void usage() {
         "                                    BLE always and on USB once locked\n"
         "  --udp <host[:port]>               with --ble: device streams video+IMU to\n"
         "                                    this host over WiFi/UDP (default port 5005)\n"
+        "  --verbose                         print the control-plane traffic\n"
         "\n"
         "commands:\n"
         "  list [--scan-ble]                 discover devices (USB, and BLE with --scan-ble)\n"
@@ -129,6 +131,9 @@ void usage() {
         "                                    published as metadata; --rectify on|off toggles\n"
         "                                    on-device FEC rectification, default off, needs FEC fw;\n"
         "                                    --fov-scale sets the rectified FOV, default 1.0, <1 wider)\n"
+        "  calibration --camera [--rectify on|off] [--fov-scale <s>]\n"
+        "                                    change only those flags, keeping the stored\n"
+        "                                    intrinsics (no need to retype --set)\n"
         "  calibration --imu --mode <raw|calibrated|both>\n"
         "                                    select on-device IMU handling for the session\n"
         "                                    (calibrated applies M*S*(x-b) per sample)\n"
@@ -152,7 +157,8 @@ void usage() {
         "  update --url <url>                update from an explicit URL (no service call)\n"
         "  update --file <update.eff>        update from a local bundle over USB\n"
         "  abort-update                      cancel an update in progress\n"
-        "  wifi add <ssid> <psk> [country]   provision a WiFi network (\"US\" unlocks 5 GHz)\n"
+        "  wifi add <ssid> [psk [country]]   provision WiFi (quote an SSID with spaces;\n"
+        "                                    omit <psk> for a hidden prompt; \"US\" unlocks 5 GHz)\n"
         "  wifi remove <ssid> | select <ssid>\n"
         "  wifi list                         saved networks (marks the connected one)\n"
         "  wifi scan                         access points in range (not while recording)\n"
@@ -165,7 +171,9 @@ void usage() {
         "  encryption on|off                 AES-256 encrypt new recordings\n"
         "  encryption create                 generate the key; SHOWN ONCE, keep it\n"
         "  encryption delete                 show the key and how to destroy it\n"
-        "  encryption delete --confirm <id>  destroy it (recordings become unreadable)\n"
+        "  encryption delete --confirm <id> [--yes]\n"
+        "                                    destroy it (recordings become unreadable);\n"
+        "                                    --yes is required without a terminal\n"
         "  key show [--out <file>]           print the key, or write it to a 0600 file\n"
         "  factory-reset [--yes]             defaults + unlock; DESTROYS the encryption key\n"
         "  sync-time                         set the device clock from the host\n"
@@ -180,7 +188,10 @@ void usage() {
 bool di_locked_unauth(const Device& dev) {
     if (dev.is_authenticated()) return false;
     const DeviceInformation& i = dev.get_device_information();
-    return i.usb_locked || i.input_type == INPUT_TYPE::STREAM;
+    // A session-unlocked device answers gated verbs without a password, so the
+    // "only info/state/storage" warning would be false there.
+    return (i.usb_locked && !i.session_unlocked) ||
+           i.input_type == INPUT_TYPE::STREAM;
 }
 
 // `detail` is whoever refused saying why (the device, or the update service): the
@@ -401,10 +412,13 @@ void print_info(const DeviceInformation& i) {
                 i.encryption_enabled ? "ON (new recordings encrypted)" : "off");
     // The key_id, never the key: it is how an operator matches a device against
     // the copy they saved, and how they tell which key opens a given recording.
-    if (i.encryption_key_present)
-        std::printf("encryption key   : %s (AES-256-GCM)\n", i.encryption_key_id.c_str());
-    else
+    // The id is a gated field: present is readable pre-auth, the id is not.
+    if (!i.encryption_key_present)
         std::printf("encryption key   : none (run 'encryption create')\n");
+    else if (i.encryption_key_id.empty())
+        std::printf("encryption key   : present (password required for id)\n");
+    else
+        std::printf("encryption key   : %s (AES-256-GCM)\n", i.encryption_key_id.c_str());
 }
 
 // Parse "LAT,LON[,ALT]" into a Location (exception-free). Returns false on any
@@ -434,8 +448,24 @@ bool parse_location(const std::string& s, Location& loc) {
 void print_recording(const RecordingStatus& r, bool show_target = true) {
     std::printf("%-24s ", r.name.c_str());
     if (show_target) std::printf("%-12s ", to_string(r.target));
-    std::printf("%s  %.1f MB, %llu frames, %llu ms",
+    // The stop reason qualifies "complete": e.g. "complete (disk full)".
+    // UNSPECIFIED (in progress, or firmware/recordings predating the field)
+    // prints nothing extra.
+    const char* why = "";
+    switch (r.stopped_reason) {
+        case STOP_REASON::DISK_FULL:   why = " (disk full)"; break;
+        case STOP_REASON::WRITE_ERROR: why = " (write error)"; break;
+        // r.partial: an unrepaired torso served as-is (decrypts with a
+        // truncated-tail warning) — say so rather than implying a finalized file.
+        case STOP_REASON::INTERRUPTED:
+            why = r.partial ? " (partial: recovered after power loss)"
+                            : " (recovered after power loss)";
+            break;
+        default: break;
+    }
+    std::printf("%s%s  %.1f MB, %llu frames, %llu ms",
                 r.recording ? "RECORDING" : "complete",
+                r.recording ? "" : why,
                 r.bytes / (1024.0 * 1024.0), (unsigned long long)r.frames,
                 (unsigned long long)r.duration_ms);
     std::printf("  %s", r.encrypted ? "[encrypted]" : "[unencrypted]");
@@ -450,6 +480,45 @@ void print_recording(const RecordingStatus& r, bool show_target = true) {
         std::printf("storage: %llu / %llu MiB free\n",
                     (unsigned long long)(r.storage_free_bytes >> 20),
                     (unsigned long long)(r.storage_total_bytes >> 20));
+}
+
+// Read a secret from the terminal, echoing '*' per keystroke (backspace edits,
+// Ctrl-C/Ctrl-D cancels -> false). Piped stdin falls back to a plain line read.
+// The prompt and echo go to stderr so stdout stays clean for scripting.
+bool prompt_secret(const char* prompt, std::string& out) {
+    out.clear();
+    std::fprintf(stderr, "%s", prompt);
+    if (!isatty(STDIN_FILENO)) {
+        int c;
+        while ((c = std::fgetc(stdin)) != EOF && c != '\n') out.push_back((char)c);
+        return !out.empty() || c == '\n';
+    }
+    termios saved{};
+    if (tcgetattr(STDIN_FILENO, &saved) != 0) return false;
+    termios raw = saved;
+    // ISIG off too: ^C is read as a byte and handled as cancel, so the terminal
+    // is always restored (a signal mid-prompt would leave echo disabled).
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    bool ok = true;
+    for (;;) {
+        char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) { ok = false; break; }
+        if (c == '\n' || c == '\r') break;
+        if (c == 3 || c == 4) { ok = false; break; }   // ^C / ^D
+        if (c == 0x7f || c == '\b') {
+            if (!out.empty()) { out.pop_back(); std::fputs("\b \b", stderr); }
+        } else if ((unsigned char)c >= 0x20) {
+            out.push_back(c);
+            std::fputc('*', stderr);
+        }
+    }
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    std::fputc('\n', stderr);
+    if (!ok) out.clear();
+    return ok;
 }
 
 }  // namespace
@@ -516,7 +585,13 @@ int main(int argc, char** argv) {
     // ---- everything else talks to one device ---------------------------------
     Device dev;
     ERROR_CODE ec = dev.open(init);
-    if (ec != ERROR_CODE::SUCCESS) return fail(ec, "open");
+    if (ec != ERROR_CODE::SUCCESS)
+        // One control client per cable: a second USB open is refused, not queued.
+        return fail(ec, "open",
+                    ec == ERROR_CODE::DEVICE_BUSY
+                        ? "device is in use by another process; close the other "
+                          "SDK app / ef-cli, or reach it over BLE (--ble)"
+                        : "");
 
     // The library keeps quiet about a refused password (no stderr from a lib);
     // the CLI is where a human is, so warn here instead.
@@ -842,7 +917,10 @@ int main(int argc, char** argv) {
         }
         if (sub == "delete" && args.size() > 2) {
             ec = dev.delete_recording(args[2]);
-            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "record delete");
+            // Surface the device's own refusal text ("recording is live; stop
+            // it first") instead of a bare code.
+            if (ec != ERROR_CODE::SUCCESS)
+                return fail(ec, "record delete", dev.last_error_message());
             std::printf("deleted '%s'\n", args[2].c_str());
             return 0;
         }
@@ -994,8 +1072,46 @@ int main(int argc, char** argv) {
     }
     if (cmd == "wifi" && args.size() > 1) {
         const std::string& sub = args[1];
-        if (sub == "add" && args.size() > 3)
-            ec = dev.wifi_add(args[2], args[3], args.size() > 4 ? args[4] : "");
+        if (sub == "add" && args.size() > 2) {
+            // A word count that can't be <ssid> <psk> [country] is almost always
+            // an unquoted SSID with spaces shifting the password into the wrong
+            // slot; name the fix rather than mis-provisioning the device.
+            const char* quote_hint =
+                "  (an SSID with spaces must be quoted: "
+                "ef-cli wifi add \"My Network\" <password>)\n";
+            if (args.size() > 5) {
+                std::fprintf(stderr, "wifi add: too many arguments\n%s", quote_hint);
+                return 2;
+            }
+            if (args.size() == 5) {
+                const std::string& c = args[4];
+                bool cc = c.size() >= 2 && c.size() <= 3;
+                for (char ch : c)
+                    if (!std::isalnum((unsigned char)ch)) cc = false;
+                if (!cc) {
+                    std::fprintf(stderr,
+                                 "wifi add: '%s' is not a country code (2-3 letters, e.g. US)\n%s",
+                                 c.c_str(), quote_hint);
+                    return 2;
+                }
+            }
+            std::string psk;
+            if (args.size() == 3) {   // ssid only: ask, echoing '*' per keystroke
+                if (!prompt_secret("WiFi password: ", psk)) {
+                    std::fprintf(stderr, "wifi add: cancelled\n");
+                    return 1;
+                }
+            } else {
+                psk = args[3];
+            }
+            // WPA-PSK passphrases are 8-63 chars; the device would accept the
+            // store write and then fail the association with a bare timeout.
+            if (psk.size() < 8 || psk.size() > 63) {
+                std::fprintf(stderr, "wifi add: password must be 8-63 characters\n");
+                return 2;
+            }
+            ec = dev.wifi_add(args[2], psk, args.size() > 4 ? args[4] : "");
+        }
         else if (sub == "remove" && args.size() > 2) ec = dev.wifi_remove(args[2]);
         else if (sub == "select" && args.size() > 2) ec = dev.wifi_select(args[2]);
         else if (sub == "status") {

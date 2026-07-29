@@ -1,8 +1,10 @@
 /* ef-decrypt — turn an encrypted recording back into the plain container.
  *
- * The whole format lives in rec/enc_sink.{c,h}; this is only a CLI around
- * enc_decrypt_fd(), so there is exactly one implementation of the format and the
- * device and host can never disagree about it.
+ * The format implementation is the firmware's rec/enc_sink.{c,h}, VENDORED
+ * into tools/vendor/ at a pinned firmware revision (provenance + hashes in
+ * vendor/README.md); this is only a CLI around enc_decrypt_fd(). Divergence
+ * is possible after a firmware-side format change until the vendored copy is
+ * refreshed — the vendor README's hash check is what catches it.
  *
  * Exit codes mirror enc_decrypt_fd's three outcomes, because "truncated" is a
  * normal result for a recording cut short by power loss and must not look like
@@ -78,8 +80,14 @@ int main(int argc, char **argv) {
             (unsigned long long)info.chunks, info.chunk_bytes);
     fprintf(stderr, "plaintext : %llu bytes -> %s\n",
             (unsigned long long)info.plain_bytes, argv[3]);
-    if (!info.clean_eof)
-        fprintf(stderr, "WARNING   : no end marker; file was truncated. "
-                        "Everything above decrypted and verified.\n");
+    if (!info.clean_eof) {
+        if (info.tag_failed)
+            fprintf(stderr, "WARNING   : chunk %llu failed authentication (corrupt or "
+                            "tampered ciphertext). Everything above decrypted and verified.\n",
+                    (unsigned long long)info.chunks);
+        else
+            fprintf(stderr, "WARNING   : no end marker; file was truncated. "
+                            "Everything above decrypted and verified.\n");
+    }
     return rc == 0 ? 0 : 1;
 }

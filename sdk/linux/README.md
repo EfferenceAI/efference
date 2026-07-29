@@ -53,10 +53,14 @@ root, in increasing order of commitment:
 ```sh
 sdk/linux/build/ef-cli info     # run it by its full path; nothing to set up
 source env.sh                   # add ef-cli to PATH for this shell, then: ef-cli info
-sdk/linux/build.sh --install    # copy ef-cli to /usr/local/bin, on PATH for every shell (sudo)
+sdk/linux/build.sh --install    # put ef-cli on PATH for every shell (sudo)
 ```
 
-`--install` copies the binary rather than linking it, so re-run it after every
+`--install` places `ef-cli` and `ef-decrypt` on PATH, and installs the library,
+its headers, and the calibration shared objects so `find_package(ef)` works.
+`efference-viewer` is **not** installed: run it from `sdk/linux/build/` by path.
+
+It copies binaries rather than linking them, so re-run it after every
 rebuild. A plain `./build.sh` writes only to `sdk/linux/build/`, and an `ef-cli`
 installed earlier goes on running the older code without complaining. If you are
 changing the SDK and rebuilding often, `source env.sh` puts `build/` on PATH
@@ -119,9 +123,11 @@ commands
                                  start a device-local (eMMC) recording (survives host disconnect;
                                  --location overrides the LocationFix for this recording only)
   record stop                    stop the current device recording
-  record status [name]           session status (+ storage + upload)
+  record status [name]           session status (+ storage + upload); says why a completed
+                                 session ended, e.g. "complete (disk full)"
   record list                    list device recordings (each marked [encrypted]/[unencrypted])
-  record delete <name>           delete a device recording
+  record delete <name>           delete a device recording (returns immediately;
+                                 large files are reclaimed in the background)
   download <name> [dest]         pull a recording over USB/BLE (default <name>.mcap)
   upload <name> <url>            device uploads a recording to a pre-signed URL (over WiFi)
   stop-upload <name>             cancel a running upload
@@ -130,7 +136,8 @@ commands
   update --url <url>             update from an explicit URL, skipping the service
   update --file <update.eff>     update from a local bundle, pushed over USB
   abort-update                   cancel an update in progress
-  wifi add <ssid> <psk> [country]  save + connect a WiFi network (country = ISO regdomain code)
+  wifi add <ssid> [psk [country]]  save + connect a WiFi network (quote an SSID with spaces;
+                                   omit <psk> for a hidden prompt; country = ISO code)
   wifi select <ssid>               force a specific saved network (overrides the auto-best pick)
   wifi list                        list saved networks (marks the connected one)
   wifi remove <ssid>               forget a saved network (disconnects it if it's the current one)
@@ -158,7 +165,7 @@ commands
 ### `efference-viewer`: live viewer
 
 ```text
-efference-viewer [--codec raw|h264|h265|h264hq|h265hq] [--ble MAC] [--password PW] [--udp HOST[:PORT]] [--flip on|off|auto] [--headless]
+efference-viewer [--codec raw|h264|h265|h264hq|h265hq] [--h264|--h265] [--ble MAC] [--password PW] [--udp HOST[:PORT]] [--flip on|off|auto] [--headless|--no-window]
 ```
 Opens an OpenCV window with the decoded video; a status bar above the video
 shows the live frame number and the latest **IMU values** (accel m/s², gyro
@@ -166,6 +173,9 @@ rad/s), and the same values are echoed to the console once per second. `--flip o
 180° host-side (for an upside-down camera; `auto` decides from the IMU). `Q`,
 `Esc`, window-close, or `Ctrl-C` quit. (A 3-D IMU orientation gizmo is on the
 [roadmap](#roadmap).)
+
+`--h264` and `--h265` are shorthand for the matching `--codec`. Run
+`efference-viewer --help` for the current flag list.
 
 `--headless` (alias `--no-window`) skips the window and just holds the session,
 printing a once-per-second heartbeat. Pair it with `--udp <host>` to make the
@@ -186,6 +196,11 @@ applies its own).
 
 USB isoc video is sized to the negotiated link speed automatically (SuperSpeed
 32 KB/interval, high-speed 1 KB); live streaming works at both.
+
+USB control is **one client per cable**: while an SDK app or `ef-cli` holds the
+device open, a second USB open is refused with `DEVICE_BUSY` ("in use by another
+process"). BLE stays available in parallel, so a long-running USB app does not
+lock an operator out of the device.
 
 ---
 
@@ -295,7 +310,7 @@ corruption:
 | Exit | Meaning |
 |---|---|
 | 0 | Clean: the end marker was present and every chunk verified. |
-| 1 | Truncated, or a chunk failed its tag. Everything written before that point is valid and is kept. |
+| 1 | Truncated, or a chunk failed its tag. Everything written before that point is valid and is kept. The warning says which happened: a clean early end reads as truncation (normal after power loss), a failed tag as corrupt or tampered ciphertext. |
 | 2 | Unusable input: bad header, wrong key, an algorithm this build does not implement, or I/O failure. No output file is left behind. |
 
 A wrong key is caught at the header rather than as a wall of failing chunks, and
@@ -321,7 +336,11 @@ The first form is there so you can still save the key if you need to read old
 recordings. The device requires the `key_id` to match, so an SDK caller cannot
 destroy a key it never identified either, and it refuses unless the device is
 idle: a running session holds the key in memory and would otherwise keep writing
-under a key the device had just reported destroyed.
+under a key the device had just reported destroyed. That idle check is advisory
+(there is no lease): a recording started in the instant between the check and
+the destruction still writes under the destroyed key, which stays readable only
+by whoever saved the delete reply. Don't race `record start` against
+`encryption delete`.
 
 Both destructive commands prompt for typed confirmation on a terminal. With no
 terminal (`ssh box 'ef-cli …'`, cron, redirected stdin) they **refuse** instead of
@@ -375,6 +394,21 @@ ef-cli record list                 # clip1  bytes=…  frames=…  dur=…  + re
 ef-cli download clip1 clip1.mcap   # over the USB/BLE control plane
 ```
 
+A recording runs until `record stop`, storage reaches the device's reserve
+(10% of the recording store; the session then finalizes cleanly on its own), or
+power is lost. After a power loss the device recovers the interrupted recording
+on its next boot: everything flushed up to ~250 ms before the cut is salvaged
+into a normal, listed, downloadable `.mcap` (device firmware >= v00.09.16).
+Encrypted recordings interrupted by power loss cannot be repaired on the device
+(the ciphertext is opaque to it), so they are listed as
+`partial: recovered after power loss` and served as-is: `download` and `upload`
+move the partial bytes, and `ef-decrypt` recovers everything up to the cut with
+a truncated-tail warning (exit 1); see "Reading an encrypted recording".
+
+`record status`/`record list` report why a completed session ended
+(`RecordingStatus::stopped_reason`: USER, DISK_FULL, WRITE_ERROR, or
+INTERRUPTED for a power-loss recovery; firmware >= v00.09.16).
+
 **Live view over the USB wire**
 ```sh
 efference-viewer --codec h265           # live H.265 1200p30 in an OpenCV window
@@ -392,6 +426,8 @@ ef-cli wifi scan                   # see nearby APs (strongest first) before pic
 ef-cli wifi add homenet hunter2 US # save + connect (optional 3rd arg = ISO regdomain code)
 ef-cli wifi add cafe pass123       # add more, all saved nets sit at equal priority, so the
                                # device auto-connects to the best AP in range
+ef-cli wifi add "My iPhone"        # SSIDs with spaces need quotes; with no <psk> on the
+                               # command line the password is typed at a hidden prompt
 ef-cli wifi select cafe            # choose a specific saved network (overrides the auto-best pick)
 ef-cli wifi status                 # association + IP
 ef-cli info                        # device snapshot, also lists every saved network

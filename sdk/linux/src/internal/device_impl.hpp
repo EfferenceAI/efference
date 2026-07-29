@@ -199,8 +199,10 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         case Ctx::RECORDING:
             switch (c) {
                 case ef_v1_ErrorCode_NOT_FOUND:         return ERROR_CODE::RECORDING_NOT_FOUND;
+                // delete of the session that is recording right now; retry
+                // after stop (same shape as the WIFI-context BUSY).
+                case ef_v1_ErrorCode_BUSY:              return ERROR_CODE::DEVICE_BUSY;
                 case ef_v1_ErrorCode_INVALID_PARAMETER:
-                case ef_v1_ErrorCode_BUSY:
                 case ef_v1_ErrorCode_INVALID_STATE:     return ERROR_CODE::INVALID_FUNCTION_CALL;
                 default:                                return ERROR_CODE::SESSION_RECORDING_ERROR;
             }
@@ -256,6 +258,8 @@ inline ERROR_CODE open_err(Status s) {
         case Status::NO_STREAM:        return ERROR_CODE::CANNOT_START_CAMERA_STREAM;
         // libusb EACCES on open/claim, the actionable udev/permissions case.
         case Status::INSUFFICIENT_PERMISSIONS: return ERROR_CODE::INSUFFICIENT_PERMISSIONS;
+        // Interface claim refused: another client already has the device open.
+        case Status::BUSY:             return ERROR_CODE::DEVICE_BUSY;
         default:                       return ERROR_CODE::DEVICE_NOT_AVAILABLE;
     }
 }

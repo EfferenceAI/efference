@@ -205,6 +205,16 @@ enum class UPLOAD_STATE {
     OFF     = 1,
 };
 
+// Why a device-local recording session ended. UNSPECIFIED for in-progress
+// sessions and recordings made by firmware that predates the field.
+enum class STOP_REASON {
+    UNSPECIFIED = 0,
+    USER        = 1,   // explicit stop
+    DISK_FULL   = 2,   // storage reserve reached; finalized cleanly
+    WRITE_ERROR = 3,   // sink write error ended the session
+    INTERRUPTED = 4,   // power loss / crash; recovered at next boot
+};
+
 // Firmware update phases. New values are appended; 0-3 keep their values.
 enum class UPDATE_STATE {
     DOWNLOADING    = 0,
@@ -244,6 +254,7 @@ const char* to_string(MEM);
 const char* to_string(MOTION_STATE);
 const char* to_string(RECORDING_TARGET);
 const char* to_string(UPLOAD_STATE);
+const char* to_string(STOP_REASON);
 const char* to_string(UPDATE_STATE);
 const char* to_string(MAT_TYPE);
 

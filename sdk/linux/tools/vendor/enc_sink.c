@@ -388,6 +388,7 @@ int enc_decrypt_fd(int in_fd, int out_fd, const uint8_t key[ENC_KEY_BYTES],
             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
                                 ENC_TAG_BYTES, tag) != 1 ||
             EVP_DecryptFinal_ex(ctx, pt + outl, &tmpl) != 1) {
+            info->tag_failed = 1;
             rc = 1; break;                            /* tag failed */
         }
 

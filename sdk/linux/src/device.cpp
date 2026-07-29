@@ -256,6 +256,13 @@ ERROR_CODE Device::open(InitParameters params) {
         auto ble = std::unique_ptr<internal::BleConnection>(
             new internal::BleConnection(params.verbose));
         Status st = ble->open(params.ble_address);
+        if (st == Status::DEVICE_NOT_FOUND) {
+            // A fresh adapter can miss the advert in the first discovery window;
+            // one clean rebuild-and-retry absorbs that without masking a device
+            // that is genuinely gone.
+            ble.reset(new internal::BleConnection(params.verbose));
+            st = ble->open(params.ble_address);
+        }
         if (st != Status::SUCCESS) return open_err(st);
         {
             std::lock_guard<std::mutex> lk(impl_->ctl_mtx);

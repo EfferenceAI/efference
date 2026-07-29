@@ -210,6 +210,16 @@ message StartRecording {
 }
 message StopRecording      { string name = 1; }   // empty => current
 message GetRecordingStatus { string name = 1; }
+// Why a session stopped. UNSPECIFIED for in-progress sessions and recordings
+// made by firmware that predates the field.
+enum StopReason {
+  STOP_UNSPECIFIED = 0;
+  STOP_USER        = 1;  // explicit stop
+  STOP_DISK_FULL   = 2;  // storage reserve reached; finalized cleanly
+  STOP_WRITE_ERROR = 3;  // sink write error ended the session
+  STOP_INTERRUPTED = 4;  // power loss / crash; recovered at next boot
+}
+
 message RecordingStatus {
   string name = 1; bool recording = 2; RecordingTarget target = 3;
   uint64 bytes = 4; uint64 frames = 5; uint64 duration_ms = 6;
@@ -217,13 +227,20 @@ message RecordingStatus {
   // the container magic off a segment, not from metadata, so it stays true for
   // files written by an older build and cannot drift from what is on disk.
   bool encrypted = 7;
+  StopReason stopped_reason = 8;
+  // True when a segment survives only as an unrepaired power-loss torso (an
+  // encrypted .partial file salvage cannot rebuild): the bytes download/upload
+  // as-is and decrypt with a truncated-tail warning. False from firmware that
+  // predates the field.
+  bool partial = 9;
 }
 message ListRecordings  {}
 message RecordingList   { repeated RecordingStatus recordings = 1; }
 message DeleteRecording { string name = 1; }
 // Pull a device-local recording to the host over the control plane, mirroring the
 // OTA push (chunk-over-transport, no networking). Host loops offset->EOF; each reply
-// carries up to 7168 B of the .mcap plus the total size and an eof flag.
+// carries up to 7168 B of the recording (a finalized .mcap, or an unrepaired
+// power-loss partial served as-is) plus the total size and an eof flag.
 message DownloadRecording { string name = 1; uint64 offset = 2; uint32 len = 3; }
 message RecordingChunk    { bytes  data = 1; uint64 total = 2; bool   eof = 3; }
 

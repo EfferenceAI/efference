@@ -116,8 +116,11 @@ Status StreamReader::start(int device_index, bool want_video, bool want_imu,
     libusb_set_auto_detach_kernel_driver(handle_, 1);
     rc = libusb_claim_interface(handle_, iface_);
     if (rc < 0) {
+        // Same EBUSY split as the control interface (usb_connection.cpp): a
+        // second client is "busy", not "unavailable".
         Status ec = (rc == LIBUSB_ERROR_ACCESS) ? Status::INSUFFICIENT_PERMISSIONS
-                                                    : Status::CLAIM_FAILED;
+                  : (rc == LIBUSB_ERROR_BUSY)   ? Status::BUSY
+                                                : Status::CLAIM_FAILED;
         libusb_close(handle_); handle_ = nullptr; libusb_exit(ctx_); ctx_ = nullptr;
         iface_ = -1; return ec;
     }

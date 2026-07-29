@@ -316,7 +316,7 @@ Status BleConnection::open(const std::string& address) {
     dev_path_ = device_path(adapter_, address);
 
     // If BlueZ doesn't know the device yet (no prior scan), discover it, so
-    // `ef-ctl --addr` self-connects cold without a manual `bluetoothctl connect`.
+    // `ef-cli --ble` self-connects cold without a manual `bluetoothctl connect`.
     if (!device_known()) {
         if (verbose_) fprintf(stderr, "[ble] %s unknown; discovering...\n",
                               address.c_str());
@@ -336,7 +336,10 @@ Status BleConnection::open(const std::string& address) {
     // progress so it doesn't look hung.
     if (verbose_) fprintf(stderr, "[ble] %s known; connecting (may take a few seconds)...\n",
                           address.c_str());
-    if (!connect_with_retry()) return Status::DEVICE_NOT_FOUND;
+    // Exhausted connects mean the device WAS advertising but would not link:
+    // that is "detected, unavailable", not "not found" — and keeping the codes
+    // distinct is what lets Device::open retry only the missed-advert case.
+    if (!connect_with_retry()) return Status::BLE_ERROR;
     if (verbose_) fprintf(stderr, "[ble] link up; resolving GATT services...\n");
 
     GVariant* r = nullptr;

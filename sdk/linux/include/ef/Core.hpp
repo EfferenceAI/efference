@@ -322,6 +322,13 @@ struct RecordingStatus {
     // actually on disk (it reads the container magic), so this is right even for
     // sessions recorded before the setting was last changed.
     bool             encrypted   = false;
+    // Why the session ended (UNSPECIFIED while recording or for sessions made
+    // by firmware that predates the field).
+    STOP_REASON      stopped_reason = STOP_REASON::UNSPECIFIED;
+    // A segment survives only as an unrepaired power-loss torso: download/upload
+    // serve the bytes as-is and ef-decrypt recovers them with a truncated-tail
+    // warning. Always false from firmware that predates the field.
+    bool             partial = false;
 
     // Device storage (free/total space for continued recording).
     uint64_t storage_free_bytes  = 0;

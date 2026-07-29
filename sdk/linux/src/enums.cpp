@@ -201,6 +201,16 @@ const char* to_string(UPLOAD_STATE s) {
     return s == UPLOAD_STATE::RUNNING ? "RUNNING" : "OFF";
 }
 
+const char* to_string(STOP_REASON r) {
+    switch (r) {
+        case STOP_REASON::USER:        return "USER";
+        case STOP_REASON::DISK_FULL:   return "DISK_FULL";
+        case STOP_REASON::WRITE_ERROR: return "WRITE_ERROR";
+        case STOP_REASON::INTERRUPTED: return "INTERRUPTED";
+        default:                       return "UNSPECIFIED";
+    }
+}
+
 const char* to_string(UPDATE_STATE s) {
     switch (s) {
         case UPDATE_STATE::DOWNLOADING:    return "DOWNLOADING";

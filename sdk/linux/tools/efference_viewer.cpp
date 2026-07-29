@@ -38,19 +38,36 @@ using namespace ef;
 static volatile std::sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
 
-// ./efference-viewer [--codec raw|h264|h265|h264hq|h265hq] [--h264|--h265] [--ble MAC] [--password PW] [--udp HOST[:PORT]] [--flip on|off|auto] [--headless]
-// (--h264/--h265 are shorthands for --codec h264/h265.)
-// Rectification is done on-device (see `ef calibration --camera --rectify`); the
-// viewer just displays the delivered frames.
-// --headless (alias --no-window): open the session and hold it, no OpenCV window.
-// Use it to command the device to push video+IMU to a --udp target (a remote
-// host) without a local display; --flip is a host-side display transform and has
-// no effect on the forwarded stream, so the receiver applies its own flip.
+// Flags live in usage() below, which --help prints. Not repeated here: a second
+// copy is how the README came to claim this tool had no --help.
+//
+// --flip is a host-side display transform only. It does not touch the stream sent
+// to a --udp target, so a remote receiver applies its own.
+static void usage(const char* argv0) {
+    std::printf(
+        "usage: %s [options]\n"
+        "\n"
+        "  --codec raw|h264|h265|h264hq|h265hq   stream codec (default h265)\n"
+        "  --h264 | --h265                       shorthand for the matching --codec\n"
+        "  --ble <MAC>                           connect over Bluetooth instead of USB\n"
+        "  --password <pw>                       control password, default 123456\n"
+        "  --udp <host[:port]>                   device forwards video+IMU here over WiFi\n"
+        "  --flip on|off|auto                    rotate the display 180 (auto reads the IMU)\n"
+        "  --headless, --no-window               hold the session without an OpenCV window\n"
+        "\n"
+        "Rectification is on-device: see `ef-cli calibration --camera --rectify`.\n"
+        "Q, Esc, closing the window, or Ctrl-C quits.\n", argv0);
+}
+
 int main(int argc, char** argv) {
     InitParameters init;
     bool headless = false;
     bool flip_set = false;
     for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
+            usage(argv[0]);
+            return 0;
+        }
         if (!std::strcmp(argv[i], "--h265")) init.compression = COMPRESSION_MODE::H265;
         else if (!std::strcmp(argv[i], "--h264")) init.compression = COMPRESSION_MODE::H264;
         else if (!std::strcmp(argv[i], "--codec") && i + 1 < argc) {
@@ -88,6 +105,7 @@ int main(int argc, char** argv) {
             headless = true;
         } else {
             std::fprintf(stderr, "unknown or malformed argument '%s'\n", argv[i]);
+            usage(argv[0]);
             return 2;
         }
     }

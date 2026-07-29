@@ -31,7 +31,7 @@ for complete setup and usage guides, or browse the
 [API reference](https://docs.efference.ai/api/device).
 
 The SDK currently targets Linux and requires C++17, CMake 3.16 or newer,
-`pkg-config`, and `libusb-1.0`.
+`pkg-config`, `libusb-1.0`, and `libcurl`.
 
 ```sh
 git clone https://github.com/EfferenceAI/efference.git
@@ -61,6 +61,17 @@ same password that already gates Bluetooth LE. Both are off on a factory device:
 ./sdk/linux/build/ef-cli encryption on
 ./sdk/linux/build/ef-cli lock on             # USB now needs --password too
 ```
+
+Encrypted recordings come off the device as `.enc`, so keep that key: reading one
+back needs `ef-decrypt`, which the same build produces.
+
+```sh
+./sdk/linux/build/ef-decrypt <in.enc> <key-file> <out>   # key: 32 raw bytes or 64 hex chars
+```
+
+The build also produces `efference-viewer`, a live video and IMU window. Both it
+and `ef-decrypt` build only when their optional dependencies are present, and the
+configure output says which were found.
 
 For installation, device setup, transports, examples, and the complete CLI
 reference, visit **[docs.efference.ai](https://docs.efference.ai)**.

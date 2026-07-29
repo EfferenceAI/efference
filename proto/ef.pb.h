@@ -151,6 +151,16 @@ typedef enum _ef_v1_ImuData {
     ef_v1_ImuData_IMU_BOTH = 2
 } ef_v1_ImuData;
 
+/* Why a session stopped. UNSPECIFIED for in-progress sessions and recordings
+ made by firmware that predates the field. */
+typedef enum _ef_v1_StopReason {
+    ef_v1_StopReason_STOP_UNSPECIFIED = 0,
+    ef_v1_StopReason_STOP_USER = 1, /* explicit stop */
+    ef_v1_StopReason_STOP_DISK_FULL = 2, /* storage reserve reached; finalized cleanly */
+    ef_v1_StopReason_STOP_WRITE_ERROR = 3, /* sink write error ended the session */
+    ef_v1_StopReason_STOP_INTERRUPTED = 4 /* power loss / crash; recovered at next boot */
+} ef_v1_StopReason;
+
 /* Which cipher a key is for, and which one a recording was written with. Carried
  explicitly from the start so the format is not pigeonholed to one algorithm; the
  container header spends a byte on the same id. */
@@ -263,6 +273,12 @@ typedef struct _ef_v1_RecordingStatus {
  the container magic off a segment, not from metadata, so it stays true for
  files written by an older build and cannot drift from what is on disk. */
     bool encrypted;
+    ef_v1_StopReason stopped_reason;
+    /* True when a segment survives only as an unrepaired power-loss torso (an
+ encrypted .partial file salvage cannot rebuild): the bytes download/upload
+ as-is and decrypt with a truncated-tail warning. False from firmware that
+ predates the field. */
+    bool partial;
 } ef_v1_RecordingStatus;
 
 typedef struct _ef_v1_ListRecordings {
@@ -280,7 +296,8 @@ typedef struct _ef_v1_DeleteRecording {
 
 /* Pull a device-local recording to the host over the control plane, mirroring the
  OTA push (chunk-over-transport, no networking). Host loops offset->EOF; each reply
- carries up to 7168 B of the .mcap plus the total size and an eof flag. */
+ carries up to 7168 B of the recording (a finalized .mcap, or an unrepaired
+ power-loss partial served as-is) plus the total size and an eof flag. */
 typedef struct _ef_v1_DownloadRecording {
     char name[64];
     uint64_t offset;
@@ -1011,6 +1028,10 @@ extern "C" {
 #define _ef_v1_ImuData_MAX ef_v1_ImuData_IMU_BOTH
 #define _ef_v1_ImuData_ARRAYSIZE ((ef_v1_ImuData)(ef_v1_ImuData_IMU_BOTH+1))
 
+#define _ef_v1_StopReason_MIN ef_v1_StopReason_STOP_UNSPECIFIED
+#define _ef_v1_StopReason_MAX ef_v1_StopReason_STOP_INTERRUPTED
+#define _ef_v1_StopReason_ARRAYSIZE ((ef_v1_StopReason)(ef_v1_StopReason_STOP_INTERRUPTED+1))
+
 #define _ef_v1_EncryptionAlgorithm_MIN ef_v1_EncryptionAlgorithm_ENC_ALG_UNSPECIFIED
 #define _ef_v1_EncryptionAlgorithm_MAX ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM
 #define _ef_v1_EncryptionAlgorithm_ARRAYSIZE ((ef_v1_EncryptionAlgorithm)(ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM+1))
@@ -1053,6 +1074,7 @@ extern "C" {
 
 
 #define ef_v1_RecordingStatus_target_ENUMTYPE ef_v1_RecordingTarget
+#define ef_v1_RecordingStatus_stopped_reason_ENUMTYPE ef_v1_StopReason
 
 
 
@@ -1161,7 +1183,7 @@ extern "C" {
 #define ef_v1_StartRecording_init_default        {"", _ef_v1_RecordingTarget_MIN, false, ef_v1_UploadSpec_init_default, false, ef_v1_Location_init_default}
 #define ef_v1_StopRecording_init_default         {""}
 #define ef_v1_GetRecordingStatus_init_default    {""}
-#define ef_v1_RecordingStatus_init_default       {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0}
+#define ef_v1_RecordingStatus_init_default       {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0, _ef_v1_StopReason_MIN, 0}
 #define ef_v1_ListRecordings_init_default        {0}
 #define ef_v1_RecordingList_init_default         {0, {ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default, ef_v1_RecordingStatus_init_default}}
 #define ef_v1_DeleteRecording_init_default       {""}
@@ -1253,7 +1275,7 @@ extern "C" {
 #define ef_v1_StartRecording_init_zero           {"", _ef_v1_RecordingTarget_MIN, false, ef_v1_UploadSpec_init_zero, false, ef_v1_Location_init_zero}
 #define ef_v1_StopRecording_init_zero            {""}
 #define ef_v1_GetRecordingStatus_init_zero       {""}
-#define ef_v1_RecordingStatus_init_zero          {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0}
+#define ef_v1_RecordingStatus_init_zero          {"", 0, _ef_v1_RecordingTarget_MIN, 0, 0, 0, 0, _ef_v1_StopReason_MIN, 0}
 #define ef_v1_ListRecordings_init_zero           {0}
 #define ef_v1_RecordingList_init_zero            {0, {ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero, ef_v1_RecordingStatus_init_zero}}
 #define ef_v1_DeleteRecording_init_zero          {""}
@@ -1374,6 +1396,8 @@ extern "C" {
 #define ef_v1_RecordingStatus_frames_tag         5
 #define ef_v1_RecordingStatus_duration_ms_tag    6
 #define ef_v1_RecordingStatus_encrypted_tag      7
+#define ef_v1_RecordingStatus_stopped_reason_tag 8
+#define ef_v1_RecordingStatus_partial_tag        9
 #define ef_v1_RecordingList_recordings_tag       1
 #define ef_v1_DeleteRecording_name_tag           1
 #define ef_v1_DownloadRecording_name_tag         1
@@ -1925,7 +1949,9 @@ X(a, STATIC,   SINGULAR, UENUM,    target,            3) \
 X(a, STATIC,   SINGULAR, UINT64,   bytes,             4) \
 X(a, STATIC,   SINGULAR, UINT64,   frames,            5) \
 X(a, STATIC,   SINGULAR, UINT64,   duration_ms,       6) \
-X(a, STATIC,   SINGULAR, BOOL,     encrypted,         7)
+X(a, STATIC,   SINGULAR, BOOL,     encrypted,         7) \
+X(a, STATIC,   SINGULAR, UENUM,    stopped_reason,    8) \
+X(a, STATIC,   SINGULAR, BOOL,     partial,           9)
 #define ef_v1_RecordingStatus_CALLBACK NULL
 #define ef_v1_RecordingStatus_DEFAULT NULL
 
@@ -2681,8 +2707,8 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_PutChunks_size                     6242
 #define ef_v1_Reboot_size                        0
 #define ef_v1_RecordingChunk_size                7184
-#define ef_v1_RecordingList_size                 5088
-#define ef_v1_RecordingStatus_size               104
+#define ef_v1_RecordingList_size                 5280
+#define ef_v1_RecordingStatus_size               108
 #define ef_v1_Request_size                       7194
 #define ef_v1_ResetCalibration_size              4
 #define ef_v1_Response_size                      7454

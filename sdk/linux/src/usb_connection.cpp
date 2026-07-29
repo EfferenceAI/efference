@@ -134,8 +134,11 @@ Status UsbConnection::open(int device_index, int verbose) {
     libusb_set_auto_detach_kernel_driver(handle_, 1);
     rc = libusb_claim_interface(handle_, iface_);
     if (rc < 0) {
+        // EBUSY = another process holds the SDK interface (one control client per
+        // cable); distinct from the device being absent or unreadable.
         Status ec = (rc == LIBUSB_ERROR_ACCESS) ? Status::INSUFFICIENT_PERMISSIONS
-                                                    : Status::CLAIM_FAILED;
+                  : (rc == LIBUSB_ERROR_BUSY)   ? Status::BUSY
+                                                : Status::CLAIM_FAILED;
         close();
         return ec;
     }

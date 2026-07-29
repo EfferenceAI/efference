@@ -132,6 +132,8 @@ struct enc_dec_info {
     uint64_t chunks;        /* chunks successfully verified */
     uint64_t plain_bytes;
     int      clean_eof;     /* 1 if the final-chunk marker was seen */
+    int      tag_failed;    /* 1 if a chunk failed authentication; clean_eof==0 without
+                             * this means the ciphertext simply ends early (truncation) */
     uint8_t  algorithm;     /* id from the header; 0 == AES-256-GCM (pre-field file) */
     char     key_id[ENC_KEY_ID_STRLEN];   /* "" when the file predates the field */
 };

@@ -1,2 +1,4 @@
-# ef-smoke-test.sh capture artifacts (regenerated each run, fixed names)
+# Smoke-test capture artifacts (regenerated each run, fixed names). Kept here as
+# well as at the repo root: they were once written relative to the working
+# directory, so they can still turn up under sdk/linux/ from an older run.
 efsmoke_grab.*

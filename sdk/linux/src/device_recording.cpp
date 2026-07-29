@@ -113,6 +113,14 @@ void recording_from_wire(const WireRecording& s, RecordingStatus* out) {
     out->frames      = s.frames;
     out->duration_ms = s.duration_ms;
     out->encrypted   = s.encrypted;
+    // Out-of-range wire values (a future firmware's new reason) degrade to
+    // UNSPECIFIED rather than aliasing an existing reason.
+    out->stopped_reason =
+        (s.stopped_reason >= ef_v1_StopReason_STOP_USER &&
+         s.stopped_reason <= ef_v1_StopReason_STOP_INTERRUPTED)
+            ? (STOP_REASON)s.stopped_reason
+            : STOP_REASON::UNSPECIFIED;
+    out->partial = s.partial;
 }
 
 }  // namespace
@@ -255,28 +263,83 @@ ERROR_CODE Device::download_recording(const std::string& name,
         if (!found) return ERROR_CODE::RECORDING_NOT_FOUND;
     }
 
-    std::FILE* f = std::fopen(dest_path.c_str(), "wb");
-    if (!f) return ERROR_CODE::SESSION_RECORDING_ERROR;
-
     // Pull loop, mirror of the OTA sideload push: request a window at each offset,
     // device returns up to 7168 B per response, loop to eof. Rides the control
     // transport (USB or BLE) like every verb, so no WiFi needed.
+    //
+    // Fault tolerance: a ~10 GiB file is ~1.5 M round trips, and one stalled
+    // chunk used to discard the whole partial. Each chunk now retries with
+    // backoff, and a partial file left by an earlier failure resumes at its
+    // size — after proving identity by re-fetching the first chunk and
+    // comparing it against the local prefix, so a same-named re-recording is
+    // never spliced onto stale bytes. The device side is a stateless pread at
+    // the requested offset, so both behaviors work against any firmware that
+    // has the verb. Cost of the retries: an abort via close() fails ~1 s
+    // slower than before (the retries burn out against the closed transport).
     const uint32_t kChunk = (uint32_t)sizeof(ef_v1_RecordingChunk{}.data.bytes);  // 7168
+    const int kChunkRetries = 4;
+
+    // Retry ONLY the transient stall (COMMUNICATION_ERROR): a permanent code
+    // (recording gone, auth, closed device) re-fails identically, and retrying
+    // INVALID_PASSWORD would re-run the auth handshake once per attempt.
+    // Worst-case added latency at a real stall: 2.5 s of backoff.
+    auto fetch = [&](uint64_t off, WireResponse& resp) -> ERROR_CODE {
+        ERROR_CODE ec = ERROR_CODE::SUCCESS;
+        for (int a = 0; a <= kChunkRetries; a++) {
+            if (a) std::this_thread::sleep_for(std::chrono::milliseconds(250 * a));
+            WireRequest req = ef_v1_Request_init_zero;
+            req.which_body = ef_v1_Request_download_recording_tag;
+            std::snprintf(req.body.download_recording.name,
+                          sizeof req.body.download_recording.name, "%s", name.c_str());
+            req.body.download_recording.offset = off;
+            req.body.download_recording.len    = kChunk;
+            ec = impl_->call(req, resp, ef_v1_Response_recording_chunk_tag,
+                             Ctx::RECORDING);
+            if (ec != ERROR_CODE::COMMUNICATION_ERROR) return ec;
+        }
+        return ec;
+    };
+
+    // Resume decision: an existing partial resumes only when it proves identity
+    // (a full first chunk matching the live file byte-for-byte — the static
+    // metadata block carries session timestamps, so distinct recordings diverge
+    // inside chunk 0) AND is not longer than the live file (a longer "partial"
+    // is from some other file; appending would return SUCCESS on an over-long
+    // splice). Anything else starts clean over the old file.
     uint64_t offset = 0;
+    uint64_t total = 0;  // device-reported size, from the last chunk seen
+    bool append = false;
+    if (std::FILE* old = std::fopen(dest_path.c_str(), "rb")) {
+        uint8_t head[sizeof(ef_v1_RecordingChunk{}.data.bytes)];
+        size_t have = std::fread(head, 1, sizeof head, old);
+        std::fseek(old, 0, SEEK_END);
+        long old_size = std::ftell(old);
+        std::fclose(old);
+        if (have == sizeof head && old_size > 0) {
+            WireResponse resp;
+            ERROR_CODE ec = fetch(0, resp);
+            if (ec != ERROR_CODE::SUCCESS) return ec;
+            const ef_v1_RecordingChunk& c = resp.body.recording_chunk;
+            if (c.data.size == sizeof head &&
+                (uint64_t)old_size <= c.total &&
+                std::memcmp(c.data.bytes, head, sizeof head) == 0) {
+                offset = (uint64_t)old_size;
+                append = true;
+            }
+        }
+    }
+
+    std::FILE* f = std::fopen(dest_path.c_str(), append ? "ab" : "wb");
+    if (!f) return ERROR_CODE::SESSION_RECORDING_ERROR;
+
     ERROR_CODE result = ERROR_CODE::SUCCESS;
     for (;;) {
-        WireRequest req = ef_v1_Request_init_zero;
-        req.which_body = ef_v1_Request_download_recording_tag;
-        std::snprintf(req.body.download_recording.name,
-                      sizeof req.body.download_recording.name, "%s", name.c_str());
-        req.body.download_recording.offset = offset;
-        req.body.download_recording.len    = kChunk;
         WireResponse resp;
-        ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_recording_chunk_tag,
-                                    Ctx::RECORDING);
+        ERROR_CODE ec = fetch(offset, resp);
         if (ec != ERROR_CODE::SUCCESS) { result = ec; break; }
 
         const ef_v1_RecordingChunk& c = resp.body.recording_chunk;
+        total = c.total;
         if (c.data.size) {
             if (std::fwrite(c.data.bytes, 1, c.data.size, f) != c.data.size) {
                 result = ERROR_CODE::SESSION_RECORDING_ERROR;
@@ -288,7 +351,12 @@ ERROR_CODE Device::download_recording(const std::string& name,
         if (c.data.size == 0) { result = ERROR_CODE::COMMUNICATION_ERROR; break; }  // no progress, not eof
     }
     std::fclose(f);
-    if (result != ERROR_CODE::SUCCESS) std::remove(dest_path.c_str());   // no partial files
+    // SUCCESS means the local file is the whole recording. total==0 tolerated
+    // for firmware that never fills the field.
+    if (result == ERROR_CODE::SUCCESS && total && offset != total)
+        result = ERROR_CODE::SESSION_RECORDING_ERROR;
+    // The partial is kept on failure so a re-run resumes it (see above); a
+    // failed download's file is not a valid .mcap until a run returns SUCCESS.
     return result;
 }
 
