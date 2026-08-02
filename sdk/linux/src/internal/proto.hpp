@@ -44,7 +44,7 @@ namespace proto {
 constexpr uint8_t  MAGIC          = 0xEF;
 constexpr uint8_t  VERSION        = 1;
 constexpr uint32_t HDR_LEN        = 12;
-constexpr uint32_t MAX_PAYLOAD    = 8192;  // == EFR_CTL_MSG_MAX
+constexpr uint32_t MAX_PAYLOAD    = 8192;  // matches the device's control-message cap
 constexpr uint32_t MAX_FRAME      = HDR_LEN + MAX_PAYLOAD;
 
 enum Type : uint8_t {

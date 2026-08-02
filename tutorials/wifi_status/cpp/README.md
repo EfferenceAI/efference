@@ -30,7 +30,10 @@ else
 ```
 
 Association is asynchronous, so just after provisioning the snapshot may still
-read disconnected; re-open (or re-run) for a fresh one.
+read disconnected. Call `refresh_device_information()` for a fresh one, then read
+`get_device_information()` **again** — it returns by value, so the `wifi` reference
+above is a copy of the old snapshot and does not follow the refresh. Re-opening
+works too but is the long way round.
 
 ## Build and run
 

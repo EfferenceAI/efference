@@ -94,7 +94,8 @@ global flags
   --password <pw>        control password (factory default 123456); always needed on BLE,
                          and on USB once locked
   --udp <host[:port]>    with --ble: device streams video+IMU to this host over WiFi/UDP (default port 5005)
-  --verbose              print the control-plane traffic
+  --verbose              print the control-plane traffic; over BLE, also print
+                         phase-by-phase connect timing (`[ble] +NNNN ms <phase>`)
 
 commands
   list [--scan-ble]              discover devices (USB; add BLE with --scan-ble)
@@ -142,7 +143,8 @@ commands
   wifi list                        list saved networks (marks the connected one)
   wifi remove <ssid>               forget a saved network (disconnects it if it's the current one)
   wifi scan                        access points in range, strongest first (top 10)
-  wifi status                      current association (connecting / connected / not connected)
+  wifi status                      current association (connected / connecting / disconnected /
+                                   auth_failed, the last two both meaning no link right now)
   set-password <new>             rekey the control password (over UNLOCKED USB, no old password)
   set-password <old> <new>       rekey the control password (over BLE, or locked USB)
   lock on|off [--session]        lock/unlock the USB control plane (needs the current password;
@@ -157,7 +159,7 @@ commands
   factory-reset [--yes]          restore defaults; DESTROYS the encryption key. USB-only escape
   sync-time                      set the device clock from the host
   time                           read the device wall clock
-  location                       read the device's current location (session_meta.json, else default)
+  location                       read the device's current location (the persisted value, else the default)
   location set <lat> <lon> [alt] persist the device location -> every recording's LocationFix
   reboot                         reboot the device
 ```
@@ -189,7 +191,7 @@ applies its own).
 
 | Transport | Control | Video + IMU | How |
 |---|---|---|---|
-| **USB** | ✓ (bulk ep1/ep2) | ✓ live isoc ep3/ep4 | default; `open()` over USB |
+| **USB** | ✓ | ✓ live | default; `open()` over USB |
 | **Bluetooth LE** | ✓ (GATT, password-gated) | n/a (control only) | `--ble <MAC>` / `InitParameters::input_type = STREAM` |
 | **WiFi / UDP** | via USB or BLE | ✓ live UDP | `--udp <host[:port]>` over USB or `--ble`; device pushes to that host (yours, or a remote) |
 | **MCAP replay** | n/a | ✓ from file | `InitParameters::input_type = MCAP`, `mcap_path` |
@@ -200,7 +202,21 @@ USB isoc video is sized to the negotiated link speed automatically (SuperSpeed
 USB control is **one client per cable**: while an SDK app or `ef-cli` holds the
 device open, a second USB open is refused with `DEVICE_BUSY` ("in use by another
 process"). BLE stays available in parallel, so a long-running USB app does not
-lock an operator out of the device.
+lock an operator out of the device. `ef-cli info` reports whether a BLE central
+holds the link, which is otherwise only visible as a `DEVICE_BUSY` on a verb that
+needs the radio. There is deliberately no "is it paired" counterpart: the device
+purges the BLE bond on every disconnect, so no lasting pairing state exists to
+report.
+
+**A snapshot is not a subscription.** `get_device_information()` is a cached
+accessor: it never talks to the device. The snapshot is taken at `open()` and
+retaken by the wifi verbs, so a handle held open across a WiFi drop keeps
+reporting the association it saw at `open()`. Call `refresh_device_information()`
+to retake it, the same way `poll_fault()` refreshes device state. And when the
+transport goes away, the association and the BLE link are cleared to unknown
+rather than left at their last value, so a lost device never reads as still
+connected. The health status is deliberately kept: it records a sweep that did
+happen, and blanking it would report a healthy device as failed.
 
 ---
 
@@ -367,7 +383,8 @@ does. Your saved copy is the only thing that survives either.
 
 **Identity / info**
 ```sh
-ef-cli info            # serial, hw rev, firmware, camera geometry, IMU, WiFi, MACs
+ef-cli info            # serial, hw rev, firmware, camera geometry, IMU, WiFi, MACs,
+                   #   and whether a BLE central is holding the link right now
 ef-cli state           # CLOSED / IDLE / STREAMING / UPDATING
                    #   STREAMING = moving data: live host stream, recording, upload, OR calibration
 ```
@@ -500,7 +517,9 @@ int main() {
 ```
 
 Calls that touch the wire return `ef::ERROR_CODE`; results come back through out
-parameters. `get_*` accessors serve values cached at `open()` and never block.
+parameters. `get_*` accessors serve values cached at `open()` and never block, so
+a long-lived handle refreshes them explicitly: `refresh_device_information()` for
+the device snapshot, `poll_fault()` for device state.
 Full surface: [`include/ef/Device.hpp`](include/ef/Device.hpp),
 [`Core.hpp`](include/ef/Core.hpp), [`Enums.hpp`](include/ef/Enums.hpp),
 [`Parameters.hpp`](include/ef/Parameters.hpp).

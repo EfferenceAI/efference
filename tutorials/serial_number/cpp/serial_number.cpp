@@ -13,7 +13,7 @@ using namespace ef;
 int main() {
     Device device;
 
-    ERROR_CODE ec = device.open();   // USB is the default; capture auto-starts
+    ERROR_CODE ec = device.open();   // USB is the default; no data flows until grab()
     if (ec != ERROR_CODE::SUCCESS) {
         std::cerr << "open failed: " << to_string(ec) << "\n";
         return 1;

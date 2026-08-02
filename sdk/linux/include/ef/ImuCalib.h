@@ -1,7 +1,7 @@
 /* IMU field calibration in pure C: gyro zero-bias and accelerometer
  * ellipsoid fit.
  *
- * Pure C99, depends only on linalg.c and libm.
+ * Pure C99; the prebuilt libimu_cal.so depends only on libm.
  */
 #ifndef IMU_CALIB_H
 #define IMU_CALIB_H

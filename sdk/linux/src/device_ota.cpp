@@ -81,7 +81,9 @@ ERROR_CODE Device::check_update(UpdateAvailability& out) {
     // is nothing to ask the service about. Same guard update() applies.
     if (impl_->init.input_type == INPUT_TYPE::MCAP)
         return ERROR_CODE::INVALID_FUNCTION_CALL;
-    return check_for_update(impl_->info, out);
+    DeviceInformation snap;
+    { std::lock_guard<std::mutex> lk(impl_->info_mtx); snap = impl_->info; }
+    return check_for_update(snap, out);
 }
 
 ERROR_CODE Device::check_update(bool& available) {
@@ -107,7 +109,8 @@ ERROR_CODE Device::update(const std::string& url,
         impl_->init.input_type == INPUT_TYPE::MCAP)
         return ERROR_CODE::INVALID_FUNCTION_CALL;
 
-    const uint32_t old_version = impl_->info.firmware_version;
+    uint32_t old_version;
+    { std::lock_guard<std::mutex> lk(impl_->info_mtx); old_version = impl_->info.firmware_version; }
 
     // A url that names an existing local file means sideload: push the .eff
     // over the control link instead of asking the device to download it.
@@ -126,7 +129,9 @@ ERROR_CODE Device::update(const std::string& url,
     std::string fetch_url = url;
     if (!sideload && url.empty()) {
         UpdateAvailability avail;
-        ERROR_CODE ec = check_for_update(impl_->info, avail);
+        DeviceInformation snap2;
+        { std::lock_guard<std::mutex> lk(impl_->info_mtx); snap2 = impl_->info; }
+        ERROR_CODE ec = check_for_update(snap2, avail);
         // Carry the service's reason across, or the caller sees a bare
         // COMMUNICATION_ERROR here while check_update() explains itself.
         impl_->last_dev_msg = avail.service_error;
@@ -190,7 +195,9 @@ ERROR_CODE Device::update(const std::string& url,
             // already past this, and its own retry loop waits out a blip, so checking
             // earlier would refuse the re-run that attaches to it.
             impl_->refresh_wireless();
-            if (!impl_->info.wireless.wifi_connected) return bail(ERROR_CODE::WIFI_NOT_CONNECTED);
+            bool up; { std::lock_guard<std::mutex> lk(impl_->info_mtx);
+                       up = impl_->info.wireless.wifi_connected; }
+            if (!up) return bail(ERROR_CODE::WIFI_NOT_CONNECTED);
             // The wire field is a fixed array and snprintf truncates silently, so refuse
             // a URL that would not survive rather than sending a mangled one.
             WireRequest req = ef_v1_Request_init_zero;
@@ -212,9 +219,9 @@ ERROR_CODE Device::update(const std::string& url,
     auto deadline    = std::chrono::steady_clock::now() + std::chrono::minutes(15);
     auto start_grace = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     bool seen_active = false;
-    // Poll BLE gently: the radio is fragile and is also carrying the WiFi download
-    // this poll is waiting on. USB can poll fast. Future: subscribe to the device's
-    // OTA Event notify over BLE instead of polling.
+    // Poll BLE gently: the same radio is carrying the WiFi download this poll is
+    // waiting on, so polling hard would slow the thing being measured. USB has no
+    // such contention and polls once a second.
     const bool ble_link = (impl_->init.input_type == INPUT_TYPE::STREAM);
     const auto poll_interval = std::chrono::seconds(ble_link ? 5 : 1);
     for (;;) {
@@ -267,7 +274,7 @@ ERROR_CODE Device::update(const std::string& url,
     const auto reconnect_start = std::chrono::steady_clock::now();
     const auto reconnect_deadline = reconnect_start + std::chrono::minutes(3);
     while (std::chrono::steady_clock::now() < reconnect_deadline) {
-        // Elapsed is appended by the host renderer; don't duplicate it in the message.
+        // Keep the message static; the caller's progress callback owns elapsed time.
         report(UPDATE_STATE::RECONNECTING, -1, "waiting for device");
         reopened = open(saved);
         if (reopened == ERROR_CODE::SUCCESS) break;
@@ -284,7 +291,8 @@ ERROR_CODE Device::update(const std::string& url,
     UpdateStatus u;
     get_update_status(u);
     if (u.last_error == ERROR_CODE::FAILED_TO_UPDATE ||
-        impl_->info.firmware_version <= old_version) {
+        [&]{ std::lock_guard<std::mutex> lk(impl_->info_mtx);
+             return impl_->info.firmware_version; }() <= old_version) {
         report(UPDATE_STATE::RECONNECTING, -1,
                "device rebooted but is still on the old version (update rejected / rolled back)");
         return ERROR_CODE::FAILED_TO_UPDATE;

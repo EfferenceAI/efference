@@ -320,11 +320,9 @@ UpdateFailure classify_update_failure(ERROR_CODE ec, const std::string& msg) {
 }
 
 void print_info(const DeviceInformation& i) {
+    // One identity, printed once. DeviceInformation::serial_number is the same
+    // value parsed as an integer, so printing both read as two serials.
     std::printf("serial           : %s\n", i.serial.c_str());
-    // serial_number is the numeric form of `serial`, 0 for non-decimal serials
-    // (e.g. "M1BENCH002"). Show it only when set, so it reads as one identity.
-    if (i.serial_number != 0)
-        std::printf("serial_number    : %u\n", i.serial_number);
     std::printf("model            : %s\n", to_string(i.model));
     // Prefer the device's human-readable version string ("vXX.XX.XX"); fall back
     // to the monotonic int for older devices that don't report a usable string.
@@ -388,12 +386,18 @@ void print_info(const DeviceInformation& i) {
     const WirelessConfiguration& w = i.wireless;
     std::printf("wifi mac         : %s\n",
                 w.wifi_mac_address.empty() ? "(unprovisioned)" : w.wifi_mac_address.c_str());
-    std::printf("bt mac           : %s%s\n",
-                w.bt_mac_address.empty() ? "(unprovisioned)" : w.bt_mac_address.c_str(),
-                w.bt_paired ? " (paired)" : "");
+    std::printf("bt mac           : %s\n",
+                w.bt_mac_address.empty() ? "(unprovisioned)" : w.bt_mac_address.c_str());
+    // "none reported", not "none": proto3 never puts a false bool on the wire, so
+    // firmware predating the field is indistinguishable from one reporting no
+    // central. Neither case supports asserting there is none.
+    std::printf("ble link         : %s\n",
+                w.ble_connected ? "a central is connected" : "none reported");
     if (w.wifi_connected)
         std::printf("wifi             : connected \"%s\" (%s, rssi %d)\n",
                     w.wifi_ssid.c_str(), w.wifi_ip_address.c_str(), w.wifi_rssi);
+    else if (w.wifi_state == "unknown")
+        std::printf("wifi             : unknown (snapshot could not be refreshed)\n");
     else
         std::printf("wifi             : not connected\n");
     for (const auto& n : w.saved_networks)
@@ -1142,6 +1146,11 @@ int main(int argc, char** argv) {
                     x += ", signal " + std::to_string(w.wifi_rssi) + " dBm";
                 std::printf("connected to \"%s\" (%s%s)\n",
                             w.wifi_ssid.c_str(), w.wifi_ip_address.c_str(), x.c_str());
+            } else if (w.wifi_state == "unknown") {
+                // The snapshot could not be refreshed, so the link is unknowable.
+                // Printing "not connected" here would assert something no round
+                // trip established.
+                std::puts("unknown (could not reach the device to refresh)");
             } else {
                 std::puts("not connected");
             }

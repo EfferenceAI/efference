@@ -1,11 +1,15 @@
 ---
 title: "Calibrate IMU"
-description: "Estimate gyro bias and the accelerometer ellipsoid, then record calibrated samples."
+description: "Estimate gyro bias and the accelerometer ellipsoid, write them to the device, then record calibrated samples."
 ---
 
 Calibrates the M1's IMU in two steps: it measures the gyro zero-bias with the
 device held still, then fits the accelerometer ellipsoid as you rotate the device
 through all orientations. It prints the resulting bias and scale terms.
+
+**This writes the fit to the device.** The values persist and apply from the next
+session onward, replacing whatever calibration was stored before. To go back to
+the factory values, run `ef-cli calibration --imu --reset`.
 
 Needs the prebuilt `libimu_cal.so` for your architecture
 (`sdk/linux/lib/<arch>/`). It is skipped on architectures without that library.

@@ -41,9 +41,11 @@ ERROR_CODE Device::enable_recording(RecordingParameters params) {
                         : (pb_codec(impl_->init.compression) == ef_v1_Codec_H264) ? "h264"
                                                                                   : "h265";
         auto rec = std::make_shared<HostRecorder>();
-        if (!rec->start(params.path, raw, fmt,
-                        impl_->info.camera_configuration.resolution.width,
-                        impl_->info.camera_configuration.resolution.height))
+        int rw, rh;
+        { std::lock_guard<std::mutex> lk(impl_->info_mtx);
+          rw = impl_->info.camera_configuration.resolution.width;
+          rh = impl_->info.camera_configuration.resolution.height; }
+        if (!rec->start(params.path, raw, fmt, rw, rh))
             return ERROR_CODE::SESSION_RECORDING_ERROR;
         { std::lock_guard<std::mutex> lk(impl_->data_mtx); impl_->host_rec = std::move(rec); }
         impl_->recording = params;
@@ -267,15 +269,9 @@ ERROR_CODE Device::download_recording(const std::string& name,
     // device returns up to 7168 B per response, loop to eof. Rides the control
     // transport (USB or BLE) like every verb, so no WiFi needed.
     //
-    // Fault tolerance: a ~10 GiB file is ~1.5 M round trips, and one stalled
-    // chunk used to discard the whole partial. Each chunk now retries with
-    // backoff, and a partial file left by an earlier failure resumes at its
-    // size — after proving identity by re-fetching the first chunk and
-    // comparing it against the local prefix, so a same-named re-recording is
-    // never spliced onto stale bytes. The device side is a stateless pread at
-    // the requested offset, so both behaviors work against any firmware that
-    // has the verb. Cost of the retries: an abort via close() fails ~1 s
-    // slower than before (the retries burn out against the closed transport).
+    // Chunks retry with backoff. A resume re-fetches chunk 0 and compares it
+    // against the local prefix first, so a same-named re-recording is never
+    // spliced onto stale bytes.
     const uint32_t kChunk = (uint32_t)sizeof(ef_v1_RecordingChunk{}.data.bytes);  // 7168
     const int kChunkRetries = 4;
 
@@ -301,7 +297,7 @@ ERROR_CODE Device::download_recording(const std::string& name,
     };
 
     // Resume decision: an existing partial resumes only when it proves identity
-    // (a full first chunk matching the live file byte-for-byte — the static
+    // (a full first chunk matching the live file byte-for-byte; the static
     // metadata block carries session timestamps, so distinct recordings diverge
     // inside chunk 0) AND is not longer than the live file (a longer "partial"
     // is from some other file; appending would return SUCCESS on an over-long

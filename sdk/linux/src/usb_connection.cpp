@@ -41,7 +41,8 @@ constexpr unsigned kTimeoutMs    = 2000;
 
 // Locate the FF/EF/03 interface + its bulk control endpoints. Video and IMU ride
 // the isochronous endpoints on a second interface and are not opened here. Read
-// from descriptors (they shift when ADB enumerates), never hard-coded.
+// from descriptors, never hard-coded: interface and endpoint numbers shift with
+// the device's active USB composition.
 int find_sdk_iface(libusb_device* dev, int* iface, uint8_t* ep_out, uint8_t* ep_in) {
     libusb_config_descriptor* cfg = nullptr;
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) return -1;

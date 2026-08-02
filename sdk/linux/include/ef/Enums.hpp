@@ -41,7 +41,7 @@ enum class ERROR_CODE : int {
     DEVICE_NOT_AVAILABLE = 22,          // Device detected but could not be opened.
     INVALID_FIRMWARE = 23,              // Corrupted or unrecognized firmware image.
     INVALID_FUNCTION_CALL = 24,         // Call not valid in the current DEVICE_STATE.
-    INVALID_PASSWORD = 25,              // BLE control password rejected (challenge-response failed).
+    INVALID_PASSWORD = 25,              // Control password rejected (BLE, or a locked USB link).
     INSUFFICIENT_PERMISSIONS = 26,      // Cannot access the device; add the udev rule / grant USB access.
     UNSUPPORTED = 27,                   // Operation not supported in this build.
     DEVICE_BUSY = 28,                   // Device busy (e.g. recording or livestreaming); retry once it is idle.
@@ -101,7 +101,7 @@ enum class COMPRESSION_MODE {
     H265_HQ = 4,  // high quality (near-lossless)
 };
 
-// On-device IMU sample handling for a capture session (proto ImuConfig.data).
+// On-device IMU sample handling for a capture session.
 // RAW: record uncalibrated samples + carry the full ImuCalibration params as
 // metadata (data-collection default; consumer applies M*S*(x-b)). CALIBRATED:
 // the device applies M*S*(x-b) per sample. BOTH: emit both.

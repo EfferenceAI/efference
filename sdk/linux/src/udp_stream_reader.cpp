@@ -100,7 +100,8 @@ void UdpStreamReader::recv_loop() {
     // 64 KB is the UDP max and covers any config without truncation.
     std::vector<uint8_t> buf(65536);
     while (!stop_.load()) {
-        // Test aid: emit periodic PLIs to exercise force-IDR on a clean link.
+        // EF_UDP_TEST_PLI_MS: unsupported debug knob, off unless set. Emits periodic
+        // PLIs to exercise force-IDR on a clean link.
         if (test_pli_ms_ > 0 && have_peer_) {
             uint64_t now = mono_ns();
             if (!last_test_pli_ns_ ||

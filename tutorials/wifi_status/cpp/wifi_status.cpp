@@ -23,6 +23,8 @@ int main() {
     if (wifi.wifi_state == "auth_failed")
         std::cout << "Authentication failed for \"" << wifi.wifi_ssid
                   << "\" - check the password and re-provision.\n";
+    else if (wifi.wifi_state == "unknown")
+        std::cout << "The snapshot could not be refreshed, so the link is unknown.\n";
     else if (!wifi.wifi_connected)
         std::cout << "The M1 is not connected to any WiFi network.\n";
     else

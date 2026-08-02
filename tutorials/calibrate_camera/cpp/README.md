@@ -17,7 +17,7 @@ Needs OpenCV and the prebuilt `libcamera_cal.so` for your architecture
 | Flag | Effect |
 |---|---|
 | `--pattern WxH` | Inner-corner count of the board (default: `11x8`). |
-| `--square-size MM` | Physical square size for metric output (default: unit squares). |
+| `--square-size MM` | Physical square size in mm, for metric output (default: `30.0`). Must be greater than zero. |
 | `--ble MAC` | Control over Bluetooth instead of USB. |
 
 ## Build and run

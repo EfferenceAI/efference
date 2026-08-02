@@ -29,8 +29,8 @@ namespace ef {
 namespace internal {
 
 namespace {
-// ef_stream wire (firmware ef_stream.h): 8-B common + 36-B video header (payload
-// @44) | 12-B IMU batch header (samples @20, 40 B each).
+// ef_stream wire layout: 8-B common + 36-B video header (payload @44)
+// | 12-B IMU batch header (samples @20, 40 B each).
 constexpr uint8_t  kMagic       = 0xEF;
 constexpr uint8_t  kTypeVideo   = 1, kTypeImu = 2;
 constexpr uint8_t  kFragStart   = 0x01, kFragEnd = 0x02;

@@ -208,7 +208,7 @@ ERROR_CODE check_for_update(const DeviceInformation& info, UpdateAvailability& o
     }
 
     // 404 = nothing published for this device: no update, not a failure. Not matched on
-    // the error string, which the service has already renamed once.
+    // the error string, which is not part of the contract.
     if (http == 404) return ERROR_CODE::SUCCESS;
     if (http != 200) {
         if (out.service_error.empty())

@@ -147,14 +147,21 @@ struct ImuCalibrationParameters {
 struct WirelessConfiguration {
     std::string wifi_mac_address;
     std::string bt_mac_address;
+    // DEPRECATED, never populated: the device purges the BLE bond on every
+    // disconnect, so there is no lasting "paired" state to report.
+    // Use ble_connected instead.
     bool        bt_paired = false;
+    // A BLE central holds the link right now (false on firmware predating the field).
+    bool        ble_connected = false;
     bool        wifi_connected = false;
     std::string wifi_ssid;
     std::string wifi_ip_address;
     int         wifi_rssi = 0;
     bool        internet_reachable = false;
-    // Live association detail (best-effort; empty/0 = unknown or older firmware).
-    std::string wifi_state;           // "connected" / "connecting" / "disconnected"
+    // Live association detail (best-effort; empty/0 = not reported by this firmware).
+    std::string wifi_state;           // "connected"/"connecting"/"disconnected"/"auth_failed"
+                                      // from the device; "unknown" is set host-side when a
+                                      // refresh failed, and is distinct from empty
     int         wifi_link_speed = 0;  // negotiated PHY link rate, Mbps
     int         wifi_freq_mhz = 0;    // channel frequency, MHz (2.4 vs 5 GHz derivable)
     std::string wifi_security;        // "WPA2" / "WPA3" / "WPA2/WPA3" / "Open"
@@ -168,17 +175,16 @@ struct WifiNetwork {
     bool        secured = false; // true = encrypted (WPA/WPA2/WPA3)
 };
 
-// Cipher a key is for, and that a recording was written with. Carried explicitly
-// so the format is not pigeonholed to one algorithm; UNSPECIFIED means "device
-// default" on a request, and AES-256-GCM in a file written before the field.
+// Cipher a key is for, and that a recording was written with. UNSPECIFIED means
+// "device default" on a request, and AES-256-GCM in a file written before the field.
 enum class ENCRYPTION_ALGORITHM {
     UNSPECIFIED = 0,
     AES_256_GCM = 1,
 };
 
-// The device's at-rest video key. `key` is populated only by the two calls that
-// hand it over (create/get, and delete returning what it destroyed); elsewhere the
-// device reports `key_id` alone, which names a key without revealing it.
+// The device's at-rest video key. `key` is populated only by create, get, and
+// delete (which returns what it destroyed); elsewhere the device reports `key_id`
+// alone, which names a key without revealing it.
 struct EncryptionKey {
     ENCRYPTION_ALGORITHM algorithm = ENCRYPTION_ALGORITHM::UNSPECIFIED;
     std::vector<uint8_t> key;       // 32 bytes for AES-256-GCM
@@ -192,7 +198,7 @@ struct DeviceProperties {
     int device_id  = 0;
     std::string serial;             // USB descriptor serial
     std::string ble_address;        // BLE MAC (input_type == STREAM)
-    std::string ble_name;           // advertised name ("Efference M1")
+    std::string ble_name;           // advertised name, "M1-<serial>" per unit
 };
 
 struct DeviceInformation {
@@ -228,8 +234,7 @@ struct DeviceInformation {
 
 
 // One frame of image data plus the metadata to interpret it. Owns its buffer
-// (deep copy/assign). Fields are private to preserve layout invariants; Device
-// is the sole producer, consumers read through the accessors.
+// (deep copy/assign); read through the accessors.
 class Mat {
 public:
     Mat() = default;
@@ -265,7 +270,7 @@ public:
 
 private:
     friend class Device;   // sole producer; fills the fields below directly
-    void flip180();        // in-place 180-degree rotation (host-side, upside-down camera)
+    void flip180();        // in-place 180-degree rotation (host-side, FLIP_MODE)
 
     uint32_t   frame_id_ = 0;
     Timestamp  timestamp_;                // capture time, device clock
@@ -318,9 +323,8 @@ struct RecordingStatus {
     uint64_t         bytes       = 0;
     uint64_t         frames      = 0;
     uint64_t         duration_ms = 0;
-    // Stored segments are AES-256-GCM encrypted. The device reports what is
-    // actually on disk (it reads the container magic), so this is right even for
-    // sessions recorded before the setting was last changed.
+    // Stored segments are AES-256-GCM encrypted. Reflects what is actually on
+    // disk, so it is right even for sessions predating the current setting.
     bool             encrypted   = false;
     // Why the session ended (UNSPECIFIED while recording or for sessions made
     // by firmware that predates the field).

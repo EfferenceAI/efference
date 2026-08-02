@@ -719,6 +719,13 @@ typedef struct _ef_v1_DeviceInformation {
     ef_v1_EncryptionAlgorithm encryption_algorithm; /* the installed key's cipher (UNSPECIFIED if none) */
     /* Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only. */
     bool session_unlocked;
+    /* An LE link is up on the device's radio right now -- in practice a central
+ (phone app, ef-cli --ble), since the adapter only accepts. Read from the
+ kernel's connection list per request, so it cannot outlive the link the way
+ a cached flag would. Unlike bt_mac, which is identity, this is state.
+ Always true when read over BLE (the request itself proves a link), so it
+ cannot be used from a BLE session to detect a SECOND central. */
+    bool ble_connected;
 } ef_v1_DeviceInformation;
 
 /* Write calibration for one sensor (IDLE only; applied on the next capture
@@ -867,8 +874,7 @@ typedef struct _ef_v1_Response {
  physical access defeated encryption entirely. CreateEncryptionKey handing the key
  to the operator once is what makes destroying it here acceptable.
 
- Preserves the ADB-enable marker (it is the deploy channel; wiping it strands the
- board).
+ Device provisioning and factory-set identity survive the reset.
 
  Ungated on USB ONLY — physical possession is the credential, and that is the
  forgot-password escape. Over BLE it requires auth like any other verb, because an
@@ -1240,7 +1246,7 @@ extern "C" {
 #define ef_v1_GetState_init_default              {0}
 #define ef_v1_StateInfo_init_default             {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_default  {0}
-#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0}
+#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0}
 #define ef_v1_CapMode_init_default               {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_default          {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default}}
 #define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1332,7 +1338,7 @@ extern "C" {
 #define ef_v1_GetState_init_zero                 {0}
 #define ef_v1_StateInfo_init_zero                {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_zero     {0}
-#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0}
+#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0}
 #define ef_v1_CapMode_init_zero                  {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_zero             {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero}}
 #define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1565,6 +1571,7 @@ extern "C" {
 #define ef_v1_DeviceInformation_encryption_key_id_tag 26
 #define ef_v1_DeviceInformation_encryption_algorithm_tag 27
 #define ef_v1_DeviceInformation_session_unlocked_tag 28
+#define ef_v1_DeviceInformation_ble_connected_tag 30
 #define ef_v1_SetCalibration_camera_tag          1
 #define ef_v1_SetCalibration_imu_tag             2
 #define ef_v1_ResetCalibration_camera_tag        1
@@ -2333,7 +2340,8 @@ X(a, STATIC,   SINGULAR, BOOL,     encryption_enabled,  24) \
 X(a, STATIC,   SINGULAR, BOOL,     encryption_key_present,  25) \
 X(a, STATIC,   SINGULAR, STRING,   encryption_key_id,  26) \
 X(a, STATIC,   SINGULAR, UENUM,    encryption_algorithm,  27) \
-X(a, STATIC,   SINGULAR, BOOL,     session_unlocked,  28)
+X(a, STATIC,   SINGULAR, BOOL,     session_unlocked,  28) \
+X(a, STATIC,   SINGULAR, BOOL,     ble_connected,    30)
 #define ef_v1_DeviceInformation_CALLBACK NULL
 #define ef_v1_DeviceInformation_DEFAULT NULL
 #define ef_v1_DeviceInformation_camera_MSGTYPE ef_v1_CameraIntrinsics
@@ -2670,7 +2678,7 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_CreateEncryptionKey_size           2
 #define ef_v1_DeleteEncryptionKey_size           17
 #define ef_v1_DeleteRecording_size               65
-#define ef_v1_DeviceInformation_size             1881
+#define ef_v1_DeviceInformation_size             1884
 #define ef_v1_DownloadRecording_size             82
 #define ef_v1_EncryptionKey_size                 55
 #define ef_v1_FactoryReset_size                  0

@@ -1,8 +1,8 @@
 ////////////////////////////////////////////////////////////////////////////////
 //
 // File:      mcap_replay_reader.cpp
-// Purpose:   MCAP file-replay data source (internal), analogous to a
-//            prerecorded-clip reader.
+// Purpose:   MCAP file-replay data source (internal): plays a recording back
+//            through the same assembler the live transports feed.
 // Author:    Calvin Nguyen
 //
 // Copyright (c) 2026, Remnant Robotics, Inc. All rights reserved.

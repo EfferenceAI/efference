@@ -22,6 +22,7 @@
 
 #include "ble_connection.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -300,6 +301,16 @@ Status BleConnection::open(const std::string& address) {
     auto fail = [&](Status s) { cmd_path_.clear(); resp_path_.clear(); ver_path_.clear();
                                 return s; };
 
+    // Per-phase elapsed time under --verbose, so a slow open can be attributed
+    // to a stage.
+    const auto t_open0 = std::chrono::steady_clock::now();
+    auto mark = [&](const char* phase) {
+        if (!verbose_) return;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t_open0).count();
+        fprintf(stderr, "[ble] +%5lld ms  %s\n", (long long)ms, phase);
+    };
+
     ctx_ = g_main_context_new();
     // Pushed for open() only (see CtxGuard): the bus connection and Response signal
     // subscription latch ctx_ here; afterwards pump_until() iterates ctx_ directly.
@@ -312,8 +323,10 @@ Status BleConnection::open(const std::string& address) {
         if (e) g_error_free(e);
         return Status::BLE_ERROR;
     }
+    mark("bluetooth service");
     adapter_  = first_adapter_path(conn_);
     dev_path_ = device_path(adapter_, address);
+    mark("adapter found");
 
     // If BlueZ doesn't know the device yet (no prior scan), discover it, so
     // `ef-cli --ble` self-connects cold without a manual `bluetoothctl connect`.
@@ -321,8 +334,10 @@ Status BleConnection::open(const std::string& address) {
         if (verbose_) fprintf(stderr, "[ble] %s unknown; discovering...\n",
                               address.c_str());
         set_discovery(true);
+        mark("scanning");
         auto known = [&]() { return device_known(); };
         bool found = pump_until(known, DISCOVER_MS);
+        mark(found ? "device found" : "scan timed out");
         set_discovery(false);
         if (!found) {
             if (verbose_) fprintf(stderr, "[ble] device %s not found in scan\n",
@@ -332,14 +347,14 @@ Status BleConnection::open(const std::string& address) {
     }
 
     // Connect with retry/backoff; already-connected counts as success (agent races).
-    // Advertises at BlueZ's ~1280 ms default, so the link can take seconds: emit
-    // progress so it doesn't look hung.
+    // Connecting can take a few seconds: emit progress so it does not look hung.
     if (verbose_) fprintf(stderr, "[ble] %s known; connecting (may take a few seconds)...\n",
                           address.c_str());
     // Exhausted connects mean the device WAS advertising but would not link:
-    // that is "detected, unavailable", not "not found" — and keeping the codes
-    // distinct is what lets Device::open retry only the missed-advert case.
+    // that is "detected, unavailable", not "not found". Keeping the codes distinct
+    // is what lets Device::open retry only the missed-advert case.
     if (!connect_with_retry()) return Status::BLE_ERROR;
+    mark("connected");
     if (verbose_) fprintf(stderr, "[ble] link up; resolving GATT services...\n");
 
     GVariant* r = nullptr;
@@ -359,7 +374,9 @@ Status BleConnection::open(const std::string& address) {
         return res;
     };
     if (!pump_until(resolved, CONNECT_MS)) return fail(Status::BLE_ERROR);
+    mark("services resolved");
     if (!discover_characteristics())       return fail(Status::INTERFACE_NOT_FOUND);
+    mark("characteristics found");
 
     // Subscribe to Response notifications, then StartNotify.
     resp_sub_ = g_dbus_connection_signal_subscribe(
@@ -505,14 +522,20 @@ std::vector<BleScanEntry> BleConnection::scan(uint32_t scan_ms, int verbose) {
                 if (std::strcmp(iname, "org.bluez.Device1") == 0) {
                     BleScanEntry ent;
                     bool ours = false;
+                    // Name is what the remote reported; Alias is a local label bluez
+                    // caches and the user can override, so it can mask the per-unit
+                    // advert. Collect both and prefer Name after the loop, since
+                    // property order is not guaranteed.
+                    std::string alias;
                     const gchar* pk = nullptr;
                     GVariant* pv = nullptr;
                     while (g_variant_iter_next(props, "{&sv}", &pk, &pv)) {
                         if (!std::strcmp(pk, "Address"))
                             ent.address = g_variant_get_string(pv, nullptr);
-                        else if (!std::strcmp(pk, "Alias") || (!std::strcmp(pk, "Name") &&
-                                                               ent.name.empty()))
+                        else if (!std::strcmp(pk, "Name"))
                             ent.name = g_variant_get_string(pv, nullptr);
+                        else if (!std::strcmp(pk, "Alias"))
+                            alias = g_variant_get_string(pv, nullptr);
                         else if (!std::strcmp(pk, "UUIDs")) {
                             GVariantIter ui;
                             g_variant_iter_init(&ui, pv);
@@ -522,6 +545,7 @@ std::vector<BleScanEntry> BleConnection::scan(uint32_t scan_ms, int verbose) {
                         }
                         g_variant_unref(pv);
                     }
+                    if (ent.name.empty()) ent.name = alias;
                     if (ours && !ent.address.empty()) found.push_back(std::move(ent));
                 }
                 g_variant_iter_free(props);

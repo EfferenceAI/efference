@@ -64,11 +64,8 @@ public:
     InitParameters get_init_parameters() const;
     bool           is_open() const;
     // Whether this session proved the control password. Meaningful only when the
-    // device reports itself locked (DeviceInformation::usb_locked, or any BLE
-    // link). open() deliberately SUCCEEDS with a wrong password, because the
-    // device still answers info/state/storage and those are what an operator
-    // needs when recovering a lost password; check this to know whether gated
-    // verbs will work before calling one.
+    // device reports itself locked. open() succeeds even with a wrong password,
+    // since info/state/storage still answer, so check this before a gated verb.
     bool           is_authenticated() const;
     void           close();
 
@@ -87,9 +84,20 @@ public:
 
     DeviceInformation get_device_information() const;
 
+    // Retake the snapshot get_device_information() serves; it is otherwise taken
+    // at open() and by the wifi verbs, so a handle held across a WiFi drop keeps
+    // reporting what it saw then. Re-read after calling: earlier returns are copies.
+    // Const accessors stay safe from other threads; two mutating calls are unordered.
+    ERROR_CODE refresh_device_information();
+
+    // The first grab() starts the data plane; open() alone streams nothing.
+    // GRAB_TIMEOUT is backpressure, not a fault: call again. On MCAP replay,
+    // END_OF_BUFFER means the file ended.
     ERROR_CODE grab(RuntimeParameters params = RuntimeParameters());
     RuntimeParameters get_runtime_parameters() const;
 
+    // Both read what the last grab() latched. The Mat borrows that frame and is
+    // valid only until the next grab().
     ERROR_CODE retrieve_image(Mat& mat, VIEW view = VIEW::NV12);
     ERROR_CODE retrieve_imu(SensorsData& data,
                             TIME_REFERENCE ref = TIME_REFERENCE::IMAGE);
@@ -109,15 +117,15 @@ public:
                                     const std::string& name = "");
     ERROR_CODE list_recordings(std::vector<RecordingStatus>& out);
 
-    // Free / total bytes on the recording store (the /userdata ext4 partition,
-    // via statvfs). Queryable any time, no active recording required.
+    // Free / total bytes on the device's recording store. Queryable any time,
+    // no active recording required.
     ERROR_CODE get_storage(uint64_t& free_bytes, uint64_t& total_bytes);
     ERROR_CODE delete_recording(const std::string& name);
 
     // Pull a device recording over the control link (USB/BLE, no WiFi needed).
-    // A failed run leaves the partial file at dest_path — not a valid .mcap
-    // until a run returns SUCCESS — and a re-run resumes it after verifying it
-    // belongs to this recording.
+    // A failed run leaves a partial file at dest_path, not a valid .mcap until a
+    // run returns SUCCESS. A re-run resumes it after verifying it belongs to
+    // this recording.
     ERROR_CODE download_recording(const std::string& name,
                                   const std::string& dest_path);
 
@@ -203,13 +211,13 @@ public:
     // cleared. Ungated on USB only, so physical possession is the escape when the
     // password is lost; over BLE it needs the password like any other verb.
     //
-    // ⚠ DESTROYS the encryption key. Every recording ever made under it becomes
+    // WARNING: DESTROYS the encryption key. Every recording made under it becomes
     // permanently undecryptable, including copies already uploaded elsewhere.
     // Unlike delete_encryption_key() it does NOT return the key first: this verb
     // answers unauthenticated over USB, and handing a key to an unauthenticated
     // caller is exactly the exposure destroying it removes.
     //
-    // Preserves the ADB-enable marker. Refused while a capture is active.
+    // Refused while a capture is active.
     ERROR_CODE factory_reset();
 
     ERROR_CODE sync_time();   // align the device clock with the host clock
@@ -217,13 +225,13 @@ public:
     // returned Timestamp is the device CLOCK_REALTIME at the time of the reply.
     ERROR_CODE get_device_time(Timestamp& out);
 
-    // Persist the device location to session_meta.json (replaces the default);
-    // every subsequent recording uses it until changed. For a one-off, use
+    // Persist the device location (replaces the default); every subsequent
+    // recording uses it until changed. For a one-off, use
     // RecordingParameters::location instead.
     ERROR_CODE set_location(double latitude, double longitude,
                             double altitude = 0.0, double covariance_diag = 0.0);
-    // Read the device's current effective location (session_meta.json if present,
-    // otherwise the compiled default).
+    // Read the device's current effective location (the persisted value if one
+    // has been set, otherwise the factory default).
     ERROR_CODE get_location(Location& out);
 
     ERROR_CODE reboot();

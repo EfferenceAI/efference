@@ -128,7 +128,7 @@ inline WireCodec pb_codec(COMPRESSION_MODE c) {
 }
 
 // _HQ presets ride the same wire codec plus explicit encoder quality;
-// 90 is perceptually near-lossless. Tune here.
+// 90 is perceptually near-lossless.
 inline constexpr uint32_t kHqQuality = 90;
 
 inline uint32_t quality_for(COMPRESSION_MODE c) {
@@ -547,7 +547,7 @@ struct Device::Impl {
     RuntimeParameters   runtime;       // last grab() knobs
     RecordingParameters recording;     // last enable_recording() params
 
-    DeviceInformation info;            // cached at open()
+    DeviceInformation info;            // cached; refresh_device_information() retakes it
     HealthStatus      health;          // last completed sweep
     Caps              caps;            // internal validation menu
     std::string       last_dev_msg;    // Response.message from the last failed call
@@ -599,6 +599,11 @@ struct Device::Impl {
     // (download_recording, ota_push, polls) re-take it per call(), so a concurrent
     // close() aborts them at the next chunk boundary instead of crashing.
     std::mutex ctl_mtx;
+    // Guards info / health / caps, which the const accessors copy off any thread
+    // while control paths rewrite them. LOCK ORDER: never hold this across a
+    // call() -- call() takes ctl_mtx, and a thread holding ctl_mtx may want this
+    // one. Do the round trip first, then lock and assign.
+    mutable std::mutex info_mtx;
 
     std::shared_ptr<internal::StreamAssembler> reader_snapshot() const {
         std::lock_guard<std::mutex> lk(reader_mtx);
@@ -664,8 +669,8 @@ struct Device::Impl {
                            pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL) {
         if (!connection) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
         req.corr_id = ++corr;
-        uint8_t buf[8192];   // == proto::MAX_PAYLOAD (EFR_CTL_MSG_MAX): an
-                             // OtaPushChunk request encodes to ~7.2 KB.
+        uint8_t buf[8192];   // == proto::MAX_PAYLOAD: an OtaPushChunk request
+                             // encodes to ~7.2 KB.
         pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof buf);
         if (!pb_encode(&os, ef_v1_Request_fields, &req))
             return ERROR_CODE::UNKNOWN_FAILURE;
@@ -745,13 +750,18 @@ struct Device::Impl {
         device_fault_latch = resp.body.state_info.fault_latch;
         device_last_fault  = resp.body.state_info.last_fault;
 
-        // Raw facets for the illegal-state guards. Recording shows as FSM COLLECT
-        // (reported_status RECORDING echoes it); uploading only on reported_status.
-        dev_recording = !std::strcmp(fsm, "COLLECT") || !std::strcmp(dev, "RECORDING");
+        // Raw facets for the illegal-state guards. A REAL recording is reported_status
+        // RECORDING; the FSM COLLECT state ALSO covers a UVC webcam, which writes
+        // nothing to disk (reported_status IDLE) and must NOT be flagged as recording,
+        // else record/health/cal (the ops meant to PREEMPT the webcam, which the device
+        // handles) are wrongly refused as "device busy". So key dev_recording on the
+        // reported_status, not the FSM state. (The display `state` below still maps a
+        // webcam COLLECT to STREAMING.)
+        dev_recording = !std::strcmp(dev, "RECORDING");
         dev_uploading = !std::strcmp(dev, "UPLOADING");
 
-        // Public 4-value projection of the authoritative FSM state (see docs
-        // architecture/device-state-model). SAFE and a latched fault -> CLOSED;
+        // Public 4-value projection of the device's own state machine.
+        // SAFE and a latched fault -> CLOSED;
         // transitional states (INIT/RESET/HEALTH_TEST/SLEEP) -> CLOSED; OTA ->
         // UPDATING; COLLECT/CAL or a live host stream -> STREAMING; IDLE -> IDLE.
         // CLOSED therefore means "present but not in a usable data state"; a client
@@ -762,6 +772,7 @@ struct Device::Impl {
                                             state = DEVICE_STATE::CLOSED;
         else if (!std::strcmp(fsm, "OTA"))  state = DEVICE_STATE::UPDATING;
         else if (reader_live || dev_recording || dev_uploading ||
+                 !std::strcmp(fsm, "COLLECT") ||   // real recording OR a UVC webcam
                  !std::strcmp(fsm, "CAL"))  state = DEVICE_STATE::STREAMING;
         else if (!std::strcmp(fsm, "IDLE")) state = DEVICE_STATE::IDLE;
         else                                state = DEVICE_STATE::CLOSED;  // INIT/RESET/HEALTH_TEST/SLEEP
@@ -912,51 +923,93 @@ struct Device::Impl {
         }
     }
 
+    // The live association is no longer knowable. Say so, rather than keep serving
+    // the last one: a stale `wifi_connected` is what a UI renders as a network the
+    // device is not on. CALLER HOLDS info_mtx.
+    void forget_wifi_association() {
+        info.wireless.wifi_connected     = false;
+        info.wireless.wifi_ssid.clear();
+        info.wireless.wifi_ip_address.clear();
+        info.wireless.wifi_rssi          = 0;
+        info.wireless.internet_reachable = false;
+        info.wireless.wifi_link_speed    = 0;
+        info.wireless.wifi_freq_mhz      = 0;
+        info.wireless.wifi_security.clear();
+        info.wireless.wifi_state         = "unknown";
+    }
+
     void close_transport() {
-        // ctl_mtx: never tear the transport down under an in-flight round trip
-        // (libusb documents closing a handle with a blocked transfer as UB).
-        std::lock_guard<std::mutex> lk(ctl_mtx);
-        if (connection) connection->close();
-        connection.reset();
-        state = DEVICE_STATE::CLOSED;
+        {
+            // ctl_mtx: never tear the transport down under an in-flight round trip
+            // (libusb documents closing a handle with a blocked transfer as UB).
+            std::lock_guard<std::mutex> lk(ctl_mtx);
+            if (connection) connection->close();
+            connection.reset();
+            state = DEVICE_STATE::CLOSED;
+        }
+        // close() early-returns on an already-CLOSED handle, so the open() error
+        // paths must clear the snapshot here or nothing ever will.
+        std::lock_guard<std::mutex> lk(info_mtx);
+        forget_wifi_association();
+        info.wireless.ble_connected = false;
+        // health is deliberately NOT cleared: it records a sweep that happened, and
+        // HealthStatus{} defaults to passed=false, so blanking it would call a
+        // healthy device failed across the OTA reconnect. close() still clears it.
+    }
+
+    // No reply, as opposed to a reply saying "no". Only silence makes the view
+    // unknowable: a refusal still leaves what the ungated GetDeviceInformation
+    // supplied, which on a locked link is the real association.
+    // DEVICE_NOT_AVAILABLE is deliberately absent -- err_from produces it from
+    // DEVICE_SERVICE_UNREACHABLE, which IS a reply.
+    static bool link_failed(ERROR_CODE ec) {
+        return ec == ERROR_CODE::COMMUNICATION_ERROR ||
+               ec == ERROR_CODE::DEVICE_NOT_INITIALIZED;
     }
 
     // Refresh the cached wireless snapshot from device truth (best-effort) so
     // get_device_information().wireless reflects a provisioning change: live
     // association from GetWifiStatus, saved networks from WifiList.
     void refresh_wireless() {
-        {
-            WireRequest req = ef_v1_Request_init_zero;
-            req.which_body = ef_v1_Request_get_wifi_status_tag;
-            WireResponse resp;
-            if (call(req, resp, ef_v1_Response_wifi_status_tag) == ERROR_CODE::SUCCESS) {
-                const WireWifi& w = resp.body.wifi_status;
-                info.wireless.wifi_connected     = w.connected;
-                info.wireless.wifi_ssid          = w.ssid;
-                info.wireless.wifi_ip_address    = w.ip;
-                info.wireless.wifi_rssi          = w.rssi;
-                info.wireless.internet_reachable = w.internet;
-                info.wireless.wifi_link_speed    = w.link_speed;
-                info.wireless.wifi_freq_mhz      = w.freq_mhz;
-                info.wireless.wifi_security      = w.security;
-                // Back-compat: firmware predating WifiStatus.state (field 8)
-                // leaves it empty, so derive the 3-state from the legacy
-                // `connected` bool rather than show a blank state.
-                info.wireless.wifi_state =
-                    w.state[0] ? w.state : (w.connected ? "connected" : "disconnected");
-            }
+        // Both round trips first: call() takes ctl_mtx, and info_mtx must never be
+        // held across one (see the lock-order note on info_mtx).
+        WireRequest wreq = ef_v1_Request_init_zero;
+        wreq.which_body = ef_v1_Request_get_wifi_status_tag;
+        WireResponse wresp;
+        const ERROR_CODE wec = call(wreq, wresp, ef_v1_Response_wifi_status_tag);
+
+        WireRequest lreq = ef_v1_Request_init_zero;
+        lreq.which_body = ef_v1_Request_wifi_list_tag;
+        WireResponse lresp;
+        const ERROR_CODE lec = call(lreq, lresp, ef_v1_Response_wifi_list_result_tag);
+
+        std::lock_guard<std::mutex> lk(info_mtx);
+        if (wec == ERROR_CODE::SUCCESS) {
+            const WireWifi& w = wresp.body.wifi_status;
+            info.wireless.wifi_connected     = w.connected;
+            info.wireless.wifi_ssid          = w.ssid;
+            info.wireless.wifi_ip_address    = w.ip;
+            info.wireless.wifi_rssi          = w.rssi;
+            info.wireless.internet_reachable = w.internet;
+            info.wireless.wifi_link_speed    = w.link_speed;
+            info.wireless.wifi_freq_mhz      = w.freq_mhz;
+            info.wireless.wifi_security      = w.security;
+            // Back-compat: firmware predating WifiStatus.state (field 8) leaves it
+            // empty, so derive a state from the legacy `connected` bool rather than
+            // show a blank one. The device also emits auth_failed; "unknown" is
+            // host-side only.
+            info.wireless.wifi_state =
+                w.state[0] ? w.state : (w.connected ? "connected" : "disconnected");
+        } else if (link_failed(wec)) {
+            forget_wifi_association();   // silence means unknown, not unchanged
         }
-        {
-            WireRequest req = ef_v1_Request_init_zero;
-            req.which_body = ef_v1_Request_wifi_list_tag;
-            WireResponse resp;
-            if (call(req, resp, ef_v1_Response_wifi_list_result_tag) == ERROR_CODE::SUCCESS) {
-                const ef_v1_WifiListResult& l = resp.body.wifi_list_result;
-                info.wireless.saved_networks.clear();
-                for (pb_size_t i = 0; i < l.ssids_count; i++)
-                    info.wireless.saved_networks.push_back(l.ssids[i]);
-            }
+        if (lec == ERROR_CODE::SUCCESS) {
+            const ef_v1_WifiListResult& l = lresp.body.wifi_list_result;
+            info.wireless.saved_networks.clear();
+            for (pb_size_t i = 0; i < l.ssids_count; i++)
+                info.wireless.saved_networks.push_back(l.ssids[i]);
         }
+        // No else: the saved list is provisioning, not live state.
     }
 
     // Every IMU drain goes through here so a host recording sees every sample

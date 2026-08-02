@@ -13,6 +13,7 @@ include(CMakeFindDependencyMacro)
 # a build-tree export (same machine that built the SDK), so every dependency the
 # SDK linked is present here; the optional ones are matched non-fatally.
 find_dependency(Threads)
+find_dependency(CURL)   # ef links CURL::libcurl unconditionally (update-check)
 find_dependency(PkgConfig)
 pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 pkg_check_modules(EF_AV QUIET IMPORTED_TARGET libavcodec libavutil libswscale)  # FFmpeg decode

@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
 
     // ---- Step 2: accel ellipsoid (rotate through all orientations) ----
     wait_enter("Step 2/2 - accel ellipsoid: slowly rotate the device through every\n"
-               "orientation (all faces up/down, edges, corners) for ~30 s.");
+               "orientation (all faces up/down, edges, corners) for ~25 s.");
     std::vector<double> a2, g2;
     if (collect_imu(device, 25.0, "rotate ", a2, g2) != 0) return 1;
     double W[9], b[3];

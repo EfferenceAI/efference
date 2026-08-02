@@ -17,7 +17,8 @@ This produces `libef` and the `ef-cli` control tool. Tutorials link against it.
 ## Build and run a tutorial
 
 Each tutorial has its own `build.sh` that locates the SDK build tree for you, so
-no `env.sh` or CMake flags are needed. From the tutorial's folder:
+no `env.sh` or CMake flags are needed. (Invoking `cmake` directly does need them,
+which is what each `CMakeLists.txt` header describes.) From the tutorial's folder:
 
 ```sh
 cd tutorials/serial_number/cpp

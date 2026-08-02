@@ -189,7 +189,7 @@ message StreamTarget {
   Protocol protocol  = 4;                                          // UDP for ONLINE live
 }
 message StopStream      {}
-message SelectTransfer  { Transfer transfer = 1; }                 // flip ep2 alt-setting (ISO<->BULK)
+message SelectTransfer  { Transfer transfer = 1; }                 // switch the stream transfer mode (ISO<->BULK)
 message GetStreamStatus {}
 message StreamStatus {
   Mode mode = 1; bool streaming = 2; Transfer transfer = 3; StreamTarget.Kind target = 4;
@@ -388,6 +388,13 @@ message DeviceInformation {
   EncryptionAlgorithm encryption_algorithm = 27;  // the installed key's cipher (UNSPECIFIED if none)
   // Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only.
   bool         session_unlocked       = 28;
+  // An LE link is up on the device's radio right now -- in practice a central
+  // (phone app, ef-cli --ble), since the adapter only accepts. Read from the
+  // kernel's connection list per request, so it cannot outlive the link the way
+  // a cached flag would. Unlike bt_mac, which is identity, this is state.
+  // Always true when read over BLE (the request itself proves a link), so it
+  // cannot be used from a BLE session to detect a SECOND central.
+  bool         ble_connected          = 30;
 }
 // Hardware capability menu, mirrors device.json (generated from CAPS[]).
 message CapMode { uint32 width = 1; uint32 height = 2; uint32 fps = 3; string binning = 4; bool usable = 5; }
@@ -502,8 +509,7 @@ message EncryptionKey {
 // physical access defeated encryption entirely. CreateEncryptionKey handing the key
 // to the operator once is what makes destroying it here acceptable.
 //
-// Preserves the ADB-enable marker (it is the deploy channel; wiping it strands the
-// board).
+// Device provisioning and factory-set identity survive the reset.
 //
 // Ungated on USB ONLY — physical possession is the credential, and that is the
 // forgot-password escape. Over BLE it requires auth like any other verb, because an

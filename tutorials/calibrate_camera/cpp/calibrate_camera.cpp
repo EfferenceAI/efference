@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (ckb_version() < 1) {
-        std::fprintf(stderr, "libcheckerboard version 1+ required\n");
+        std::fprintf(stderr, "libcamera_cal version 1+ required\n");
         return 1;
     }
 

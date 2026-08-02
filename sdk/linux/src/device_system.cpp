@@ -34,8 +34,8 @@ namespace {
 HealthStatus health_from_wire(const WireHealth& s) {
     HealthStatus h;
     // The sweep verdict is authoritative: PASS unless some check FAILed (SKIP ignored).
-    // `health_passed` is the inline gate only StartHealthTest returns; it is NOT on the
-    // GetHealthResult poll path this comes from, so ANDing it in would force FAIL always.
+    // `health_passed` is the inline gate only StartHealthCheck returns; it is NOT on the
+    // GetHealthStatus poll path this comes from, so ANDing it in would force FAIL always.
     h.passed            = (s.overall != ef_v1_HealthVerdict_HV_FAIL);
     h.deep              = s.deep;
     h.timestamp.data_ns = (uint64_t)s.timestamp_ns;
@@ -102,6 +102,7 @@ ERROR_CODE Device::health_check(HealthStatus& out, bool deep) {
         ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_health_status_tag);
         if (ec != ERROR_CODE::SUCCESS) return ec;
         if (!resp.body.health_status.sweep_in_flight) {
+            std::lock_guard<std::mutex> lk(impl_->info_mtx);
             impl_->health = health_from_wire(resp.body.health_status);
             out = impl_->health;
             return ERROR_CODE::SUCCESS;
@@ -131,9 +132,12 @@ ERROR_CODE Device::wifi_add(const std::string& ssid, const std::string& psk,
     if (ec == ERROR_CODE::SUCCESS) {
         // Optimistic dedup'd update; refresh_wireless() then replaces the list with
         // device truth (WifiList), so a re-add / psk rotation never duplicates.
-        auto& v = impl_->info.wireless.saved_networks;
-        if (std::find(v.begin(), v.end(), ssid) == v.end()) v.push_back(ssid);
-        impl_->refresh_wireless();
+        {
+            std::lock_guard<std::mutex> lk(impl_->info_mtx);
+            auto& v = impl_->info.wireless.saved_networks;
+            if (std::find(v.begin(), v.end(), ssid) == v.end()) v.push_back(ssid);
+        }
+        impl_->refresh_wireless();   // round-trips; must not hold info_mtx
     }
     return ec;
 }
@@ -150,9 +154,12 @@ ERROR_CODE Device::wifi_remove(const std::string& ssid) {
     // that split to word the failure.
     ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::WIFI);
     if (ec == ERROR_CODE::SUCCESS) {
-        auto& v = impl_->info.wireless.saved_networks;
-        for (auto it = v.begin(); it != v.end();) it = (*it == ssid) ? v.erase(it) : it + 1;
-        impl_->refresh_wireless();
+        {
+            std::lock_guard<std::mutex> lk(impl_->info_mtx);
+            auto& v = impl_->info.wireless.saved_networks;
+            for (auto it = v.begin(); it != v.end();) it = (*it == ssid) ? v.erase(it) : it + 1;
+        }
+        impl_->refresh_wireless();   // round-trips; must not hold info_mtx
     }
     return ec;
 }

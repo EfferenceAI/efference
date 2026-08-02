@@ -1,8 +1,7 @@
 /* Encrypting byte sink — AES-256-GCM over an arbitrary output stream.
  *
- * Container-agnostic on purpose: it sees bytes and an fd, never MCAP or MP4.
- * The recording container is changing (see plans/ota/pronto-video-encryption.md
- * D6), so the crypto layer must not be bound to either one.
+ * Container-agnostic on purpose: it sees bytes and an fd, never MCAP or MP4, so
+ * the crypto layer stays independent of whichever container a recording uses.
  *
  * Chunked rather than whole-file for two reasons: a streaming writer cannot
  * buffer a whole recording, and a file truncated by power loss must still

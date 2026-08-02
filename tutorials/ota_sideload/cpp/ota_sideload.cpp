@@ -38,8 +38,9 @@ int main(int argc, char** argv) {
               << "sideloading " << eff << " over USB...\n";
 
     // update() blocks until the device has received, verified, and applied the
-    // image. The callback fires on each phase (DOWNLOADING here means receiving
-    // over the wire, then VERIFYING, READY_TO_APPLY, APPLYING).
+    // image. The callback fires on each phase; sideloading a local file reports
+    // UPLOADING while the host pushes it, then VERIFYING, READY_TO_APPLY,
+    // APPLYING, REBOOTING and RECONNECTING.
     ERROR_CODE ec = device.update(eff, [](const UpdateStatus& s) {
         std::cout << "  " << to_string(s.state);
         if (s.progress >= 0)      std::cout << "  " << s.progress << "%";

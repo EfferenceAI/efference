@@ -51,7 +51,8 @@ public:
     // link. Name kept for source compatibility. Factory default "123456".
     std::string ble_password = "123456";
 
-    // ---- session configuration (applied at open(); capture auto-starts) -----
+    // ---- session configuration (validated at open(); the data plane starts on
+    //      the first grab()) ------------------------------------------------
     RESOLUTION       resolution  = RESOLUTION::AUTO;
     int              fps         = 30;
     COMPRESSION_MODE compression = COMPRESSION_MODE::H265;

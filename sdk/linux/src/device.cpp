@@ -174,15 +174,29 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
 
     di.wireless.wifi_mac_address = d.wifi_mac;   // vendor storage; "" if unprovisioned
     di.wireless.bt_mac_address   = d.bt_mac;
+    di.wireless.ble_connected    = d.ble_connected;
     if (d.has_wifi) {
+        // The whole WifiStatus: this reply is ungated where GetWifiStatus is not,
+        // so on a locked link it is the only source of the last four.
         di.wireless.wifi_connected     = d.wifi.connected;
         di.wireless.wifi_ssid          = d.wifi.ssid;
         di.wireless.wifi_ip_address    = d.wifi.ip;
         di.wireless.wifi_rssi          = d.wifi.rssi;
         di.wireless.internet_reachable = d.wifi.internet;
+        di.wireless.wifi_link_speed    = d.wifi.link_speed;
+        di.wireless.wifi_freq_mhz      = d.wifi.freq_mhz;
+        di.wireless.wifi_security      = d.wifi.security;
+        // Same back-compat derivation refresh_wireless uses: firmware predating
+        // WifiStatus.state leaves it empty.
+        di.wireless.wifi_state =
+            d.wifi.state[0] ? d.wifi.state
+                            : (d.wifi.connected ? "connected" : "disconnected");
     }
 
     if (d.has_caps) {
+        // Rebuild, never append: `di` is fresh per call but `caps` is the caller's
+        // long-lived menu, and open() alone calls this twice on a locked link.
+        if (caps) { caps->modes.clear(); caps->codecs.clear(); }
         for (pb_size_t i = 0; i < d.caps.modes_count; i++) {
             // internal validation menu keeps every advertised mode (usable flag
             // and all) so open() can give a precise INVALID_FPS/RESOLUTION reason.
@@ -240,10 +254,11 @@ ERROR_CODE Device::open(InitParameters params) {
         else if (fmt == "h264")               impl_->init.compression = COMPRESSION_MODE::H264;
         else if (fmt == "nv12" || fmt.empty()) impl_->init.compression = COMPRESSION_MODE::RAW;
         else { r->stop(); return ERROR_CODE::UNSUPPORTED_COMPRESSION; }  // e.g. jpeg
-        impl_->info            = DeviceInformation{};
-        impl_->info.input_type = INPUT_TYPE::MCAP;
-        impl_->info.camera_configuration.resolution  = {r->width(), r->height()};
-        impl_->info.camera_configuration.compression = impl_->init.compression;
+        { std::lock_guard<std::mutex> lk(impl_->info_mtx);
+          impl_->info            = DeviceInformation{};
+          impl_->info.input_type = INPUT_TYPE::MCAP;
+          impl_->info.camera_configuration.resolution  = {r->width(), r->height()};
+          impl_->info.camera_configuration.compression = impl_->init.compression; }
         impl_->set_reader(std::move(r));
         impl_->state = DEVICE_STATE::STREAMING;
         return ERROR_CODE::SUCCESS;
@@ -301,13 +316,14 @@ ERROR_CODE Device::open(InitParameters params) {
         WireResponse resp;
         ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_device_information_tag);
         if (ec != ERROR_CODE::SUCCESS) { impl_->close_transport(); return ec; }
-        info_from_wire(resp.body.device_information, params.input_type, usb_serial,
-                       &impl_->info, &impl_->caps);
+        { std::lock_guard<std::mutex> lk(impl_->info_mtx);
+          info_from_wire(resp.body.device_information, params.input_type, usb_serial,
+                         &impl_->info, &impl_->caps); }
 
         // A locked USB link gates exactly like BLE. GetDeviceInformation is
         // ungated, so this is the earliest we can know, and authenticating here
         // means every later verb sees an authed session. Unlocked USB (the
-        // factory default) skips this entirely and behaves as it always has.
+        // factory default) skips this entirely.
         //
         // A wrong password does NOT fail the open: the device still answers
         // info/state/storage/factory-reset unauthenticated, and those are exactly
@@ -327,22 +343,28 @@ ERROR_CODE Device::open(InitParameters params) {
                 req2.which_body = ef_v1_Request_get_device_information_tag;
                 WireResponse resp2;
                 if (impl_->call(req2, resp2, ef_v1_Response_device_information_tag)
-                        == ERROR_CODE::SUCCESS)
+                        == ERROR_CODE::SUCCESS) {
+                    std::lock_guard<std::mutex> lk(impl_->info_mtx);
                     info_from_wire(resp2.body.device_information, params.input_type,
                                    usb_serial, &impl_->info, &impl_->caps);
+                }
             }
         }
     }
 
     // ---- validate the session configuration against the advertised menu ------
+    // Validate off a snapshot: holding info_mtx through the loops would pin it
+    // across the close_transport() calls below, which take it themselves.
+    Caps menu;
+    { std::lock_guard<std::mutex> lk(impl_->info_mtx); menu = impl_->caps; }
     Resolution res = get_resolution(params.resolution);
     if (params.resolution == RESOLUTION::AUTO) {
         res = {1920, 1200};   // device native (HD1200) when caps offer no match
-        for (const auto& m : impl_->caps.modes)
+        for (const auto& m : menu.modes)
             if (m.usable && m.fps == params.fps) { res = {m.w, m.h}; break; }
-    } else if (!impl_->caps.modes.empty()) {
+    } else if (!menu.modes.empty()) {
         bool res_ok = false, fps_ok = false;
-        for (const auto& m : impl_->caps.modes) {
+        for (const auto& m : menu.modes) {
             if (m.usable && m.w == res.width && m.h == res.height) {
                 res_ok = true;
                 if (m.fps == params.fps) fps_ok = true;
@@ -351,12 +373,12 @@ ERROR_CODE Device::open(InitParameters params) {
         if (!res_ok) { impl_->close_transport(); return ERROR_CODE::INVALID_RESOLUTION; }
         if (!fps_ok) { impl_->close_transport(); return ERROR_CODE::INVALID_FPS; }
     }
-    if (!impl_->caps.codecs.empty()) {
+    if (!menu.codecs.empty()) {
         const char* want = (pb_codec(params.compression) == ef_v1_Codec_H264) ? "H264"
                          : (pb_codec(params.compression) == ef_v1_Codec_H265) ? "H265"
                                                                               : "RAW";
         bool ok = false;
-        for (const auto& c : impl_->caps.codecs)
+        for (const auto& c : menu.codecs)
             if (c == want) { ok = true; break; }
         if (!ok) { impl_->close_transport(); return ERROR_CODE::UNSUPPORTED_COMPRESSION; }
     }
@@ -399,9 +421,12 @@ void Device::close() {
     impl_->stop_host_rec();
     impl_->stop_streaming();
     impl_->close_transport();
-    impl_->info   = DeviceInformation{};
-    impl_->health = HealthStatus{};
-    impl_->caps   = Caps{};
+    {
+        std::lock_guard<std::mutex> lk(impl_->info_mtx);
+        impl_->info   = DeviceInformation{};
+        impl_->health = HealthStatus{};
+        impl_->caps   = Caps{};
+    }
     { std::lock_guard<std::mutex> lk(impl_->data_mtx);
       impl_->imu_backlog.clear();
       impl_->imu_backlog_dropped = 0; }
@@ -429,7 +454,50 @@ bool Device::poll_fault(std::string* reason) {
 InitParameters      Device::get_init_parameters() const      { return impl_ ? impl_->init : InitParameters{}; }
 RuntimeParameters   Device::get_runtime_parameters() const   { return impl_ ? impl_->runtime : RuntimeParameters{}; }
 RecordingParameters Device::get_recording_parameters() const { return impl_ ? impl_->recording : RecordingParameters{}; }
-DeviceInformation   Device::get_device_information() const   { return impl_ ? impl_->info : DeviceInformation{}; }
-HealthStatus        Device::get_health_status() const        { return impl_ ? impl_->health : HealthStatus{}; }
+DeviceInformation   Device::get_device_information() const {
+    if (!impl_) return DeviceInformation{};
+    std::lock_guard<std::mutex> lk(impl_->info_mtx);
+    return impl_->info;
+}
+
+ERROR_CODE Device::refresh_device_information() {
+    // Guard like every sibling verb rather than letting call() bounce it. MCAP
+    // needs its own test: a replay handle reports STREAMING and so passes
+    // is_open(), but it has no device to ask and must not have its view rewritten.
+    if (!is_open() || impl_->init.input_type == INPUT_TYPE::MCAP)
+        return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_get_device_information_tag;
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_device_information_tag);
+    if (ec != ERROR_CODE::SUCCESS) {
+        // Only on silence (see link_failed): the return code alone is not enough,
+        // since a caller that ignores it re-reads the stale answer.
+        if (Impl::link_failed(ec)) {
+            std::lock_guard<std::mutex> lk(impl_->info_mtx);
+            impl_->forget_wifi_association();
+            impl_->info.wireless.ble_connected = false;
+        }
+        return ec;
+    }
+    // By value, not a reference into the struct being overwritten: defensive
+    // against info_from_wire's read-before-assign order changing.
+    std::unique_lock<std::mutex> lk(impl_->info_mtx);
+    const std::string serial_fallback = impl_->info.serial;
+    // info_from_wire blanks the fields the wifi verbs own. Carry the saved list:
+    // refresh_wireless() below deliberately does not restore it on a failed list.
+    std::vector<std::string> saved_nets = impl_->info.wireless.saved_networks;
+    info_from_wire(resp.body.device_information, impl_->init.input_type,
+                   serial_fallback, &impl_->info, &impl_->caps);
+    impl_->info.wireless.saved_networks = std::move(saved_nets);
+    lk.unlock();               // refresh_wireless() round-trips; see the lock order
+    impl_->refresh_wireless();
+    return ERROR_CODE::SUCCESS;
+}
+HealthStatus        Device::get_health_status() const {
+    if (!impl_) return HealthStatus{};
+    std::lock_guard<std::mutex> lk(impl_->info_mtx);
+    return impl_->health;   // owns a vector<HealthCheck>; close() frees it
+}
 
 }  // namespace ef

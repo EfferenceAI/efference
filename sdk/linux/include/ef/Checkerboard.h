@@ -2,7 +2,7 @@
 //
 // File:      Checkerboard.h
 // Purpose:   Checkerboard detection + wide-angle (Double Sphere) camera
-//            calibration. Public API of the prebuilt libcheckerboard binary.
+//            calibration. Public API of the prebuilt libcamera_cal.so.
 //
 // Copyright (c) 2026, Remnant Robotics, Inc. All rights reserved.
 //

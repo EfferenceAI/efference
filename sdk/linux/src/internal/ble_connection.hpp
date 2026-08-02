@@ -38,7 +38,7 @@ namespace internal {
 // One discovered M1 peripheral (advertising the Efference Control Service).
 struct BleScanEntry {
     std::string address;   // "AA:BB:CC:DD:EE:FF"
-    std::string name;      // advertised name ("Efference M1")
+    std::string name;      // advertised name, "M1-<serial>" per unit
 };
 
 class BleConnection : public Connection {

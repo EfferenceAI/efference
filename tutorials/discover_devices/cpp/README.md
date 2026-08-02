@@ -47,6 +47,6 @@ One line per device, then a total.
 ```text
 Scanning USB + BLE (3000 ms)...
 - USB  id=0  serial=7f3a1c9d20b4e6f8
-- STREAM  ble=60:48:9C:BA:32:F1  name="Efference M1"
+- STREAM  ble=60:48:9C:BA:32:F1  name="M1-7341a2daa233f183"
 2 device(s).
 ```
