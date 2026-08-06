@@ -84,3 +84,4 @@ Built only where OpenCV and FFmpeg are both present. These use `ef::toCvMat()`
 |---|---|
 | [`calibrate_imu`](calibrate_imu/cpp/README.md) | Gyro bias + accelerometer ellipsoid estimation. Needs `libimu_cal`. |
 | [`grab`](grab/cpp/README.md) | A bare open/grab/retrieve loop for throughput checks and debugging. |
+| [`grab_stress`](grab_stress/cpp/README.md) | Repeat open/grab/close and measure the startup frame cadence; reproduces the 1200p H.265 session-start pause. Enables the `[ef.diag]` stream diagnostics with `--debug`. |

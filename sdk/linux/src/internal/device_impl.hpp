@@ -594,6 +594,120 @@ struct Device::Impl {
     uint64_t last_frame_ts_ns = 0;
     uint32_t corr = 0;
 
+    // ---- stream-startup / encoded-frame diagnostics (opt-in via init.verbose >=
+    //      internal::kDiagLevel; see internal/stream_debug.hpp) ----------------
+    // Host-side monotonic session id, bumped each time a data-plane stream starts.
+    // The device does not expose its own session id on the wire, so this is a host
+    // counter that lets a log correlate all lines from one open/stream/close cycle.
+    uint64_t diag_session_id      = 0;
+    uint64_t diag_open_mono_ns    = 0;   // set at open(); measures open->first-frame
+    uint64_t diag_stream_mono_ns  = 0;   // set when the stream starts
+    bool     diag_first_decoded   = false;
+    bool     diag_first_returned  = false;
+    uint64_t diag_last_ret_mono_ns = 0;  // host monotonic of the last returned frame
+
+    bool diag() const { return internal::diag_on(init.verbose); }
+
+    // Reset the per-session "first X" latches so a re-opened handle logs a fresh
+    // startup sequence. Called when the data plane (re)starts.
+    void diag_reset_session() {
+        diag_session_id++;
+        diag_stream_mono_ns   = internal::diag_mono_ns();
+        diag_first_decoded    = false;
+        diag_first_returned   = false;
+        diag_last_ret_mono_ns = 0;
+    }
+
+    // Codec label for the logs (matches the human names the grab tutorial uses).
+    const char* diag_codec() const {
+        switch (init.compression) {
+            case COMPRESSION_MODE::H264:    return "H264";
+            case COMPRESSION_MODE::H264_HQ: return "H264_HQ";
+            case COMPRESSION_MODE::H265:    return "H265";
+            case COMPRESSION_MODE::H265_HQ: return "H265_HQ";
+            case COMPRESSION_MODE::RAW:     return "RAW";
+        }
+        return "?";
+    }
+
+    // Emit a grab/retrieve timeout line with the full cross-subsystem state the
+    // assembler cannot see on its own (device state + decoder priming). Called on
+    // the consumer thread; reads a read-only stats snapshot from the reader.
+    void diag_log_timeout(const char* ev,
+                          const std::shared_ptr<internal::StreamAssembler>& r) {
+        if (!diag()) return;
+        internal::StreamAssembler::StreamStats st;
+        if (r) r->get_stats(&st);
+        const uint64_t now = internal::diag_mono_ns();
+        const double dt = st.last_frame_mono_ns
+                              ? internal::diag_ms_since(st.last_frame_mono_ns, now)
+                              : 0.0;
+        const char* comm = init.input_type == INPUT_TYPE::USB    ? "usb"
+                         : init.input_type == INPUT_TYPE::STREAM ? "udp"
+                                                                 : "mcap";
+#ifdef EF_WITH_FFMPEG
+        const char* dec = decoder.have ? (diag_first_decoded ? "primed" : "priming")
+                                       : "none";
+#else
+        const char* dec = "nodecode";
+#endif
+        std::fprintf(stderr,
+                     "[ef.diag] t=%llu s=%llu ev=%s last_id=%u dt_since_last_ms=%.3f "
+                     "last_key_id=%u last_key_ts=%llu cap=%s comm=%s dec=%s "
+                     "dev_state=%s vbuf{ready=%d,reasm=%d,consuming=%d} "
+                     "frames_dropped=%llu total=%llu imu_q=%zu resync=%d\n",
+                     (unsigned long long)now, (unsigned long long)diag_session_id,
+                     ev, st.last_frame_id, dt, st.last_keyframe_id,
+                     (unsigned long long)st.last_keyframe_ts_ns,
+                     st.running ? "streaming" : "idle", comm, dec,
+                     to_string(state.load()), st.ready_slot, st.reasm_slot,
+                     st.consuming_slot, (unsigned long long)st.frames_dropped,
+                     (unsigned long long)st.total_frames, st.imu_queue_depth,
+                     st.resync_pending ? 1 : 0);
+    }
+
+    // First frame with decoded pixels (encoded: avcodec_receive_frame; RAW: the
+    // NV12 copy). Localizes the startup stall to transport vs decode vs delivery.
+    void diag_first_decode(uint32_t frame_id) {
+        if (!diag() || diag_first_decoded) return;
+        diag_first_decoded = true;
+        const uint64_t now = internal::diag_mono_ns();
+        std::fprintf(stderr,
+                     "[ef.diag] t=%llu s=%llu ev=first_decoded_frame frame_id=%u "
+                     "stream_to_decoded_ms=%.3f\n",
+                     (unsigned long long)now, (unsigned long long)diag_session_id,
+                     frame_id,
+                     diag_stream_mono_ns ? internal::diag_ms_since(diag_stream_mono_ns, now) : 0.0);
+    }
+
+    // Log one frame handed back to the application (retrieve_image success), plus
+    // the first-decoded / first-returned milestones. rf is the frame grab() latched.
+    void diag_log_returned(const internal::StreamAssembler::RawFrame& rf) {
+        if (!diag()) return;
+        const uint64_t now = internal::diag_mono_ns();
+        if (!diag_first_returned) {
+            diag_first_returned = true;
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=first_frame_returned frame_id=%u "
+                         "open_to_first_ms=%.3f stream_to_first_ms=%.3f\n",
+                         (unsigned long long)now, (unsigned long long)diag_session_id,
+                         rf.frame_id,
+                         diag_open_mono_ns ? internal::diag_ms_since(diag_open_mono_ns, now) : 0.0,
+                         diag_stream_mono_ns ? internal::diag_ms_since(diag_stream_mono_ns, now) : 0.0);
+        }
+        const double dt = diag_last_ret_mono_ns
+                              ? internal::diag_ms_since(diag_last_ret_mono_ns, now)
+                              : 0.0;
+        diag_last_ret_mono_ns = now;
+        std::fprintf(stderr,
+                     "[ef.diag] t=%llu s=%llu ret frame_id=%u dev_ts=%llu codec=%s "
+                     "res=%dx%d size=%zu key=%d complete=%d dt_ms=%.3f\n",
+                     (unsigned long long)now, (unsigned long long)diag_session_id,
+                     rf.frame_id, (unsigned long long)rf.ts_ns, diag_codec(),
+                     rf.width, rf.height, rf.size, rf.keyframe ? 1 : 0,
+                     rf.complete ? 1 : 0, dt);
+    }
+
     // Serializes control round trips against transport teardown (libusb_close or
     // BlueZ teardown under an in-flight request is UB). Multi-round-trip loops
     // (download_recording, ota_push, polls) re-take it per call(), so a concurrent
@@ -813,14 +927,23 @@ struct Device::Impl {
     ERROR_CODE start_streaming(const Resolution& res) {
         ERROR_CODE ec = configure_session(res);
         if (ec != ERROR_CODE::SUCCESS) return ec;
+        diag_reset_session();
         // Reader must be listening BEFORE the device emits: isoc is fire-and-
         // forget and the first access unit carries the encoder's SPS/PPS. Miss
         // it and an encoded stream never decodes.
         auto r = std::make_shared<internal::StreamReader>();
         r->set_video_codec(codec_gate_id());   // drop-until-IDR resync classifier
+        r->set_debug(init.verbose, diag_session_id);
         Status st = r->start(init.device_id, /*video=*/true,
                              init.enable_imu, init.verbose);
         if (st != Status::SUCCESS) return open_err(st);
+        if (diag())
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=stream_start_requested "
+                         "transport=USB res=%dx%d codec=%s fps=%d\n",
+                         (unsigned long long)internal::diag_mono_ns(),
+                         (unsigned long long)diag_session_id, res.width, res.height,
+                         diag_codec(), init.fps);
         {
             WireRequest req = ef_v1_Request_init_zero;
             req.which_body             = ef_v1_Request_start_stream_tag;
@@ -848,17 +971,26 @@ struct Device::Impl {
             ec = configure_session(res);
         }
         if (ec != ERROR_CODE::SUCCESS) return ec;
+        diag_reset_session();
         // Bind the UDP socket before StartStream, same reason the isoc reader
         // starts first: the opening access unit (SPS/PPS) is sent immediately
         // and never retransmitted.
         auto r = std::make_shared<internal::UdpStreamReader>();
         r->set_video_codec(codec_gate_id());   // drop-until-IDR resync classifier
+        r->set_debug(init.verbose, diag_session_id);
         Status st = r->start(init.udp_port, /*video=*/true,
                              init.enable_imu, init.verbose);
         if (st != Status::SUCCESS) {
             stop_stream_quiet();   // never leave the device armed on our failure
             return ERROR_CODE::CANNOT_START_CAMERA_STREAM;
         }
+        if (diag())
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=stream_start_requested "
+                         "transport=UDP res=%dx%d codec=%s fps=%d\n",
+                         (unsigned long long)internal::diag_mono_ns(),
+                         (unsigned long long)diag_session_id, res.width, res.height,
+                         diag_codec(), init.fps);
         {
             WireRequest req = ef_v1_Request_init_zero;
             req.which_body                    = ef_v1_Request_start_stream_tag;
@@ -916,10 +1048,21 @@ struct Device::Impl {
             reader.reset();
         }
         if (r) {
+            const uint64_t t0 = diag() ? internal::diag_mono_ns() : 0;
+            if (diag())
+                std::fprintf(stderr, "[ef.diag] t=%llu s=%llu ev=stream_stop_requested\n",
+                             (unsigned long long)t0, (unsigned long long)diag_session_id);
             r->stop();   // wakes any blocked grab(); freed by last snapshot holder
             // Only when a reader existed: StopStream == StopCollect on the device,
             // so an unconditional call would also stop a DEVICE_LOCAL recording.
             stop_stream_quiet();
+            if (diag()) {
+                const uint64_t t1 = internal::diag_mono_ns();
+                std::fprintf(stderr,
+                             "[ef.diag] t=%llu s=%llu ev=stream_stop_completed elapsed_ms=%.3f\n",
+                             (unsigned long long)t1, (unsigned long long)diag_session_id,
+                             internal::diag_ms_since(t0, t1));
+            }
         }
     }
 

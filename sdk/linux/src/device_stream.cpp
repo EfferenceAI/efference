@@ -41,6 +41,9 @@ ERROR_CODE Device::grab(RuntimeParameters params) {
     if (ec == ERROR_CODE::COMMUNICATION_ERROR &&
         impl_->init.input_type == INPUT_TYPE::MCAP)
         ec = ERROR_CODE::END_OF_BUFFER;
+    // Diagnostics: a grab timeout is the "no frame within the window" symptom of
+    // the startup stall; dump the full cross-subsystem state (see diag_log_timeout).
+    if (ec == ERROR_CODE::GRAB_TIMEOUT) impl_->diag_log_timeout("grab_timeout", reader);
     auto hr = impl_->host_rec_snapshot();   // pins the recorder across the tee
     if (ec == ERROR_CODE::SUCCESS || ec == ERROR_CODE::CORRUPTED_FRAME) {
         internal::StreamAssembler::RawFrame rf;
@@ -107,6 +110,8 @@ ERROR_CODE Device::retrieve_image(Mat& mat, VIEW view) {
         mat.step_ = rf.width;
         mat.data_.assign(rf.data, rf.data + rf.size);
         if (impl_->effective_flip()) mat.flip180();
+        impl_->diag_first_decode(rf.frame_id);   // RAW: the copy is the "decode"
+        impl_->diag_log_returned(rf);
         return ERROR_CODE::SUCCESS;
     }
 
@@ -122,6 +127,8 @@ ERROR_CODE Device::retrieve_image(Mat& mat, VIEW view) {
             return ERROR_CODE::CORRUPTED_FRAME;
         mat.step_ = step;
         if (impl_->effective_flip()) mat.flip180();
+        impl_->diag_first_decode(rf.frame_id);
+        impl_->diag_log_returned(rf);
         return ERROR_CODE::SUCCESS;
     }
     // Encoded (H264/H265): decode one access unit, then colour-convert.
@@ -144,11 +151,22 @@ ERROR_CODE Device::retrieve_image(Mat& mat, VIEW view) {
     // EAGAIN until the pipeline fills. That is "no frame YET", not an error:
     // flushing here would restart the priming and no frame would ever surface.
     // Surface it as the non-fatal GRAB_TIMEOUT ("retry next grab") instead.
-    if (rc == AVERROR(EAGAIN)) return ERROR_CODE::GRAB_TIMEOUT;
+    if (rc == AVERROR(EAGAIN)) {
+        // Decoder priming is a candidate contributor to the startup stall, so
+        // surface each priming EAGAIN under diagnostics (does not change behavior).
+        if (impl_->diag())
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=retrieve_eagain frame_id=%u "
+                         "(decoder priming)\n",
+                         (unsigned long long)internal::diag_mono_ns(),
+                         (unsigned long long)impl_->diag_session_id, rf.frame_id);
+        return ERROR_CODE::GRAB_TIMEOUT;
+    }
     if (rc < 0) {
         avcodec_flush_buffers(impl_->decoder.dec);
         return ERROR_CODE::CORRUPTED_FRAME;
     }
+    impl_->diag_first_decode(rf.frame_id);   // first fully decoded access unit
     const uint8_t* src[4] = { frm->data[0], frm->data[1], frm->data[2], frm->data[3] };
     int srcstride[4] = { frm->linesize[0], frm->linesize[1], frm->linesize[2], frm->linesize[3] };
     int step = 0;
@@ -158,6 +176,7 @@ ERROR_CODE Device::retrieve_image(Mat& mat, VIEW view) {
     mat.resolution_ = {frm->width, frm->height};
     mat.step_       = step;
     if (impl_->effective_flip()) mat.flip180();
+    impl_->diag_log_returned(rf);
     return ERROR_CODE::SUCCESS;
 #else
     (void)rf;
