@@ -76,7 +76,13 @@ public:
     uint32_t grab_timeout_ms     = 1000;   // grab() blocks at most this long
     bool     drop_partial_frames = true;   // discard lossy frames silently
 
-    int verbose = 0;                       // 0 = quiet, 1 = connection trace
+    int verbose = 0;                       // 0 = quiet, 1 = connection trace,
+                                           // >= 2 = stream-startup + per-frame
+                                           // diagnostics on stderr ([ef.diag] ...).
+                                           // Off by default; level 2 is intended
+                                           // for debugging the session-start path
+                                           // and is high-volume (per received and
+                                           // returned frame). See tutorials/grab_stress.
 };
 
 // Passed to grab(): per-call knobs.

@@ -23,6 +23,8 @@
 #include "stream_assembler.hpp"
 
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace ef {
@@ -123,14 +125,46 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
         // silently skip this clamp, letting the memcpy below over-read the packet.
         if ((uint32_t)paylen < plen) plen = (uint32_t)paylen;  // defensive
 
+        // ---- diagnostics: first encoded packet on the wire (transport thread) --
+        const int dlvl = diag_level_.load(std::memory_order_relaxed);
+        if (diag_on(dlvl) && !first_packet_seen_) {
+            first_packet_seen_ = true;
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=first_encoded_packet "
+                         "frame_id=%u dev_ts=%llu\n",
+                         (unsigned long long)diag_mono_ns(),
+                         (unsigned long long)diag_session_, frame_id,
+                         (unsigned long long)ts);
+        }
+
         bool superseded = false;
         bool need_pli   = false;
+        // Diagnostics captured under vmtx_, emitted after it is released so no
+        // stderr I/O ever happens while the video lock is held.
+        bool     log_gap = false, log_rx = false;
+        uint32_t gap_last = 0, gap_next = 0, gap_skipped = 0;
+        bool     rx_key = false, rx_gated = false, rx_complete = false;
+        uint32_t rx_id = 0;  uint64_t rx_dev_ts = 0, rx_host_ns = 0;
+        int      rx_w = 0, rx_h = 0;  size_t rx_size = 0;  double rx_dt_ms = 0.0;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
             if (flags & kFragStart) {
                 if (fsize == 0 || fsize > kMaxFrameBytes) {
                     in_frame_ = false;   // reject corrupt/oversized frame
                 } else {
+                    // Frame-ID gap detection (observe-only; does NOT drive the
+                    // resync gate, which stays keyed on the packet seq above).
+                    // Surfaces the "skipped N frame IDs" symptom directly.
+                    if (diag_on(dlvl) && have_frame_id_ &&
+                        frame_id != (uint32_t)(last_frame_id_ + 1) &&
+                        frame_id > last_frame_id_) {
+                        log_gap     = true;
+                        gap_last    = last_frame_id_;
+                        gap_next    = frame_id;
+                        gap_skipped = frame_id - last_frame_id_ - 1;
+                    }
+                    last_frame_id_ = frame_id;
+                    have_frame_id_ = true;
                     if (reasm_ == -1) reasm_ = free_vbuf();
                     if (reasm_ >= 0) {
                         grow_vbufs(fsize);
@@ -157,19 +191,52 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
                     // it grabs next, so enter resync.
                     if (ready_ != -1) { superseded = true; resync_pending_ = true; }
 
+                    // Keyframe classification, computed once. The gate needs it only
+                    // while resync is pending; diagnostics want it on every complete
+                    // frame. RAW/MJPEG (codec 0) is intra, so every complete frame is
+                    // a keyframe and is never gated.
+                    int  codec = vcodec_.load(std::memory_order_relaxed);
+                    bool want_kf = diag_on(dlvl) || (codec != 0 && resync_pending_);
+                    bool kf = false;
+                    if (vmeta_[reasm_].complete) {
+                        kf = (codec == 0) ? true
+                           : (want_kf ? is_keyframe(vbuf_[reasm_].data(), cur_size_, codec)
+                                      : false);
+                    }
+                    vmeta_[reasm_].keyframe = kf;
+
                     // Drop-until-IDR gate (encoded streams only). While resync pending,
                     // withhold every frame until an IDR/IRAP arrives, never feed the
                     // decoder an orphaned P-frame ("Could not find ref with POC" spam).
-                    // Incomplete frames never clear it; RAW/MJPEG (codec 0) is intra,
-                    // never gated.
-                    int  codec = vcodec_.load(std::memory_order_relaxed);
+                    // Incomplete frames never clear it.
                     bool gated = false;
                     if (codec != 0 && resync_pending_) {
-                        if (vmeta_[reasm_].complete &&
-                            is_keyframe(vbuf_[reasm_].data(), cur_size_, codec))
+                        if (vmeta_[reasm_].complete && kf)
                             resync_pending_ = false;   // IDR: decoder resyncs here
                         else
                             gated = true;              // hold for the next IDR
+                    }
+
+                    // Track the last keyframe + rx timing for the diagnostics.
+                    if (kf && vmeta_[reasm_].complete) {
+                        last_keyframe_id_    = cur_frame_id_;
+                        last_keyframe_ts_ns_ = vmeta_[reasm_].ts_ns;
+                    }
+                    if (vmeta_[reasm_].complete) total_frames_++;
+                    if (diag_on(dlvl)) {
+                        rx_host_ns = diag_mono_ns();
+                        log_rx      = true;
+                        rx_id       = cur_frame_id_;
+                        rx_dev_ts   = vmeta_[reasm_].ts_ns;
+                        rx_w        = vmeta_[reasm_].width;
+                        rx_h        = vmeta_[reasm_].height;
+                        rx_size     = cur_size_;
+                        rx_key      = kf;
+                        rx_complete = vmeta_[reasm_].complete;
+                        rx_dt_ms    = last_frame_mono_ns_
+                                          ? diag_ms_since(last_frame_mono_ns_, rx_host_ns)
+                                          : 0.0;
+                        last_frame_mono_ns_ = rx_host_ns;
                     }
 
                     if (gated) {
@@ -182,10 +249,33 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
                         reasm_ = -1;
                         vcv_.notify_one();
                     }
+                    rx_gated = gated;
                 }
                 in_frame_ = false;
             }
         }
+        // Diagnostics emitted outside vmtx_ (one fprintf per line; libc locks the
+        // FILE so lines from the transport and consumer threads never interleave).
+        if (log_gap)
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=frame_gap last_id=%u next_id=%u "
+                         "skipped=%u last_key_id=%u last_key_ts=%llu resync=%d\n",
+                         (unsigned long long)diag_mono_ns(),
+                         (unsigned long long)diag_session_, gap_last, gap_next,
+                         gap_skipped, last_keyframe_id_,
+                         (unsigned long long)last_keyframe_ts_ns_,
+                         resync_pending_ ? 1 : 0);
+        if (log_rx)
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu rx frame_id=%u dev_ts=%llu "
+                         "host_rx_ns=%llu res=%dx%d size=%zu key=%d complete=%d "
+                         "gated=%d dt_ms=%.3f\n",
+                         (unsigned long long)rx_host_ns,
+                         (unsigned long long)diag_session_, rx_id,
+                         (unsigned long long)rx_dev_ts,
+                         (unsigned long long)rx_host_ns, rx_w, rx_h, rx_size,
+                         rx_key ? 1 : 0, rx_complete ? 1 : 0, rx_gated ? 1 : 0,
+                         rx_dt_ms);
         // Request a fresh keyframe (PLI) after a supersede or while gated. Called
         // OUTSIDE the video mutex; UDP overrides on_loss(), USB isoc (no back channel)
         // is a no-op. need_pli keeps requesting on every withheld frame until the IDR.
@@ -244,6 +334,27 @@ bool StreamAssembler::current_video(RawFrame* out) const {
     if (consuming_ == -1) return false;
     *out = vmeta_[consuming_];
     return true;
+}
+
+void StreamAssembler::get_stats(StreamStats* out) const {
+    if (!out) return;
+    {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        out->last_frame_id       = last_frame_id_;
+        out->have_frame_id       = have_frame_id_;
+        out->last_keyframe_id    = last_keyframe_id_;
+        out->last_keyframe_ts_ns = last_keyframe_ts_ns_;
+        out->last_frame_mono_ns  = last_frame_mono_ns_;
+        out->frames_dropped      = frames_dropped_;
+        out->total_frames        = total_frames_;
+        out->ready_slot          = ready_;
+        out->reasm_slot          = reasm_;
+        out->consuming_slot      = consuming_;
+        out->resync_pending      = resync_pending_;   // best-effort read (see header)
+        out->running             = running_.load();
+    }
+    std::lock_guard<std::mutex> lk(imtx_);
+    out->imu_queue_depth = imu_.size();
 }
 
 void StreamAssembler::drain_imu(std::vector<ImuSample>& out, bool latest_only,

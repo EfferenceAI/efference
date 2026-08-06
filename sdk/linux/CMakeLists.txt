@@ -185,6 +185,23 @@ else()
     message(STATUS "efference-viewer: skipped (need libopencv-dev + libavcodec-dev)")
 endif()
 
+# ---- unit tests (optional) --------------------------------------------------
+# Hardware-free tests for internal logic (e.g. the stream reassembler / startup
+# gate). OFF by default so the normal build is unchanged; enable with
+#   cmake -S . -B build -DEF_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
+option(EF_BUILD_TESTS "Build unit tests (ctest)" OFF)
+if(EF_BUILD_TESTS)
+    enable_testing()
+    add_executable(ef_stream_assembler_test tests/test_stream_assembler.cpp)
+    # The test includes internal headers and links the compiled `ef` library.
+    target_include_directories(ef_stream_assembler_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/internal
+        ${EF_PROTO_DIR} ${EF_NANOPB_DIR})
+    target_link_libraries(ef_stream_assembler_test PRIVATE ef Threads::Threads)
+    add_test(NAME stream_assembler COMMAND ef_stream_assembler_test)
+endif()
+
 # ---- tutorials build-tree export -------------------------------------------
 # Tutorials (../../tutorials/<topic>/cpp) are standalone mini-projects that link
 # the SDK via find_package(ef). Export the targets from the build tree so a
