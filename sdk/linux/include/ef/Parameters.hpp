@@ -50,6 +50,16 @@ public:
     // The device CONTROL password, not BLE-only: it also unlocks a locked USB
     // link. Name kept for source compatibility. Factory default "123456".
     std::string ble_password = "123456";
+    // Separate, higher-privilege credential for the encryption key. Sent only when a
+    // verb that can legitimately demand it is refused -- key show / create / set /
+    // delete, set_encryption, set_admin_password and clear_admin_password -- and never
+    // on any other verb, so it is not offered to a peer that has no business asking.
+    // Device::authenticate_admin() also sends it, but only because the caller asked.
+    //
+    // Unset by default, because the device has no factory default for it: until one is
+    // provisioned those verbs are served at the control-password tier.
+    // DeviceInformation::admin_provisioned reports which state a device is in.
+    std::string admin_password;
 
     // ---- session configuration (validated at open(); the data plane starts on
     //      the first grab()) ------------------------------------------------

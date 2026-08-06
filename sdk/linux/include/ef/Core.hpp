@@ -83,8 +83,7 @@ struct CameraConfiguration {
     CalibrationParameters calibration;
 };
 
-// One selectable capture mode. Only the capture modes the device has enabled
-// are listed here; disabled modes are filtered out.
+// One selectable capture mode (enabled modes only).
 struct SupportedMode {
     Resolution  resolution;
     int         fps = 0;
@@ -147,9 +146,7 @@ struct ImuCalibrationParameters {
 struct WirelessConfiguration {
     std::string wifi_mac_address;
     std::string bt_mac_address;
-    // DEPRECATED, never populated: the device purges the BLE bond on every
-    // disconnect, so there is no lasting "paired" state to report.
-    // Use ble_connected instead.
+    // DEPRECATED, never populated. Use ble_connected.
     bool        bt_paired = false;
     // A BLE central holds the link right now (false on firmware predating the field).
     bool        ble_connected = false;
@@ -168,11 +165,21 @@ struct WirelessConfiguration {
     std::vector<std::string> saved_networks;
 };
 
-// One access point seen by scan_wifi_networks().
+// Radio band for a saved network. AUTO keeps the default behaviour: every saved
+// network sits at equal priority and the strongest AP in range wins.
+enum class BAND { AUTO, GHZ_2_4, GHZ_5 };
+
+// One access point seen by scan_wifi_networks(). A dual-band AP publishes the
+// same SSID on each radio, so it appears once per band, distinguished by freq.
 struct WifiNetwork {
     std::string ssid;
     int         rssi = 0;        // signal level, dBm (higher = stronger)
     bool        secured = false; // true = encrypted (WPA/WPA2/WPA3)
+    int         freq_mhz = 0;    // channel frequency, MHz (0 = not reported)
+    BAND        band() const {   // derived, so callers need not know the split
+        return freq_mhz == 0 ? BAND::AUTO
+             : freq_mhz >= 4900 ? BAND::GHZ_5 : BAND::GHZ_2_4;
+    }
 };
 
 // Cipher a key is for, and that a recording was written with. UNSPECIFIED means
@@ -206,9 +213,7 @@ struct DeviceInformation {
     unsigned int serial_number = 0; // numeric form; 0 when the serial is not numeric
     MODEL model = MODEL::M1;
     std::string model_name;         // model exactly as the device reports it ("M1")
-    // Board revision the device reports. Currently baked per firmware build, so every
-    // unit on a given image returns the same value ("1.00"); it identifies a board spin
-    // only once provisioned per-unit. Treat "1.00" as "unknown revision".
+    // Board revision the device reports. Treat "1.00" as "unknown revision".
     std::string hw_rev;
     unsigned int firmware_version = 0;      // OTA monotonic int (anti-rollback)
     std::string  firmware_version_str;      // human-readable "XX.XX.XX" (display only)
@@ -230,6 +235,17 @@ struct DeviceInformation {
     bool        encryption_key_present = false;
     std::string encryption_key_id;    // "" when absent; never the key itself
     ENCRYPTION_ALGORITHM encryption_algorithm = ENCRYPTION_ALGORITHM::UNSPECIFIED;
+    // Whether this firmware enforces the administrator credential on the encryption-key
+    // verbs. False on older firmware; check it before reporting a device as protected.
+    bool admin_gate = false;
+    // An administrator password has been SET on this device. There is no factory
+    // default for it, so this is the whole policy: false means the encryption-key
+    // verbs are open to the control password.
+    bool admin_provisioned = false;
+    // A key is installed AND no administrator password is set, so it is guarded by the
+    // control password alone. ⚠ Do not report such a device as protected. Derived, so
+    // setting an administrator password later protects the existing key too.
+    bool key_unprotected = false;
 };
 
 

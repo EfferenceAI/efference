@@ -41,7 +41,7 @@ enum class ERROR_CODE : int {
     DEVICE_NOT_AVAILABLE = 22,          // Device detected but could not be opened.
     INVALID_FIRMWARE = 23,              // Corrupted or unrecognized firmware image.
     INVALID_FUNCTION_CALL = 24,         // Call not valid in the current DEVICE_STATE.
-    INVALID_PASSWORD = 25,              // Control password rejected (BLE, or a locked USB link).
+    INVALID_PASSWORD = 25,              // A credential was rejected: the control password, or the administrator password on a key verb.
     INSUFFICIENT_PERMISSIONS = 26,      // Cannot access the device; add the udev rule / grant USB access.
     UNSUPPORTED = 27,                   // Operation not supported in this build.
     DEVICE_BUSY = 28,                   // Device busy (e.g. recording or livestreaming); retry once it is idle.
@@ -69,6 +69,8 @@ enum class ERROR_CODE : int {
     STORAGE_FULL = 84,                  // Device storage below the free-space floor; recording refused.
     RECORDING_NOT_FOUND = 85,           // No recording with that name exists on the device.
     RECORDING_ALREADY_EXISTS = 86,      // A recording with that name already exists; delete it or pick a new name.
+    USB_REQUIRED = 87,                  // Needs the USB link itself; no password satisfies it over BLE.
+    DESTINATION_NOT_WRITABLE = 88,      // The local destination could not be written; the recording on the device is fine.
 
     UNKNOWN_FAILURE = 100               // Unclassified failure.
 };

@@ -171,6 +171,11 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
     di.encryption_key_present = d.encryption_key_present;
     di.encryption_key_id      = d.encryption_key_id;
     di.encryption_algorithm   = static_cast<ENCRYPTION_ALGORITHM>(d.encryption_algorithm);
+    // Absent on older firmware, which decodes to false: exactly right, since such a
+    // device does not enforce the tier.
+    di.admin_gate                 = d.admin_gate;
+    di.admin_provisioned          = d.admin_provisioned;
+    di.key_unprotected            = d.key_unprotected;
 
     di.wireless.wifi_mac_address = d.wifi_mac;   // vendor storage; "" if unprovisioned
     di.wireless.bt_mac_address   = d.bt_mac;
@@ -235,7 +240,21 @@ ERROR_CODE Device::open(InitParameters params) {
     if (!impl_) impl_.reset(new Impl);
     if (impl_->state != DEVICE_STATE::CLOSED) return ERROR_CODE::INVALID_FUNCTION_CALL;
 
-    impl_->init                = params;
+    {   // Same reason get_init_parameters() locks: these are std::strings another
+        // thread may be copying, and a rotation writes them under this mutex.
+        std::lock_guard<std::mutex> lk(impl_->ctl_mtx);
+        impl_->init            = params;
+        // The latches belong with it: a reopen is a fresh link with a fresh credential
+        // set, so nothing the previous one learned may survive (Device::open reuses
+        // impl_). Here rather than in each transport arm, so a third arm cannot forget.
+        impl_->admin_pw_bad    = false;
+        impl_->operator_pw_bad = false;
+        impl_->ever_authed     = false;
+        // `authenticated` too, or is_authenticated() reports the PREVIOUS link's session
+        // on a reopen: an unlocked device never calls control_auth, so nothing else
+        // would ever clear it and the stale true would survive for the handle's life.
+        impl_->authenticated   = false;
+    }
     impl_->flip_latched        = -1;
     impl_->imu_backlog.clear();
     impl_->imu_backlog_dropped = 0;
@@ -449,9 +468,17 @@ bool Device::poll_fault(std::string* reason) {
     return impl_->device_fault_latch;
 }
 
-// Cached get_* never block and stay safe on a moved-from Device (null impl_):
-// they serve the type's defaults, matching the CLOSED state such a handle reports.
-InitParameters      Device::get_init_parameters() const      { return impl_ ? impl_->init : InitParameters{}; }
+// Cached get_* stay safe on a moved-from Device (null impl_): they serve the type's
+// defaults, matching the CLOSED state such a handle reports.
+//
+// get_init_parameters is the one that takes a lock, because a successful password
+// rotation rewrites init's credential strings under ctl_mtx; copying them unlocked
+// is a data race on a std::string, not merely a stale read.
+InitParameters      Device::get_init_parameters() const      {
+    if (!impl_) return InitParameters{};
+    std::lock_guard<std::mutex> lk(impl_->ctl_mtx);
+    return impl_->init;
+}
 RuntimeParameters   Device::get_runtime_parameters() const   { return impl_ ? impl_->runtime : RuntimeParameters{}; }
 RecordingParameters Device::get_recording_parameters() const { return impl_ ? impl_->recording : RecordingParameters{}; }
 DeviceInformation   Device::get_device_information() const {

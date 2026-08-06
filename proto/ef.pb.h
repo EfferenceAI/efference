@@ -30,7 +30,11 @@ typedef enum _ef_v1_ErrorCode {
     ef_v1_ErrorCode_STORAGE_FULL = 15,
     ef_v1_ErrorCode_AUTH_REQUIRED = 16, /* BLE: authenticate before this verb is honored */
     ef_v1_ErrorCode_AUTH_FAILED = 17, /* wrong password / bad challenge signature */
-    ef_v1_ErrorCode_ALREADY_EXISTS = 18 /* name conflict (e.g. start a recording whose name already exists) */
+    ef_v1_ErrorCode_ALREADY_EXISTS = 18, /* name conflict (e.g. start a recording whose name already exists) */
+    ef_v1_ErrorCode_ADMIN_REQUIRED = 19, /* operator credential is not enough; authenticate with AUTH_ROLE_ADMIN */
+    /* The verb needs the USB link itself; no password satisfies it over BLE. Not the
+ administrator tier, which is transport-independent. */
+    ef_v1_ErrorCode_USB_REQUIRED = 20
 } ef_v1_ErrorCode;
 
 /* ============================ Enums ============================ */
@@ -160,6 +164,21 @@ typedef enum _ef_v1_StopReason {
     ef_v1_StopReason_STOP_WRITE_ERROR = 3, /* sink write error ended the session */
     ef_v1_StopReason_STOP_INTERRUPTED = 4 /* power loss / crash; recovered at next boot */
 } ef_v1_StopReason;
+
+/* ============================ WiFi ============================
+ AUTO (the default) leaves band choice to the device: strongest AP in range wins. */
+typedef enum _ef_v1_WifiBand {
+    ef_v1_WifiBand_WIFI_BAND_AUTO = 0,
+    ef_v1_WifiBand_WIFI_BAND_2_4_GHZ = 1,
+    ef_v1_WifiBand_WIFI_BAND_5_GHZ = 2
+} ef_v1_WifiBand;
+
+/* Credential tier for the challenge and the proof. ADMIN grants are SINGLE-USE and
+ answered only once an administrator password is set (DeviceInformation.admin_provisioned). */
+typedef enum _ef_v1_AuthRole {
+    ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED = 0, /* operator: the credential every verb below admin uses */
+    ef_v1_AuthRole_AUTH_ROLE_ADMIN = 1
+} ef_v1_AuthRole;
 
 /* Which cipher a key is for, and which one a recording was written with. Carried
  explicitly from the start so the format is not pigeonholed to one algorithm; the
@@ -340,7 +359,7 @@ typedef struct _ef_v1_UploadStatus {
     ef_v1_ErrorCode last_error;
 } ef_v1_UploadStatus;
 
-/* ============================ Chunked upload (option b) ============================
+/* ============================ Chunked upload ============================
  The APP (BLE central) holds the ONLY mTLS cert and runs the app-side ingest protocol
  (create/finalize/refresh-url). The DEVICE is a PUT-worker: it lists a session's
  chunks (GetSessionManifest), receives pre-signed per-chunk URLs (PutChunks),
@@ -484,15 +503,16 @@ typedef struct _ef_v1_HealthStatus {
     int64_t timestamp_ns;
 } ef_v1_HealthStatus;
 
-/* ============================ WiFi ============================ */
 typedef struct _ef_v1_WifiScan {
     char dummy_field;
 } ef_v1_WifiScan;
 
+/* A dual-band AP publishes one SSID per radio, so it appears once per band. */
 typedef struct _ef_v1_WifiNetwork {
     char ssid[33];
     int32_t rssi;
     bool secured;
+    int32_t freq_mhz;
 } ef_v1_WifiNetwork;
 
 typedef struct _ef_v1_WifiScanResult {
@@ -505,14 +525,17 @@ typedef struct _ef_v1_WifiAdd {
     char psk[64];
     /* country: ISO 3166-1 alpha-2 (e.g. "US"); "" keeps the device regdomain (5 GHz needs it) */
     char country[4];
+    ef_v1_WifiBand band;
 } ef_v1_WifiAdd;
 
 typedef struct _ef_v1_WifiRemove {
     char ssid[33];
 } ef_v1_WifiRemove;
 
+/* prefer a saved network; band is applied as given, so AUTO clears a pin */
 typedef struct _ef_v1_WifiSelect {
     char ssid[33];
+    ef_v1_WifiBand band;
 } ef_v1_WifiSelect;
 
 typedef struct _ef_v1_WifiList {
@@ -542,7 +565,7 @@ typedef struct _ef_v1_WifiStatus {
     double mbps_up;
     /* Association phase from wpa_state: "connected" / "connecting"
  / "disconnected" / "auth_failed" (last connect rejected, e.g.
- wrong password). "connected" stays for back-compat. */
+ wrong password). */
     char state[16];
     int32_t link_speed; /* negotiated PHY link rate, Mbps (0 = unknown) */
     int32_t freq_mhz; /* associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz) */
@@ -672,7 +695,7 @@ typedef struct _ef_v1_ImuCalibration {
     double gyro_noise_density;
     pb_size_t imu_to_camera_count;
     double imu_to_camera[16];
-    /* ---- additive (6+): full per-sensor M·S·(x−b) model + noise-model + temporal (IMU lane, 2026-07-21).
+    /* ---- additive (6+): full per-sensor M·S·(x−b) model, noise model, temporal offset.
  Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
  uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream. */
     pb_size_t accel_scale_misalign_count;
@@ -699,7 +722,7 @@ typedef struct _ef_v1_DeviceInformation {
     ef_v1_ImuCalibration imu;
     uint64_t storage_total_bytes; /* userdata (recording) filesystem, total */
     uint64_t storage_free_bytes; /* userdata (recording) filesystem, available */
-    /* ---- v1 additive (11+): previously host-struct-only, now reported on the wire. */
+    /* ---- v1 additive (11+) */
     uint32_t firmware_version_int; /* OTA monotonic int (from the version file) */
     bool has_current_config;
     ef_v1_VideoConfig current_config; /* current selected session config (w/h/fps/codec) */
@@ -719,13 +742,16 @@ typedef struct _ef_v1_DeviceInformation {
     ef_v1_EncryptionAlgorithm encryption_algorithm; /* the installed key's cipher (UNSPECIFIED if none) */
     /* Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only. */
     bool session_unlocked;
-    /* An LE link is up on the device's radio right now -- in practice a central
- (phone app, ef-cli --ble), since the adapter only accepts. Read from the
- kernel's connection list per request, so it cannot outlive the link the way
- a cached flag would. Unlike bt_mac, which is identity, this is state.
- Always true when read over BLE (the request itself proves a link), so it
- cannot be used from a BLE session to detect a SECOND central. */
+    /* An LE central is connected now; always true when read over BLE. */
     bool ble_connected;
+    /* This firmware enforces the ADMIN tier on the encryption-key verbs. */
+    bool admin_gate;
+    /* A key exists with no administrator password, so the control password reads it.
+ ⚠ Do not report such a device as protected. Setting one later protects it too. */
+    bool key_unprotected;
+    /* An administrator password is set; there is no factory default. False means the
+ encryption-key verbs are served at the control-password tier. */
+    bool admin_provisioned;
 } ef_v1_DeviceInformation;
 
 /* Write calibration for one sensor (IDLE only; applied on the next capture
@@ -745,15 +771,8 @@ typedef struct _ef_v1_ResetCalibration {
     bool imu;
 } ef_v1_ResetCalibration;
 
-/* ============================ Auth / access control ============================
- BLE control is gated by a user password (default 123456, rekeyable). The device
- issues a nonce (GetAuthChallenge); the host proves the password with
- Authenticate{response = HMAC-SHA256(key = PBKDF2(password), msg = nonce)}, the
- password itself never crosses the air. SetBlePassword rekeys (BLE needs the old
- password; the USB transport may reset without it, physical-access recovery).
- USB control requires no password. */
 typedef struct _ef_v1_GetAuthChallenge {
-    char dummy_field;
+    ef_v1_AuthRole role;
 } ef_v1_GetAuthChallenge;
 
 typedef PB_BYTES_ARRAY_T(32) ef_v1_AuthChallenge_nonce_t;
@@ -766,7 +785,9 @@ typedef struct _ef_v1_AuthChallenge {
 
 typedef PB_BYTES_ARRAY_T(32) ef_v1_Authenticate_response_t;
 typedef struct _ef_v1_Authenticate {
-    ef_v1_Authenticate_response_t response;
+    ef_v1_Authenticate_response_t response; /* HMAC-SHA256(PBKDF2(pw,salt,iters), nonce) */
+    ef_v1_AuthRole role; /* must match the challenge that issued the nonce */
+    uint32_t admin_verb;
 } ef_v1_Authenticate;
 
 typedef struct _ef_v1_SetBlePassword {
@@ -774,8 +795,21 @@ typedef struct _ef_v1_SetBlePassword {
     char new_password[64];
 } ef_v1_SetBlePassword;
 
-/* USB access control. Unlocked (factory default) USB has full privileges, matching
- today's behavior. Locked, a USB session is gated exactly like a BLE one: only
+/* Provision the administrator password (empty old_password) or change it; changing
+ always requires the current value, on either transport. */
+typedef struct _ef_v1_SetAdminPassword {
+    char old_password[64];
+    char new_password[64];
+} ef_v1_SetAdminPassword;
+
+/* ⚠ Remove the administrator password: the key verbs drop back to the control
+ password. Needs an ADMIN grant AND the current password. */
+typedef struct _ef_v1_ClearAdminPassword {
+    char current_password[64];
+} ef_v1_ClearAdminPassword;
+
+/* USB access control. Unlocked (factory default) USB carries OPERATOR privilege with
+ no password, matching today's behavior for everything below the admin tier. Locked, a USB session is gated exactly like a BLE one: only
  info, state, storage, the auth handshake, and FactoryReset answer without a
  password. Toggling either way requires the current password.
  session_only scopes it to this power session: {locked=false} opens a device that
@@ -787,23 +821,16 @@ typedef struct _ef_v1_SetUsbLock {
     bool session_only;
 } ef_v1_SetUsbLock;
 
-/* Turn at-rest video encryption on or off for SUBSEQUENT recordings; existing
- ones keep whatever they were written with. Enabling with no key is refused, so a
- session can never silently record unencrypted after being told to encrypt.
- `algorithm` must be one the device implements. Read the current state from
- DeviceInformation.encryption_enabled. */
+/* Enable/disable at-rest encryption for SUBSEQUENT recordings; refused with no key.
+ State is DeviceInformation.encryption_enabled. */
 typedef struct _ef_v1_SetEncryption {
     bool enabled;
     ef_v1_EncryptionAlgorithm algorithm;
 } ef_v1_SetEncryption;
 
-/* ---- key lifecycle ----
- The device generates its own key and returns it ONCE, at creation. The operator
- keeps that copy; the device keeps a working copy that a factory reset destroys.
- Custody therefore moves to the operator at creation time, and there is no state
- in which the device holds a key nobody else has.
-
- All three are gated on the control password (unlocked USB is trusted, as ever). */
+/* ---- key lifecycle: ADMIN-gated once an administrator password exists ----
+ A key is generated by the device (Create, returned ONCE) or supplied by the operator
+ (Set). Either way a factory reset destroys the device's copy. */
 typedef struct _ef_v1_GetEncryptionKey {
     char dummy_field;
 } ef_v1_GetEncryptionKey;
@@ -826,6 +853,13 @@ typedef struct _ef_v1_CreateEncryptionKey {
 typedef struct _ef_v1_DeleteEncryptionKey {
     char key_id[16];
 } ef_v1_DeleteEncryptionKey;
+
+typedef PB_BYTES_ARRAY_T(32) ef_v1_SetEncryptionKey_key_t;
+/* Install a key the operator already holds. Exactly 32 bytes; refused while one exists. */
+typedef struct _ef_v1_SetEncryptionKey {
+    ef_v1_SetEncryptionKey_key_t key;
+    ef_v1_EncryptionAlgorithm algorithm;
+} ef_v1_SetEncryptionKey;
 
 typedef PB_BYTES_ARRAY_T(32) ef_v1_EncryptionKey_key_t;
 typedef struct _ef_v1_EncryptionKey {
@@ -860,26 +894,14 @@ typedef struct _ef_v1_Response {
         ef_v1_StateInfo state_info;
         ef_v1_Location location; /* reply to GetLocation */
         ef_v1_AuthChallenge auth_challenge; /* reply to GetAuthChallenge */
-        ef_v1_EncryptionKey encryption_key; /* reply to Get/Create/DeleteEncryptionKey */
+        ef_v1_EncryptionKey encryption_key; /* reply to Get/Create/Delete/SetEncryptionKey */
     } body;
 } ef_v1_Response;
 
-/* Restore factory settings: password back to default, USB unlocked, encryption off,
- wifi credentials and runtime state cleared.
-
- ⚠ It also DESTROYS the encryption key, which makes every recording ever written
- under that key permanently undecryptable, including copies already uploaded
- elsewhere. That is deliberate: while the reset preserved the key, a reset dropped
- the password back to the default and the key could then simply be read out, so
- physical access defeated encryption entirely. CreateEncryptionKey handing the key
- to the operator once is what makes destroying it here acceptable.
-
- Device provisioning and factory-set identity survive the reset.
-
- Ungated on USB ONLY — physical possession is the credential, and that is the
- forgot-password escape. Over BLE it requires auth like any other verb, because an
- unauthenticated remote reset is now an unauthenticated remote way to destroy every
- recording's key. */
+/* Restore factory settings: password, USB lock, encryption, wifi and runtime state.
+ ⚠ DESTROYS the encryption key, making every recording under it permanently
+ undecryptable. Provisioning and factory identity survive. Needs no password over
+ USB; over BLE it needs the control password. */
 typedef struct _ef_v1_FactoryReset {
     char dummy_field;
 } ef_v1_FactoryReset;
@@ -909,7 +931,7 @@ typedef struct _ef_v1_Request {
         ef_v1_StartUpload start_upload;
         ef_v1_StopUpload stop_upload;
         ef_v1_GetUploadStatus get_upload_status;
-        /* chunked upload (option b: app orchestrates via mTLS, device is a PUT-worker) */
+        /* chunked upload: the app orchestrates via mTLS, the device is a PUT-worker */
         ef_v1_GetSessionManifest get_session_manifest;
         ef_v1_PutChunks put_chunks;
         ef_v1_GetChunkUploadStatus get_chunk_upload_status;
@@ -952,11 +974,16 @@ typedef struct _ef_v1_Request {
         ef_v1_Authenticate authenticate; /* prove the control password (HMAC over nonce) */
         ef_v1_SetBlePassword set_ble_password; /* set/rekey; UNLOCKED usb may reset w/o old */
         ef_v1_SetUsbLock set_usb_lock; /* lock/unlock USB; locked USB gates like BLE */
-        ef_v1_GetEncryptionKey get_encryption_key; /* read the video-encryption key (gated) */
-        ef_v1_FactoryReset factory_reset; /* forgot-password escape; ungated on USB only */
+        /* ADMIN-gated once an administrator password exists, FactoryReset excepted; while
+     none is set they are served at the control-password tier. See AuthRole. */
+        ef_v1_GetEncryptionKey get_encryption_key; /* read the video-encryption key */
+        ef_v1_FactoryReset factory_reset; /* lost-password recovery; over USB, possession authorises */
         ef_v1_SetEncryption set_encryption; /* turn at-rest video encryption on/off */
-        ef_v1_CreateEncryptionKey create_encryption_key; /* generate a key; returned ONCE (gated) */
-        ef_v1_DeleteEncryptionKey delete_encryption_key; /* destroy the key (gated, key_id must match) */
+        ef_v1_CreateEncryptionKey create_encryption_key; /* generate a key; returned ONCE */
+        ef_v1_DeleteEncryptionKey delete_encryption_key; /* destroy the key (key_id must match) */
+        ef_v1_SetAdminPassword set_admin_password; /* provision one, or change it with the current */
+        ef_v1_ClearAdminPassword clear_admin_password; /* REMOVE admin; needs the current one */
+        ef_v1_SetEncryptionKey set_encryption_key; /* install a key the OPERATOR supplies */
     } body;
 } ef_v1_Request;
 
@@ -967,8 +994,8 @@ extern "C" {
 
 /* Helper constants for enums */
 #define _ef_v1_ErrorCode_MIN ef_v1_ErrorCode_SUCCESS
-#define _ef_v1_ErrorCode_MAX ef_v1_ErrorCode_ALREADY_EXISTS
-#define _ef_v1_ErrorCode_ARRAYSIZE ((ef_v1_ErrorCode)(ef_v1_ErrorCode_ALREADY_EXISTS+1))
+#define _ef_v1_ErrorCode_MAX ef_v1_ErrorCode_USB_REQUIRED
+#define _ef_v1_ErrorCode_ARRAYSIZE ((ef_v1_ErrorCode)(ef_v1_ErrorCode_USB_REQUIRED+1))
 
 #define _ef_v1_Mode_MIN ef_v1_Mode_MODE_UNKNOWN
 #define _ef_v1_Mode_MAX ef_v1_Mode_UVC
@@ -1037,6 +1064,14 @@ extern "C" {
 #define _ef_v1_StopReason_MIN ef_v1_StopReason_STOP_UNSPECIFIED
 #define _ef_v1_StopReason_MAX ef_v1_StopReason_STOP_INTERRUPTED
 #define _ef_v1_StopReason_ARRAYSIZE ((ef_v1_StopReason)(ef_v1_StopReason_STOP_INTERRUPTED+1))
+
+#define _ef_v1_WifiBand_MIN ef_v1_WifiBand_WIFI_BAND_AUTO
+#define _ef_v1_WifiBand_MAX ef_v1_WifiBand_WIFI_BAND_5_GHZ
+#define _ef_v1_WifiBand_ARRAYSIZE ((ef_v1_WifiBand)(ef_v1_WifiBand_WIFI_BAND_5_GHZ+1))
+
+#define _ef_v1_AuthRole_MIN ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED
+#define _ef_v1_AuthRole_MAX ef_v1_AuthRole_AUTH_ROLE_ADMIN
+#define _ef_v1_AuthRole_ARRAYSIZE ((ef_v1_AuthRole)(ef_v1_AuthRole_AUTH_ROLE_ADMIN+1))
 
 #define _ef_v1_EncryptionAlgorithm_MIN ef_v1_EncryptionAlgorithm_ENC_ALG_UNSPECIFIED
 #define _ef_v1_EncryptionAlgorithm_MAX ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM
@@ -1126,8 +1161,10 @@ extern "C" {
 
 
 
+#define ef_v1_WifiAdd_band_ENUMTYPE ef_v1_WifiBand
 
 
+#define ef_v1_WifiSelect_band_ENUMTYPE ef_v1_WifiBand
 
 
 
@@ -1156,6 +1193,10 @@ extern "C" {
 
 
 
+#define ef_v1_GetAuthChallenge_role_ENUMTYPE ef_v1_AuthRole
+
+
+#define ef_v1_Authenticate_role_ENUMTYPE ef_v1_AuthRole
 
 
 
@@ -1166,6 +1207,8 @@ extern "C" {
 
 #define ef_v1_CreateEncryptionKey_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
 
+
+#define ef_v1_SetEncryptionKey_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
 
 #define ef_v1_EncryptionKey_algorithm_ENUMTYPE ef_v1_EncryptionAlgorithm
 
@@ -1224,10 +1267,10 @@ extern "C" {
 #define ef_v1_HealthStatus_init_default          {0, _ef_v1_HealthVerdict_MIN, 0, 0, 0, {ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default, ef_v1_HealthCheck_init_default}, 0}
 #define ef_v1_WifiScan_init_default              {0}
 #define ef_v1_WifiScanResult_init_default        {0, {ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default, ef_v1_WifiNetwork_init_default}}
-#define ef_v1_WifiNetwork_init_default           {"", 0, 0}
-#define ef_v1_WifiAdd_init_default               {"", "", ""}
+#define ef_v1_WifiNetwork_init_default           {"", 0, 0, 0}
+#define ef_v1_WifiAdd_init_default               {"", "", "", _ef_v1_WifiBand_MIN}
 #define ef_v1_WifiRemove_init_default            {""}
-#define ef_v1_WifiSelect_init_default            {""}
+#define ef_v1_WifiSelect_init_default            {"", _ef_v1_WifiBand_MIN}
 #define ef_v1_WifiList_init_default              {0}
 #define ef_v1_WifiListResult_init_default        {0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}}
 #define ef_v1_StartWifiCheck_init_default        {0}
@@ -1246,22 +1289,25 @@ extern "C" {
 #define ef_v1_GetState_init_default              {0}
 #define ef_v1_StateInfo_init_default             {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_default  {0}
-#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0}
+#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0}
 #define ef_v1_CapMode_init_default               {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_default          {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default}}
 #define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
 #define ef_v1_ImuCalibration_init_default        {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0, 0}
 #define ef_v1_SetCalibration_init_default        {0, {ef_v1_CameraIntrinsics_init_default}}
 #define ef_v1_ResetCalibration_init_default      {0, 0}
-#define ef_v1_GetAuthChallenge_init_default      {0}
+#define ef_v1_GetAuthChallenge_init_default      {_ef_v1_AuthRole_MIN}
 #define ef_v1_AuthChallenge_init_default         {{0, {0}}, {0, {0}}, 0}
-#define ef_v1_Authenticate_init_default          {{0, {0}}}
+#define ef_v1_Authenticate_init_default          {{0, {0}}, _ef_v1_AuthRole_MIN, 0}
 #define ef_v1_SetBlePassword_init_default        {"", ""}
+#define ef_v1_SetAdminPassword_init_default      {"", ""}
+#define ef_v1_ClearAdminPassword_init_default    {""}
 #define ef_v1_SetUsbLock_init_default            {0, 0}
 #define ef_v1_SetEncryption_init_default         {0, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_GetEncryptionKey_init_default      {0}
 #define ef_v1_CreateEncryptionKey_init_default   {_ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_DeleteEncryptionKey_init_default   {""}
+#define ef_v1_SetEncryptionKey_init_default      {{0, {0}}, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_EncryptionKey_init_default         {_ef_v1_EncryptionAlgorithm_MIN, {0, {0}}, "", 0}
 #define ef_v1_FactoryReset_init_default          {0}
 #define ef_v1_Request_init_zero                  {0, 0, {ef_v1_GetDeviceInformation_init_zero}}
@@ -1316,10 +1362,10 @@ extern "C" {
 #define ef_v1_HealthStatus_init_zero             {0, _ef_v1_HealthVerdict_MIN, 0, 0, 0, {ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero, ef_v1_HealthCheck_init_zero}, 0}
 #define ef_v1_WifiScan_init_zero                 {0}
 #define ef_v1_WifiScanResult_init_zero           {0, {ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero, ef_v1_WifiNetwork_init_zero}}
-#define ef_v1_WifiNetwork_init_zero              {"", 0, 0}
-#define ef_v1_WifiAdd_init_zero                  {"", "", ""}
+#define ef_v1_WifiNetwork_init_zero              {"", 0, 0, 0}
+#define ef_v1_WifiAdd_init_zero                  {"", "", "", _ef_v1_WifiBand_MIN}
 #define ef_v1_WifiRemove_init_zero               {""}
-#define ef_v1_WifiSelect_init_zero               {""}
+#define ef_v1_WifiSelect_init_zero               {"", _ef_v1_WifiBand_MIN}
 #define ef_v1_WifiList_init_zero                 {0}
 #define ef_v1_WifiListResult_init_zero           {0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}}
 #define ef_v1_StartWifiCheck_init_zero           {0}
@@ -1338,22 +1384,25 @@ extern "C" {
 #define ef_v1_GetState_init_zero                 {0}
 #define ef_v1_StateInfo_init_zero                {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_zero     {0}
-#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0}
+#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0}
 #define ef_v1_CapMode_init_zero                  {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_zero             {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero}}
 #define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
 #define ef_v1_ImuCalibration_init_zero           {0, {0, 0, 0}, 0, {0, 0, 0}, 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0, 0}
 #define ef_v1_SetCalibration_init_zero           {0, {ef_v1_CameraIntrinsics_init_zero}}
 #define ef_v1_ResetCalibration_init_zero         {0, 0}
-#define ef_v1_GetAuthChallenge_init_zero         {0}
+#define ef_v1_GetAuthChallenge_init_zero         {_ef_v1_AuthRole_MIN}
 #define ef_v1_AuthChallenge_init_zero            {{0, {0}}, {0, {0}}, 0}
-#define ef_v1_Authenticate_init_zero             {{0, {0}}}
+#define ef_v1_Authenticate_init_zero             {{0, {0}}, _ef_v1_AuthRole_MIN, 0}
 #define ef_v1_SetBlePassword_init_zero           {"", ""}
+#define ef_v1_SetAdminPassword_init_zero         {"", ""}
+#define ef_v1_ClearAdminPassword_init_zero       {""}
 #define ef_v1_SetUsbLock_init_zero               {0, 0}
 #define ef_v1_SetEncryption_init_zero            {0, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_GetEncryptionKey_init_zero         {0}
 #define ef_v1_CreateEncryptionKey_init_zero      {_ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_DeleteEncryptionKey_init_zero      {""}
+#define ef_v1_SetEncryptionKey_init_zero         {{0, {0}}, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_EncryptionKey_init_zero            {_ef_v1_EncryptionAlgorithm_MIN, {0, {0}}, "", 0}
 #define ef_v1_FactoryReset_init_zero             {0}
 
@@ -1474,12 +1523,15 @@ extern "C" {
 #define ef_v1_WifiNetwork_ssid_tag               1
 #define ef_v1_WifiNetwork_rssi_tag               2
 #define ef_v1_WifiNetwork_secured_tag            3
+#define ef_v1_WifiNetwork_freq_mhz_tag           4
 #define ef_v1_WifiScanResult_networks_tag        1
 #define ef_v1_WifiAdd_ssid_tag                   1
 #define ef_v1_WifiAdd_psk_tag                    2
 #define ef_v1_WifiAdd_country_tag                3
+#define ef_v1_WifiAdd_band_tag                   4
 #define ef_v1_WifiRemove_ssid_tag                1
 #define ef_v1_WifiSelect_ssid_tag                1
+#define ef_v1_WifiSelect_band_tag                2
 #define ef_v1_WifiListResult_ssids_tag           1
 #define ef_v1_WifiStatus_connected_tag           1
 #define ef_v1_WifiStatus_ssid_tag                2
@@ -1572,22 +1624,33 @@ extern "C" {
 #define ef_v1_DeviceInformation_encryption_algorithm_tag 27
 #define ef_v1_DeviceInformation_session_unlocked_tag 28
 #define ef_v1_DeviceInformation_ble_connected_tag 30
+#define ef_v1_DeviceInformation_admin_gate_tag   31
+#define ef_v1_DeviceInformation_key_unprotected_tag 33
+#define ef_v1_DeviceInformation_admin_provisioned_tag 34
 #define ef_v1_SetCalibration_camera_tag          1
 #define ef_v1_SetCalibration_imu_tag             2
 #define ef_v1_ResetCalibration_camera_tag        1
 #define ef_v1_ResetCalibration_imu_tag           2
+#define ef_v1_GetAuthChallenge_role_tag          1
 #define ef_v1_AuthChallenge_nonce_tag            1
 #define ef_v1_AuthChallenge_salt_tag             2
 #define ef_v1_AuthChallenge_iters_tag            3
 #define ef_v1_Authenticate_response_tag          1
+#define ef_v1_Authenticate_role_tag              2
+#define ef_v1_Authenticate_admin_verb_tag        3
 #define ef_v1_SetBlePassword_old_password_tag    1
 #define ef_v1_SetBlePassword_new_password_tag    2
+#define ef_v1_SetAdminPassword_old_password_tag  1
+#define ef_v1_SetAdminPassword_new_password_tag  2
+#define ef_v1_ClearAdminPassword_current_password_tag 1
 #define ef_v1_SetUsbLock_locked_tag              1
 #define ef_v1_SetUsbLock_session_only_tag        2
 #define ef_v1_SetEncryption_enabled_tag          1
 #define ef_v1_SetEncryption_algorithm_tag        2
 #define ef_v1_CreateEncryptionKey_algorithm_tag  1
 #define ef_v1_DeleteEncryptionKey_key_id_tag     1
+#define ef_v1_SetEncryptionKey_key_tag           1
+#define ef_v1_SetEncryptionKey_algorithm_tag     2
 #define ef_v1_EncryptionKey_algorithm_tag        1
 #define ef_v1_EncryptionKey_key_tag              2
 #define ef_v1_EncryptionKey_key_id_tag           3
@@ -1673,6 +1736,9 @@ extern "C" {
 #define ef_v1_Request_set_encryption_tag         99
 #define ef_v1_Request_create_encryption_key_tag  100
 #define ef_v1_Request_delete_encryption_key_tag  101
+#define ef_v1_Request_set_admin_password_tag     103
+#define ef_v1_Request_clear_admin_password_tag   104
+#define ef_v1_Request_set_encryption_key_tag     105
 
 /* Struct field encoding specification for nanopb */
 #define ef_v1_Request_FIELDLIST(X, a) \
@@ -1733,7 +1799,10 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,get_encryption_key,body.get_encryption_
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,factory_reset,body.factory_reset),  98) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption,body.set_encryption),  99) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,create_encryption_key,body.create_encryption_key), 100) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,delete_encryption_key,body.delete_encryption_key), 101)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,delete_encryption_key,body.delete_encryption_key), 101) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_admin_password,body.set_admin_password), 103) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,clear_admin_password,body.clear_admin_password), 104) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption_key,body.set_encryption_key), 105)
 #define ef_v1_Request_CALLBACK NULL
 #define ef_v1_Request_DEFAULT NULL
 #define ef_v1_Request_body_get_device_information_MSGTYPE ef_v1_GetDeviceInformation
@@ -1793,6 +1862,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,delete_encryption_key,body.delete_encry
 #define ef_v1_Request_body_set_encryption_MSGTYPE ef_v1_SetEncryption
 #define ef_v1_Request_body_create_encryption_key_MSGTYPE ef_v1_CreateEncryptionKey
 #define ef_v1_Request_body_delete_encryption_key_MSGTYPE ef_v1_DeleteEncryptionKey
+#define ef_v1_Request_body_set_admin_password_MSGTYPE ef_v1_SetAdminPassword
+#define ef_v1_Request_body_clear_admin_password_MSGTYPE ef_v1_ClearAdminPassword
+#define ef_v1_Request_body_set_encryption_key_MSGTYPE ef_v1_SetEncryptionKey
 
 #define ef_v1_Response_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   corr_id,           1) \
@@ -2183,14 +2255,16 @@ X(a, STATIC,   REPEATED, MESSAGE,  networks,          1)
 #define ef_v1_WifiNetwork_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   ssid,              1) \
 X(a, STATIC,   SINGULAR, INT32,    rssi,              2) \
-X(a, STATIC,   SINGULAR, BOOL,     secured,           3)
+X(a, STATIC,   SINGULAR, BOOL,     secured,           3) \
+X(a, STATIC,   SINGULAR, INT32,    freq_mhz,          4)
 #define ef_v1_WifiNetwork_CALLBACK NULL
 #define ef_v1_WifiNetwork_DEFAULT NULL
 
 #define ef_v1_WifiAdd_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   ssid,              1) \
 X(a, STATIC,   SINGULAR, STRING,   psk,               2) \
-X(a, STATIC,   SINGULAR, STRING,   country,           3)
+X(a, STATIC,   SINGULAR, STRING,   country,           3) \
+X(a, STATIC,   SINGULAR, UENUM,    band,              4)
 #define ef_v1_WifiAdd_CALLBACK NULL
 #define ef_v1_WifiAdd_DEFAULT NULL
 
@@ -2200,7 +2274,8 @@ X(a, STATIC,   SINGULAR, STRING,   ssid,              1)
 #define ef_v1_WifiRemove_DEFAULT NULL
 
 #define ef_v1_WifiSelect_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   ssid,              1)
+X(a, STATIC,   SINGULAR, STRING,   ssid,              1) \
+X(a, STATIC,   SINGULAR, UENUM,    band,              2)
 #define ef_v1_WifiSelect_CALLBACK NULL
 #define ef_v1_WifiSelect_DEFAULT NULL
 
@@ -2341,7 +2416,10 @@ X(a, STATIC,   SINGULAR, BOOL,     encryption_key_present,  25) \
 X(a, STATIC,   SINGULAR, STRING,   encryption_key_id,  26) \
 X(a, STATIC,   SINGULAR, UENUM,    encryption_algorithm,  27) \
 X(a, STATIC,   SINGULAR, BOOL,     session_unlocked,  28) \
-X(a, STATIC,   SINGULAR, BOOL,     ble_connected,    30)
+X(a, STATIC,   SINGULAR, BOOL,     ble_connected,    30) \
+X(a, STATIC,   SINGULAR, BOOL,     admin_gate,       31) \
+X(a, STATIC,   SINGULAR, BOOL,     key_unprotected,  33) \
+X(a, STATIC,   SINGULAR, BOOL,     admin_provisioned,  34)
 #define ef_v1_DeviceInformation_CALLBACK NULL
 #define ef_v1_DeviceInformation_DEFAULT NULL
 #define ef_v1_DeviceInformation_camera_MSGTYPE ef_v1_CameraIntrinsics
@@ -2414,7 +2492,7 @@ X(a, STATIC,   SINGULAR, BOOL,     imu,               2)
 #define ef_v1_ResetCalibration_DEFAULT NULL
 
 #define ef_v1_GetAuthChallenge_FIELDLIST(X, a) \
-
+X(a, STATIC,   SINGULAR, UENUM,    role,              1)
 #define ef_v1_GetAuthChallenge_CALLBACK NULL
 #define ef_v1_GetAuthChallenge_DEFAULT NULL
 
@@ -2426,7 +2504,9 @@ X(a, STATIC,   SINGULAR, UINT32,   iters,             3)
 #define ef_v1_AuthChallenge_DEFAULT NULL
 
 #define ef_v1_Authenticate_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, BYTES,    response,          1)
+X(a, STATIC,   SINGULAR, BYTES,    response,          1) \
+X(a, STATIC,   SINGULAR, UENUM,    role,              2) \
+X(a, STATIC,   SINGULAR, UINT32,   admin_verb,        3)
 #define ef_v1_Authenticate_CALLBACK NULL
 #define ef_v1_Authenticate_DEFAULT NULL
 
@@ -2435,6 +2515,17 @@ X(a, STATIC,   SINGULAR, STRING,   old_password,      1) \
 X(a, STATIC,   SINGULAR, STRING,   new_password,      2)
 #define ef_v1_SetBlePassword_CALLBACK NULL
 #define ef_v1_SetBlePassword_DEFAULT NULL
+
+#define ef_v1_SetAdminPassword_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   old_password,      1) \
+X(a, STATIC,   SINGULAR, STRING,   new_password,      2)
+#define ef_v1_SetAdminPassword_CALLBACK NULL
+#define ef_v1_SetAdminPassword_DEFAULT NULL
+
+#define ef_v1_ClearAdminPassword_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   current_password,   1)
+#define ef_v1_ClearAdminPassword_CALLBACK NULL
+#define ef_v1_ClearAdminPassword_DEFAULT NULL
 
 #define ef_v1_SetUsbLock_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     locked,            1) \
@@ -2462,6 +2553,12 @@ X(a, STATIC,   SINGULAR, UENUM,    algorithm,         1)
 X(a, STATIC,   SINGULAR, STRING,   key_id,            1)
 #define ef_v1_DeleteEncryptionKey_CALLBACK NULL
 #define ef_v1_DeleteEncryptionKey_DEFAULT NULL
+
+#define ef_v1_SetEncryptionKey_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BYTES,    key,               1) \
+X(a, STATIC,   SINGULAR, UENUM,    algorithm,         2)
+#define ef_v1_SetEncryptionKey_CALLBACK NULL
+#define ef_v1_SetEncryptionKey_DEFAULT NULL
 
 #define ef_v1_EncryptionKey_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UENUM,    algorithm,         1) \
@@ -2561,11 +2658,14 @@ extern const pb_msgdesc_t ef_v1_GetAuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_AuthChallenge_msg;
 extern const pb_msgdesc_t ef_v1_Authenticate_msg;
 extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
+extern const pb_msgdesc_t ef_v1_SetAdminPassword_msg;
+extern const pb_msgdesc_t ef_v1_ClearAdminPassword_msg;
 extern const pb_msgdesc_t ef_v1_SetUsbLock_msg;
 extern const pb_msgdesc_t ef_v1_SetEncryption_msg;
 extern const pb_msgdesc_t ef_v1_GetEncryptionKey_msg;
 extern const pb_msgdesc_t ef_v1_CreateEncryptionKey_msg;
 extern const pb_msgdesc_t ef_v1_DeleteEncryptionKey_msg;
+extern const pb_msgdesc_t ef_v1_SetEncryptionKey_msg;
 extern const pb_msgdesc_t ef_v1_EncryptionKey_msg;
 extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 
@@ -2655,18 +2755,21 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_AuthChallenge_fields &ef_v1_AuthChallenge_msg
 #define ef_v1_Authenticate_fields &ef_v1_Authenticate_msg
 #define ef_v1_SetBlePassword_fields &ef_v1_SetBlePassword_msg
+#define ef_v1_SetAdminPassword_fields &ef_v1_SetAdminPassword_msg
+#define ef_v1_ClearAdminPassword_fields &ef_v1_ClearAdminPassword_msg
 #define ef_v1_SetUsbLock_fields &ef_v1_SetUsbLock_msg
 #define ef_v1_SetEncryption_fields &ef_v1_SetEncryption_msg
 #define ef_v1_GetEncryptionKey_fields &ef_v1_GetEncryptionKey_msg
 #define ef_v1_CreateEncryptionKey_fields &ef_v1_CreateEncryptionKey_msg
 #define ef_v1_DeleteEncryptionKey_fields &ef_v1_DeleteEncryptionKey_msg
+#define ef_v1_SetEncryptionKey_fields &ef_v1_SetEncryptionKey_msg
 #define ef_v1_EncryptionKey_fields &ef_v1_EncryptionKey_msg
 #define ef_v1_FactoryReset_fields &ef_v1_FactoryReset_msg
 
 /* Maximum encoded size of messages (where known) */
 #define EF_V1_EF_PB_H_MAX_SIZE                   ef_v1_Response_size
 #define ef_v1_AuthChallenge_size                 58
-#define ef_v1_Authenticate_size                  34
+#define ef_v1_Authenticate_size                  42
 #define ef_v1_CameraIntrinsics_size              113
 #define ef_v1_CapMode_size                       29
 #define ef_v1_Capabilities_size                  888
@@ -2674,15 +2777,16 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_ChunkResult_size                   21
 #define ef_v1_ChunkUploadStatus_size             3011
 #define ef_v1_ChunkUrl_size                      2056
+#define ef_v1_ClearAdminPassword_size            65
 #define ef_v1_Configure_size                     56
 #define ef_v1_CreateEncryptionKey_size           2
 #define ef_v1_DeleteEncryptionKey_size           17
 #define ef_v1_DeleteRecording_size               65
-#define ef_v1_DeviceInformation_size             1884
+#define ef_v1_DeviceInformation_size             1893
 #define ef_v1_DownloadRecording_size             82
 #define ef_v1_EncryptionKey_size                 55
 #define ef_v1_FactoryReset_size                  0
-#define ef_v1_GetAuthChallenge_size              0
+#define ef_v1_GetAuthChallenge_size              2
 #define ef_v1_GetChunkUploadStatus_size          65
 #define ef_v1_GetDeviceInformation_size          0
 #define ef_v1_GetEncryptionKey_size              0
@@ -2722,8 +2826,10 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_Response_size                      7454
 #define ef_v1_SelectTransfer_size                2
 #define ef_v1_SessionManifest_size               6721
+#define ef_v1_SetAdminPassword_size              130
 #define ef_v1_SetBlePassword_size                130
 #define ef_v1_SetCalibration_size                428
+#define ef_v1_SetEncryptionKey_size              36
 #define ef_v1_SetEncryption_size                 4
 #define ef_v1_SetLocation_size                   38
 #define ef_v1_SetOtaConfig_size                  522
@@ -2748,14 +2854,14 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_UploadSpec_size                    2054
 #define ef_v1_UploadStatus_size                  91
 #define ef_v1_VideoConfig_size                   28
-#define ef_v1_WifiAdd_size                       104
+#define ef_v1_WifiAdd_size                       106
 #define ef_v1_WifiListResult_size                1088
 #define ef_v1_WifiList_size                      0
-#define ef_v1_WifiNetwork_size                   47
+#define ef_v1_WifiNetwork_size                   58
 #define ef_v1_WifiRemove_size                    34
-#define ef_v1_WifiScanResult_size                2352
+#define ef_v1_WifiScanResult_size                2880
 #define ef_v1_WifiScan_size                      0
-#define ef_v1_WifiSelect_size                    34
+#define ef_v1_WifiSelect_size                    36
 #define ef_v1_WifiStatus_size                    170
 
 #ifdef __cplusplus

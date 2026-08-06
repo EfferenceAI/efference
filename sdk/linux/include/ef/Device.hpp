@@ -63,9 +63,9 @@ public:
     ERROR_CODE     open(InitParameters params = InitParameters());
     InitParameters get_init_parameters() const;
     bool           is_open() const;
-    // Whether this session proved the control password. Meaningful only when the
-    // device reports itself locked. open() succeeds even with a wrong password,
-    // since info/state/storage still answer, so check this before a gated verb.
+    // Whether this session holds a proven credential. Meaningful only when the device
+    // reports itself locked; open() succeeds even with a wrong password, since
+    // info/state/storage still answer. Check this before a gated verb.
     bool           is_authenticated() const;
     void           close();
 
@@ -73,9 +73,8 @@ public:
 
     // Live fault poll. Refreshes the device state from the device firmware's state machine (so a
     // subsequent get_state() is fresh too). Returns true iff a fault is LATCHED (the
-    // device is in SAFE and needs a health-gated recovery); a latched device projects
-    // DEVICE_STATE::CLOSED (the 4-value enum has no FAULT value), which is how a client
-    // tells a fault-CLOSED from a not-open CLOSED. When `reason` is non-null it receives
+    // device needs a health-gated recovery); a latched device reports
+    // DEVICE_STATE::CLOSED, which is how a client tells a fault from a not-open device. When `reason` is non-null it receives
     // the most recent anomaly cause -- populated for a latched fault AND for an unlatched
     // abnormal session end (e.g. disk_full, capture_stopped), and empty once a new
     // session starts clean -- so check `reason` even when the return is false. Best-effort:
@@ -113,8 +112,11 @@ public:
     ERROR_CODE disable_recording();
     RecordingParameters get_recording_parameters() const;
 
+    // An empty name asks for the session recording now. A named one resolves on
+    // the device, so it reaches sessions older than list_recordings can carry.
     ERROR_CODE get_recording_status(RecordingStatus& out,
                                     const std::string& name = "");
+    // The 48 most recent sessions, oldest first.
     ERROR_CODE list_recordings(std::vector<RecordingStatus>& out);
 
     // Free / total bytes on the device's recording store. Queryable any time,
@@ -123,11 +125,15 @@ public:
     ERROR_CODE delete_recording(const std::string& name);
 
     // Pull a device recording over the control link (USB/BLE, no WiFi needed).
-    // A failed run leaves a partial file at dest_path, not a valid .mcap until a
-    // run returns SUCCESS. A re-run resumes it after verifying it belongs to
-    // this recording.
+    // dest_path names the output file, or an existing directory to write
+    // <name>.mcap into. saved_path reports the file this call targets after that
+    // resolution; it is filled in even when the call then fails, so it is the
+    // path to look at, not proof one was written. A failed run leaves a partial
+    // file there, not a valid .mcap until a run returns SUCCESS. A re-run resumes
+    // it after verifying it belongs to this recording.
     ERROR_CODE download_recording(const std::string& name,
-                                  const std::string& dest_path);
+                                  const std::string& dest_path,
+                                  std::string* saved_path = nullptr);
 
     ERROR_CODE upload_recording(const std::string& name, const std::string& url);
     ERROR_CODE stop_upload(const std::string& name);
@@ -149,24 +155,66 @@ public:
     // category; this is the specific reason and is often the only actionable part.
     const std::string& last_error_message() const;
 
+    // country: e.g. "US". Leave it empty and the device reads the regulatory
+    // domain out of nearby beacons, which is what decides whether channels 12-13
+    // and the 5 GHz band are usable at all.
+    // band: AUTO leaves any stored band pin alone; use wifi_select to clear one.
     ERROR_CODE wifi_add(const std::string& ssid, const std::string& psk,
-                        const std::string& country = "");  // e.g. "US" unlocks 5 GHz
+                        const std::string& country = "",
+                        BAND band = BAND::AUTO);
     ERROR_CODE wifi_remove(const std::string& ssid);
-    ERROR_CODE wifi_select(const std::string& ssid);
+    // Prefer a saved network, optionally pinning it to one radio of a dual-band
+    // AP. A band the AP does not offer is refused without disturbing the link.
+    ERROR_CODE wifi_select(const std::string& ssid, BAND band = BAND::AUTO);
 
     // Access points in range, strongest first. DEVICE_BUSY while recording or
     // livestreaming (a scan would disrupt the link); retry once idle.
     ERROR_CODE scan_wifi_networks(std::vector<WifiNetwork>& out);
 
     // Rekey the device control password (shared by BLE and USB). The old password
-    // is required, except on an UNLOCKED USB link where it may be "" (physical
-    // access resets a forgotten one). Once USB is locked that shortcut is gone
-    // and factory_reset() is the escape.
+    // is required, except on an unlocked USB link, where it may be "".
+    //
+    // ⚠ An ADMINISTRATOR grant also substitutes for the old password. Call
+    // authenticate_admin() immediately before this to use it; the alternative for a
+    // forgotten password is factory_reset(), which destroys the encryption key.
     ERROR_CODE set_ble_password(const std::string& old_password,
                                 const std::string& new_password);
 
-    // Lock or unlock the USB control plane. Unlocked (factory default) USB has
-    // full privileges; locked, it gates exactly like BLE and open() authenticates
+    // Rekey the ADMINISTRATOR password, the separate credential that guards reading
+    // and destroying the encryption key.
+    //
+    // There is no factory default for it. Pass an empty `old_password` to set one on a
+    // device that has none; once set, changing it requires the current value, on either
+    // transport. A lost administrator password is recoverable only by factory_reset(),
+    // which destroys the encryption key anyway.
+    //
+    // A new password shorter than 8 characters is refused by the DEVICE with
+    // INVALID_PARAMETER; the host does not pre-check it, so read last_error_message().
+
+    ERROR_CODE set_admin_password(const std::string& old_password,
+                                  const std::string& new_password);
+
+    // ⚠ REMOVE the administrator credential, returning the device to "no administrator
+    // password": the encryption-key verbs and set_encryption drop back to the control
+    // password, and any installed key becomes readable by whoever holds it. A
+    // DOWNGRADE, so the device demands the current password on top of the admin grant.
+    ERROR_CODE clear_admin_password(const std::string& current_password);
+
+    // Prove the administrator credential NOW, instead of waiting for a verb to demand
+    // it. Needed only for set_ble_password()'s rescue, which cannot escalate by itself.
+    //
+    // ⚠ The grant is SINGLE-USE and the device spends it on the first admin-gated verb.
+    // Call the verb you want immediately afterwards, with nothing in between, or you
+    // will spend the grant on something else. The intended sequence is exactly:
+    //     authenticate_admin(admin_pw);
+    //     set_ble_password("", new_worker_pw);
+    //
+    // INVALID_PASSWORD means refused, and the handle keeps whatever it already held.
+    ERROR_CODE authenticate_admin(const std::string& admin_password);
+
+    // Lock or unlock the USB control plane. Unlocked (factory default) USB answers at
+    // the CONTROL-password tier with no password at all; the administrator verbs still
+    // refuse it, because physical access is not admin. Locked, it gates exactly like BLE and open() authenticates
     // with InitParameters::ble_password. Toggling requires the current password.
     //
     // session_only opens a LOCKED device for this power session without changing
@@ -177,11 +225,14 @@ public:
     ERROR_CODE set_usb_lock(bool locked, bool session_only = false);
 
     // Turn at-rest video encryption on/off for SUBSEQUENT recordings; existing
-    // ones keep whatever they were written with. Refused with INVALID_PARAMETER
+    // ones keep whatever they were written with. Refused with INVALID_FUNCTION_CALL
     // if no key exists, so "enabled" never means "recording in the clear".
+    // Requires the ADMINISTRATOR password when the device has one.
     ERROR_CODE set_encryption(bool enabled);
 
-    // Read the video-encryption key. Gated on the same password as the lock.
+    // Read the video-encryption key. Requires the ADMINISTRATOR password when the device
+    // has one, on either transport and independently of the lock; with none set, the
+    // control password is enough and DeviceInformation reports the key as unprotected.
     // `present` is false when no key exists, which is not an error.
     ERROR_CODE get_encryption_key(EncryptionKey& out);
 
@@ -189,14 +240,23 @@ public:
     // the key is handed out in full at creation, so the caller must keep it: it is
     // what decrypts every recording made from here on.
     //
-    // Refused with INVALID_PARAMETER when a key already exists, because replacing
+    // Refused with INVALID_FUNCTION_CALL when a key already exists, because replacing
     // one would make every recording written under it permanently undecryptable.
     // Rotation is delete_encryption_key() then create, two deliberate steps.
+    // Requires the ADMINISTRATOR password when the device has one.
     ERROR_CODE create_encryption_key(EncryptionKey& out);
 
+    // Install a key the caller already holds, so a fleet can share one archive key.
+    // `key` must be exactly 32 bytes. Refused when a key already exists or the device
+    // is not idle; rotation is delete_encryption_key() then set, then set_encryption().
+    //
+    // `out` names the key (key_id, algorithm, present); its `key` is EMPTY, since the
+    // caller supplied the bytes.
+    // Requires the ADMINISTRATOR password when the device has one.
+    ERROR_CODE set_encryption_key(const std::vector<uint8_t>& key, EncryptionKey& out);
+
     // Destroy the device's encryption key. `key_id` must match the installed key
-    // (see DeviceInformation::encryption_key_id), which is what stops a caller
-    // destroying a key it never identified; INVALID_PARAMETER if it does not.
+    // (see DeviceInformation::encryption_key_id); INVALID_FUNCTION_CALL if it does not.
     //
     // `out` carries the destroyed key, with present == false. That is the last
     // chance to keep it for ciphertext already recorded under it; afterwards
@@ -204,18 +264,19 @@ public:
     //
     // Refused unless the device is IDLE: a running session holds the key in
     // memory and would keep encrypting under it after the call reported it gone.
+    // Requires the ADMINISTRATOR password, on the same terms as get_encryption_key().
     ERROR_CODE delete_encryption_key(const std::string& key_id, EncryptionKey& out);
 
-    // Restore factory settings: password to default, USB unlocked, encryption
-    // off, and wifi, calibration, capture config, recordings and runtime state
-    // cleared. Ungated on USB only, so physical possession is the escape when the
-    // password is lost; over BLE it needs the password like any other verb.
+    // Restore factory settings: the control password back to its default, the
+    // administrator password REMOVED (it has no default to restore), USB unlocked,
+    // encryption off, and wifi, calibration, capture config, recordings and runtime
+    // state cleared. Unauthenticated only over USB, so physical possession is the
+    // escape when the password is lost; over BLE it needs the password like any
+    // other verb.
     //
     // WARNING: DESTROYS the encryption key. Every recording made under it becomes
     // permanently undecryptable, including copies already uploaded elsewhere.
-    // Unlike delete_encryption_key() it does NOT return the key first: this verb
-    // answers unauthenticated over USB, and handing a key to an unauthenticated
-    // caller is exactly the exposure destroying it removes.
+    // It does NOT return the key first; use delete_encryption_key() to keep a copy.
     //
     // Refused while a capture is active.
     ERROR_CODE factory_reset();
@@ -271,8 +332,6 @@ private:
 
 // ---- update-check service ------------------------------------------------------------
 // Maps {model, running version, board, unit} to the bundle a device should install next.
-// The answer is not trusted: the device still ECDSA-verifies the bundle and refuses
-// anything not strictly newer, so a wrong answer wastes a download, nothing more.
 
 // $EF_UPDATE_CHECK_URL if set, else the compiled-in default.
 std::string update_check_url();

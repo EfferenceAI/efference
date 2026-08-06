@@ -113,10 +113,18 @@ ERROR_CODE Device::health_check(HealthStatus& out, bool deep) {
     }
 }
 
-// ---- wireless -----------------------------------------------------------------------
+// ---- wireless -------------------------------------------------------------
+
+static ef_v1_WifiBand wire_band(BAND b) {
+    switch (b) {
+        case BAND::GHZ_2_4: return ef_v1_WifiBand_WIFI_BAND_2_4_GHZ;
+        case BAND::GHZ_5:   return ef_v1_WifiBand_WIFI_BAND_5_GHZ;
+        default:            return ef_v1_WifiBand_WIFI_BAND_AUTO;
+    }
+}
 
 ERROR_CODE Device::wifi_add(const std::string& ssid, const std::string& psk,
-                            const std::string& country) {
+                            const std::string& country, BAND band) {
     if (!is_open())   return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (ssid.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
     WireRequest req = ef_v1_Request_init_zero;
@@ -125,6 +133,7 @@ ERROR_CODE Device::wifi_add(const std::string& ssid, const std::string& psk,
     std::snprintf(req.body.wifi_add.psk,  sizeof req.body.wifi_add.psk,  "%s", psk.c_str());
     // ISO 3166-1 alpha-2 regdomain ("US" unlocks 5 GHz); "" keeps the current
     // one. The wire field is 3 chars + NUL, snprintf truncates anything longer.
+    req.body.wifi_add.band = wire_band(band);
     std::snprintf(req.body.wifi_add.country, sizeof req.body.wifi_add.country,
                   "%s", country.c_str());
     WireResponse resp;
@@ -164,12 +173,13 @@ ERROR_CODE Device::wifi_remove(const std::string& ssid) {
     return ec;
 }
 
-ERROR_CODE Device::wifi_select(const std::string& ssid) {
+ERROR_CODE Device::wifi_select(const std::string& ssid, BAND band) {
     if (!is_open())   return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (ssid.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
     WireRequest req = ef_v1_Request_init_zero;
     req.which_body = ef_v1_Request_wifi_select_tag;
     std::snprintf(req.body.wifi_select.ssid, sizeof req.body.wifi_select.ssid, "%s", ssid.c_str());
+    req.body.wifi_select.band = wire_band(band);
     WireResponse resp;
     ERROR_CODE ec = impl_->call(req, resp);
     if (ec == ERROR_CODE::SUCCESS) impl_->refresh_wireless();
@@ -190,7 +200,8 @@ ERROR_CODE Device::scan_wifi_networks(std::vector<WifiNetwork>& out) {
     out.clear();
     out.reserve(r.networks_count);
     for (pb_size_t i = 0; i < r.networks_count; i++)
-        out.push_back({r.networks[i].ssid, r.networks[i].rssi, r.networks[i].secured});
+        out.push_back({r.networks[i].ssid, r.networks[i].rssi,
+                       r.networks[i].secured, r.networks[i].freq_mhz});
     std::sort(out.begin(), out.end(),
               [](const WifiNetwork& a, const WifiNetwork& b) { return a.rssi > b.rssi; });
     return ERROR_CODE::SUCCESS;
@@ -202,8 +213,8 @@ ERROR_CODE Device::set_ble_password(const std::string& old_password,
                                     const std::string& new_password) {
     if (!is_open())           return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (new_password.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
-    // Over BLE the device demands the old password; over USB an empty
-    // old_password resets a forgotten one (physical access is the credential).
+    // See Device.hpp. The empty-old_password reset needs an UNLOCKED USB link, not
+    // merely USB: a locked one is gated exactly like BLE.
     WireRequest req = ef_v1_Request_init_zero;
     req.which_body = ef_v1_Request_set_ble_password_tag;
     std::snprintf(req.body.set_ble_password.old_password,
@@ -211,7 +222,95 @@ ERROR_CODE Device::set_ble_password(const std::string& old_password,
     std::snprintf(req.body.set_ble_password.new_password,
                   sizeof req.body.set_ble_password.new_password, "%s", new_password.c_str());
     WireResponse resp;
-    return impl_->call(req, resp);   // AUTH_FAILED -> INVALID_PASSWORD
+    ERROR_CODE ec = impl_->call(req, resp);   // AUTH_FAILED -> INVALID_PASSWORD
+    // The rotation revokes the grant it was made under, so the next call re-authenticates
+    // -- with the old password unless the handle adopts the new one here.
+    if (ec == ERROR_CODE::SUCCESS) impl_->adopt_ble_password(new_password);
+    return ec;
+}
+
+ERROR_CODE Device::set_admin_password(const std::string& old_password,
+                                      const std::string& new_password) {
+    if (!is_open())           return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    if (new_password.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
+    // An empty old_password is the FIRST-TIME provisioning case: a device with no
+    // administrator credential has nothing to prove, and the device makes that path
+    // reachable at OPERATOR. Once one exists it demands the current value, so this is
+    // not a shortcut a caller can take on a provisioned device.
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_set_admin_password_tag;
+    std::snprintf(req.body.set_admin_password.old_password,
+                  sizeof req.body.set_admin_password.old_password, "%s", old_password.c_str());
+    std::snprintf(req.body.set_admin_password.new_password,
+                  sizeof req.body.set_admin_password.new_password, "%s", new_password.c_str());
+    WireResponse resp;
+    // The device requires an ADMIN grant to change the admin password, and call()
+    // earns that grant by replaying init.admin_password. For THIS verb the caller has
+    // already told us the current password -- it is old_password -- so escalate with
+    // that rather than whatever the handle was opened with. Otherwise rotating twice,
+    // or rotating from a value that is not the one passed to open(), fails with the
+    // right password in hand and forces a redundant --admin-password on every call.
+    //
+    // Passed as an argument rather than written into init first: that write raced every
+    // other thread's read of the field, and on a REFUSED rotation it left the wrong
+    // password installed as the handle's credential, so the next key read escalated
+    // with it and latched admin_pw_bad.
+    ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::CONTROL,
+                                &old_password);   // AUTH_FAILED -> INVALID_PASSWORD
+    // Adopt the new value on success, or the next key read escalates with the
+    // pre-rotation password and latches. Rotate-then-read is the documented
+    // provisioning sequence.
+    if (ec == ERROR_CODE::SUCCESS) impl_->adopt_admin_password(new_password);
+    return ec;
+}
+
+ERROR_CODE Device::clear_admin_password(const std::string& current_password) {
+    if (!is_open())               return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    if (current_password.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_clear_admin_password_tag;
+    std::snprintf(req.body.clear_admin_password.current_password,
+                  sizeof req.body.clear_admin_password.current_password,
+                  "%s", current_password.c_str());
+    WireResponse resp;
+    // Escalate with the password being removed, for the same reason set_admin_password
+    // passes old_password: the caller has just told us the current value, and writing
+    // it into init first would both race other threads and outlive the call.
+    ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::CONTROL, &current_password);
+    // The handle's stored admin credential no longer names anything, and the verbs it
+    // was for are back on the control password.
+    if (ec == ERROR_CODE::SUCCESS) impl_->adopt_admin_password(InitParameters{}.admin_password);
+    return ec;
+}
+
+ERROR_CODE Device::authenticate_admin(const std::string& admin_password) {
+    if (!is_open())             return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    if (admin_password.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
+    // ctl_mtx directly, not through call(): control_auth_locked assumes it is held, and
+    // there is no verb to wrap here -- proving the credential IS the operation.
+    std::lock_guard<std::mutex> lk(impl_->ctl_mtx);
+    // Deliberately does not touch admin_pw_bad. That latch exists to stop a wrong
+    // init.admin_password re-running a 200k-iteration derivation on every call; a
+    // credential passed explicitly is the caller's to retry, and latching it here would
+    // condemn init.admin_password for a value it never described.
+    const bool was_authed = impl_->authenticated;
+    bool refused_at_challenge = false;
+    // Scoped to SetBlePassword: the rescue is what this call exists for, and the one
+    // admin path call()'s automatic escalation cannot reach.
+    ERROR_CODE ec = impl_->control_auth_locked(admin_password,
+                                               ef_v1_AuthRole_AUTH_ROLE_ADMIN,
+                                               &refused_at_challenge,
+                                               ef_v1_Request_set_ble_password_tag);
+    if (ec == ERROR_CODE::SUCCESS) return ec;
+    // ⚠ Failing must not leave the handle worse off than before it asked, and the two
+    // failures differ. Refused BEFORE a nonce was issued (no administrator password on
+    // the device): nothing was revoked, but control_auth_locked writes `authenticated`
+    // unconditionally, so put it back. Refused at the PROOF: the challenge already
+    // revoked this link's grant, so re-earn the operator one or every later verb fails
+    // for a credential the caller never got wrong.
+    if (refused_at_challenge)      impl_->authenticated = was_authed;
+    else if (impl_->ever_authed)   (void)impl_->control_auth_locked(impl_->init.ble_password);
+    return ec;
 }
 
 
@@ -361,8 +460,15 @@ ERROR_CODE Device::set_encryption(bool enabled) {
     return impl_->call(req, resp);
 }
 
-// All three key verbs answer with the same EncryptionKey body, so they share one
-// unpack; only the request differs.
+// All four key verbs answer with the same EncryptionKey body, so they share one
+// unpack. Set's reply carries an empty `key`, which needs no special case.
+// Volatile, not memset: a wipe nothing reads again is a dead store the compiler may
+// drop. libcrypto is BLE-conditional here, so OPENSSL_cleanse is unavailable.
+static void secure_zero(void* p, size_t n) {
+    volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) v[i] = 0;
+}
+
 static void unpack_key(const WireResponse& resp, EncryptionKey& out) {
     out.algorithm = static_cast<ENCRYPTION_ALGORITHM>(resp.body.encryption_key.algorithm);
     out.present   = resp.body.encryption_key.present;
@@ -397,6 +503,30 @@ ERROR_CODE Device::create_encryption_key(EncryptionKey& out) {
     return ERROR_CODE::SUCCESS;
 }
 
+ERROR_CODE Device::set_encryption_key(const std::vector<uint8_t>& key, EncryptionKey& out) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    out = EncryptionKey{};
+    // Checked here too: an oversized key fails the nanopb decode, so the peer would
+    // report a malformed frame rather than "wrong length".
+    WireRequest req = ef_v1_Request_init_zero;
+    if (key.size() != sizeof req.body.set_encryption_key.key.bytes)
+        return ERROR_CODE::INVALID_FUNCTION_CALL;
+    req.which_body = ef_v1_Request_set_encryption_key_tag;
+    std::memcpy(req.body.set_encryption_key.key.bytes, key.data(), key.size());
+    req.body.set_encryption_key.key.size = static_cast<pb_size_t>(key.size());
+    // Algorithm left UNSPECIFIED, as create does: the device picks its default.
+    WireResponse resp;
+    ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_encryption_key_tag);
+    // The only key verb whose REQUEST carries the secret; the caller's own wipe cannot
+    // reach this copy.
+    secure_zero(req.body.set_encryption_key.key.bytes,
+                sizeof req.body.set_encryption_key.key.bytes);
+    req.body.set_encryption_key.key.size = 0;
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    unpack_key(resp, out);
+    return ERROR_CODE::SUCCESS;
+}
+
 ERROR_CODE Device::delete_encryption_key(const std::string& key_id, EncryptionKey& out) {
     if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     out = EncryptionKey{};
@@ -416,7 +546,17 @@ ERROR_CODE Device::factory_reset() {
     WireRequest req = ef_v1_Request_init_zero;
     req.which_body = ef_v1_Request_factory_reset_tag;
     WireResponse resp;
-    return impl_->call(req, resp);
+    ERROR_CODE ec = impl_->call(req, resp);
+    // A reset returns the control password to its default and REMOVES the administrator
+    // one, so the values this handle holds are now wrong. Adopt them, or the next gated verb
+    // re-authenticates with the pre-reset password, fails, and latches -- which would
+    // make the handle refuse a password that is in fact correct until it is reopened.
+    if (ec == ERROR_CODE::SUCCESS) {
+        const InitParameters factory;
+        impl_->adopt_ble_password(factory.ble_password);
+        impl_->adopt_admin_password(factory.admin_password);
+    }
+    return ec;
 }
 
 ERROR_CODE Device::reboot() {

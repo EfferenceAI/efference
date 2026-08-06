@@ -108,6 +108,10 @@ ef.v1.AuthChallenge.salt                  max_size:16     # PBKDF2 salt (not sec
 ef.v1.Authenticate.response               max_size:32     # HMAC-SHA256 = 32 bytes
 ef.v1.SetBlePassword.old_password         max_size:64
 ef.v1.SetBlePassword.new_password         max_size:64
+ef.v1.SetAdminPassword.old_password       max_size:64     # same shape as the operator credential
+ef.v1.SetAdminPassword.new_password       max_size:64
+ef.v1.ClearAdminPassword.current_password  max_size:64
 ef.v1.EncryptionKey.key                   max_size:32     # AES-256 = 32 bytes; widen with the enum
 ef.v1.EncryptionKey.key_id                max_size:16     # 8 hex chars + NUL, room to widen
 ef.v1.DeleteEncryptionKey.key_id          max_size:16
+ef.v1.SetEncryptionKey.key                max_size:32     # an oversized key fails the WHOLE decode, so clients length-check first

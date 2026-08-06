@@ -56,9 +56,13 @@ ERROR_CODE Device::enable_recording(RecordingParameters params) {
     // illegal-state pre-check (decided without touching the device): a second
     // recording, or one during update/upload, is known-illegal locally. A concurrent
     // health sweep is caught device-side (BUSY/INVALID_STATE via Ctx::RECORDING).
-    if (impl_->device_rec || impl_->dev_recording || impl_->dev_uploading ||
-        impl_->state == DEVICE_STATE::UPDATING)
+    if (impl_->state == DEVICE_STATE::UPDATING)
         return ERROR_CODE::INVALID_FUNCTION_CALL;
+    // A recording or upload already running is a transient holder, so say BUSY
+    // ("retry once idle") rather than the catch-all wrong-state code, which gave
+    // no hint that something else owns the device.
+    if (impl_->device_rec || impl_->dev_recording || impl_->dev_uploading)
+        return ERROR_CODE::DEVICE_BUSY;
     WireRequest req = ef_v1_Request_init_zero;
     req.which_body                  = ef_v1_Request_start_recording_tag;
     req.body.start_recording.target = ef_v1_RecordingTarget_REC_DEVICE_LOCAL;
@@ -146,9 +150,31 @@ ERROR_CODE Device::get_recording_status(RecordingStatus& out, const std::string&
     impl_->refresh_device_state();
 
     out = RecordingStatus{};
-    {
-        // No get_recording_status verb on device (would answer UNSUPPORTED);
-        // compose it from list_recordings plus storage/upload status below.
+    // "" = the active session: ours if one is running, else whichever the device
+    // reports as recording.
+    const std::string want = name.empty() ? impl_->device_rec_name : name;
+    bool have = false;
+    if (!want.empty()) {
+        // A named session resolves off the device's filesystem, so it works for
+        // sessions outside the 48 that list_recordings can carry.
+        WireRequest req = ef_v1_Request_init_zero;
+        req.which_body = ef_v1_Request_get_recording_status_tag;
+        std::snprintf(req.body.get_recording_status.name,
+                      sizeof req.body.get_recording_status.name, "%s", want.c_str());
+        WireResponse resp;
+        ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_recording_status_tag,
+                                    Ctx::RECORDING);
+        if (ec == ERROR_CODE::SUCCESS) {
+            recording_from_wire(resp.body.recording_status, &out);
+            have = true;
+        } else if (ec != ERROR_CODE::UNSUPPORTED) {
+            return ec;                    // real failure, including NOT_FOUND
+        }
+        // UNSUPPORTED: firmware predating the verb. Fall through to the list.
+    }
+    if (!have) {
+        // Also the only way to answer "which session is live?", which no
+        // name-keyed verb can. Carries only the 48 most recent sessions.
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_list_recordings_tag;
         WireResponse resp;
@@ -156,9 +182,6 @@ ERROR_CODE Device::get_recording_status(RecordingStatus& out, const std::string&
                                     Ctx::RECORDING);
         if (ec != ERROR_CODE::SUCCESS) return ec;
         const WireRecordingList& L = resp.body.recording_list;
-        // "" = the active session: ours if one is running, else whichever the
-        // device reports as recording.
-        const std::string want = name.empty() ? impl_->device_rec_name : name;
         const WireRecording* hit = nullptr;
         for (pb_size_t i = 0; i < L.recordings_count; i++) {
             if (want.empty() ? L.recordings[i].recording
@@ -244,26 +267,34 @@ ERROR_CODE Device::delete_recording(const std::string& name) {
 }
 
 ERROR_CODE Device::download_recording(const std::string& name,
-                                      const std::string& dest_path) {
+                                      const std::string& dest_path,
+                                      std::string* saved_path) {
     if (!is_open())                        return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (name.empty() || dest_path.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
 
-    // Device answers plain FAILURE (not NOT_FOUND) for a missing recording, which
-    // maps to SESSION_RECORDING_ERROR; pre-validate the name against list_recordings
-    // so a bad name reports RECORDING_NOT_FOUND (and no empty dest file is created).
-    {
-        WireRequest req = ef_v1_Request_init_zero;
-        req.which_body = ef_v1_Request_list_recordings_tag;
-        WireResponse resp;
-        ERROR_CODE ec = impl_->call(req, resp, ef_v1_Response_recording_list_tag,
-                                    Ctx::RECORDING);
-        if (ec != ERROR_CODE::SUCCESS) return ec;
-        const WireRecordingList& L = resp.body.recording_list;
-        bool found = false;
-        for (pb_size_t i = 0; i < L.recordings_count && !found; i++)
-            found = (name == L.recordings[i].name);
-        if (!found) return ERROR_CODE::RECORDING_NOT_FOUND;
+    // A directory destination means "put it in here", the way scp and adb pull
+    // read it. fopen() rejects one with EISDIR, so without this a plain
+    // `download <name> ../` failed as if the recording were broken.
+    std::string out_path = dest_path;
+    struct stat ds;
+    if (::stat(out_path.c_str(), &ds) == 0 && S_ISDIR(ds.st_mode)) {
+        // The name is joined onto a caller-chosen directory, and callers get names
+        // from list_recordings() -- i.e. from the device. Reject a separator or a
+        // parent ref before the join rather than trusting the peer not to send one.
+        if (name.find('/') != std::string::npos ||
+            name.find('\\') != std::string::npos ||
+            name == ".." || name.find("../") != std::string::npos)
+            return ERROR_CODE::INVALID_FUNCTION_CALL;
+        if (out_path.back() != '/') out_path += '/';
+        out_path += name + ".mcap";
     }
+    if (saved_path) *saved_path = out_path;
+
+    // No name pre-check against list_recordings: that list carries only 48
+    // sessions, so it refused names the device would have served. The
+    // device now answers NOT_FOUND itself, and chunk 0 below is fetched before the
+    // destination is opened, which is what keeps a bad name from leaving an empty
+    // file behind.
 
     // Pull loop, mirror of the OTA sideload push: request a window at each offset,
     // device returns up to 7168 B per response, loop to eof. Rides the control
@@ -302,20 +333,25 @@ ERROR_CODE Device::download_recording(const std::string& name,
     // inside chunk 0) AND is not longer than the live file (a longer "partial"
     // is from some other file; appending would return SUCCESS on an over-long
     // splice). Anything else starts clean over the old file.
+    // Chunk 0 is fetched FIRST, before the destination is created, so a name the
+    // device rejects never leaves a 0-byte file behind. It replaces the round trip
+    // the old list_recordings pre-check spent, and also serves the resume compare.
     uint64_t offset = 0;
     uint64_t total = 0;  // device-reported size, from the last chunk seen
     bool append = false;
-    if (std::FILE* old = std::fopen(dest_path.c_str(), "rb")) {
+    WireResponse first;
+    {
+        ERROR_CODE ec = fetch(0, first);
+        if (ec != ERROR_CODE::SUCCESS) return ec;
+    }
+    if (std::FILE* old = std::fopen(out_path.c_str(), "rb")) {
         uint8_t head[sizeof(ef_v1_RecordingChunk{}.data.bytes)];
         size_t have = std::fread(head, 1, sizeof head, old);
         std::fseek(old, 0, SEEK_END);
         long old_size = std::ftell(old);
         std::fclose(old);
         if (have == sizeof head && old_size > 0) {
-            WireResponse resp;
-            ERROR_CODE ec = fetch(0, resp);
-            if (ec != ERROR_CODE::SUCCESS) return ec;
-            const ef_v1_RecordingChunk& c = resp.body.recording_chunk;
+            const ef_v1_RecordingChunk& c = first.body.recording_chunk;
             if (c.data.size == sizeof head &&
                 (uint64_t)old_size <= c.total &&
                 std::memcmp(c.data.bytes, head, sizeof head) == 0) {
@@ -325,8 +361,8 @@ ERROR_CODE Device::download_recording(const std::string& name,
         }
     }
 
-    std::FILE* f = std::fopen(dest_path.c_str(), append ? "ab" : "wb");
-    if (!f) return ERROR_CODE::SESSION_RECORDING_ERROR;
+    std::FILE* f = std::fopen(out_path.c_str(), append ? "ab" : "wb");
+    if (!f) return ERROR_CODE::DESTINATION_NOT_WRITABLE;
 
     ERROR_CODE result = ERROR_CODE::SUCCESS;
     for (;;) {
@@ -338,7 +374,7 @@ ERROR_CODE Device::download_recording(const std::string& name,
         total = c.total;
         if (c.data.size) {
             if (std::fwrite(c.data.bytes, 1, c.data.size, f) != c.data.size) {
-                result = ERROR_CODE::SESSION_RECORDING_ERROR;
+                result = ERROR_CODE::DESTINATION_NOT_WRITABLE;   // host disk, not the recording
                 break;
             }
             offset += c.data.size;

@@ -173,9 +173,19 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         case ef_v1_ErrorCode_STORAGE_FULL:             return ERROR_CODE::STORAGE_FULL;
         // Name conflict on record start (recording-specific, same meaning in any ctx).
         case ef_v1_ErrorCode_ALREADY_EXISTS:           return ERROR_CODE::RECORDING_ALREADY_EXISTS;
-        // Whatever was asked, the gate that failed is the BLE password.
+        // Whatever was asked, the gate that failed is a credential. ⚠ This runs inside
+        // call_locked on the FIRST round trip, before any escalation, and the collapsed
+        // code is also what call() returns on paths that never escalate at all: a
+        // latched credential, or a verb outside the escalation list. So it does NOT
+        // mean the admin password was tried and refused. Read resp.code for which gate
+        // it was, and last_error_message() for the device's own wording.
         case ef_v1_ErrorCode_AUTH_REQUIRED:
+        case ef_v1_ErrorCode_ADMIN_REQUIRED:
         case ef_v1_ErrorCode_AUTH_FAILED:              return ERROR_CODE::INVALID_PASSWORD;
+        // Retained for wire compatibility. No current firmware emits this code; the
+        // mapping stays so an older or future device that does is not reported as a
+        // password error, which would send the user hunting for the wrong fix.
+        case ef_v1_ErrorCode_USB_REQUIRED:             return ERROR_CODE::USB_REQUIRED;
         // A control request that timed out means the device stopped answering
         // (grab timeouts come from the host-side reader, never from here).
         case ef_v1_ErrorCode_TIMEOUT:
@@ -199,6 +209,9 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         case Ctx::RECORDING:
             switch (c) {
                 case ef_v1_ErrorCode_NOT_FOUND:         return ERROR_CODE::RECORDING_NOT_FOUND;
+                // Firmware predating a verb answers UNSUPPORTED; keep it distinct so
+                // the caller can fall back instead of reading it as a real failure.
+                case ef_v1_ErrorCode_UNSUPPORTED:       return ERROR_CODE::UNSUPPORTED;
                 // delete of the session that is recording right now; retry
                 // after stop (same shape as the WIFI-context BUSY).
                 case ef_v1_ErrorCode_BUSY:              return ERROR_CODE::DEVICE_BUSY;
@@ -641,32 +654,154 @@ struct Device::Impl {
     // One protobuf round trip: encode -> transport -> decode -> code check.
     // `ctx` selects the error translation; `expect` (optional) also requires
     // that response body tag.
+    // `admin_pw`, when given, is the admin credential to escalate with instead of
+    // init.admin_password. SetAdminPassword needs that: the caller has just supplied
+    // the current password as old_password, and writing it into init before the round
+    // trip both raced every other thread's read of that field and destroyed the stored
+    // credential whenever the rotation was refused.
     ERROR_CODE call(WireRequest& req, WireResponse& resp,
-                    pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL) {
+                    pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL,
+                    const std::string* admin_pw = nullptr) {
         std::lock_guard<std::mutex> lk(ctl_mtx);
         ERROR_CODE ec = call_locked(req, resp, expect, ctx);
-        // The device expires an idle authenticated session, because USB gives it
-        // no client-disconnect event to end one on. A handle that sat idle can
-        // therefore meet AUTH_REQUIRED mid-life through no fault of the caller.
-        // Re-run the handshake once and retry, so the expiry is invisible instead
-        // of surfacing as a spurious INVALID_PASSWORD.
-        //
-        // Only when this handle authenticated before: without that, a genuinely
-        // wrong password would retry on every single call.
-        if (ec == ERROR_CODE::INVALID_PASSWORD && authenticated && !reauthing) {
-            reauthing = true;
-            ERROR_CODE re = control_auth_locked(init.ble_password);
-            reauthing = false;
-            if (re == ERROR_CODE::SUCCESS) ec = call_locked(req, resp, expect, ctx);
+        if (reauthing) return ec;
+
+        // TWO rounds, not one. On a locked link a handle whose grant was revoked meets
+        // the OPERATOR gate first (AUTH_REQUIRED) and only sees ADMIN_REQUIRED after that
+        // clears, so a single pass re-authenticated as operator, retried, got
+        // ADMIN_REQUIRED and returned it as INVALID_PASSWORD without ever escalating.
+        for (int round = 0; round < 2 && ec == ERROR_CODE::INVALID_PASSWORD; ++round) {
+            // Which credential the device wants. `ec` already proves a decoded reply
+            // rejected us on one, so resp.code is safe to read and only says which.
+            //
+            // ⚠ Scoped to the seven verbs that can legitimately demand it: the peer chooses
+            // when to say ADMIN_REQUIRED, so the credential is never derived for a verb
+            // that has no business asking. control_auth_locked floors ch.iters for the
+            // same reason. Set/ClearAdminPassword belong here because changing or removing
+            // the credential needs a grant the client would otherwise never earn.
+            const bool admin = (resp.code == ef_v1_ErrorCode_ADMIN_REQUIRED) &&
+                               (req.which_body == ef_v1_Request_get_encryption_key_tag ||
+                                req.which_body == ef_v1_Request_delete_encryption_key_tag ||
+                                req.which_body == ef_v1_Request_create_encryption_key_tag ||
+                                req.which_body == ef_v1_Request_set_encryption_key_tag ||
+                                req.which_body == ef_v1_Request_set_encryption_tag ||
+                                req.which_body == ef_v1_Request_set_admin_password_tag ||
+                                req.which_body == ef_v1_Request_clear_admin_password_tag);
+            // Escalate on demand, so the admin password is never sent by an open() that
+            // will not need it. The other case is a grant revoked under an active handle by
+            // `lock on`, a password change, or the peer's own challenge. Skip both once a
+            // credential is known bad, or a wrong password re-runs the handshake every call.
+            //
+            // A caller-supplied admin credential is exempt from the latch, which
+            // describes init.admin_password and says nothing about this one.
+            // Empty = the caller supplied no admin credential, so there is nothing to
+            // prove it WITH -- skip rather than pay a challenge and a 200k-iteration
+            // derivation to fail. The device has no factory default here, so empty is the
+            // normal unset state.
+            const std::string& admin_cred = admin_pw ? *admin_pw : init.admin_password;
+            const bool blocked = admin ? (admin_cred.empty() || (!admin_pw && admin_pw_bad))
+                                       : (!ever_authed || operator_pw_bad);
+            if (blocked) break;
+
+            // Defensive: an ADMIN_REQUIRED for a verb outside the list above must stop
+            // here rather than fall into the operator arm, where it would run a full
+            // challenge + PBKDF2, retry, get the same answer and do it a SECOND time --
+            // four wasted round trips and two 200k-iteration derivations, each challenge
+            // revoking the link's grant, for a refusal no operator credential can clear.
+            //
+            // ⚠ The list above is NOT a mirror of the device's verb_requires_admin, even
+            // though the two agree today. It answers a different question: on which verbs
+            // will this handle derive PBKDF2 over its ADMIN password against a salt the
+            // PEER chose? BLE is Just Works with the bond purged per disconnect, so a
+            // peer is not authenticated. Do not widen it just to "match" a new device-side
+            // gate; widen it only if disclosing the admin credential on that verb is
+            // acceptable. This break is what makes a divergence a clean error.
+            //
+            // SetEncryptionKey is listed on its own merits, not to match the device:
+            // omitting it would protect nothing and would make the verb unreachable,
+            // since the break below turns a missing entry into an unclearable refusal.
+            //
+            // Device::authenticate_admin() derives outside this list and does not
+            // contradict it: the rule constrains what a PEER can elicit by answering
+            // ADMIN_REQUIRED, and there the caller chose to prove the credential.
+            if (resp.code == ef_v1_ErrorCode_ADMIN_REQUIRED && !admin) break;
+
+            // Scope guard, not a bare pair: call_locked allocates, so a propagating
+            // bad_alloc left `reauthing` true forever, and the check at the top of
+            // call() then short-circuited every later call on this handle. open()
+            // does not reset it, so the handle was stranded for good.
+            struct ReauthFlag {
+                bool& f;
+                explicit ReauthFlag(bool& b) : f(b) { f = true; }
+                ~ReauthFlag() { f = false; }
+            } reauth_flag(reauthing);
+            bool challenge_refused = false;
+            ERROR_CODE re = control_auth_locked(
+                admin ? admin_cred : init.ble_password,
+                admin ? ef_v1_AuthRole_AUTH_ROLE_ADMIN
+                      : ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED,
+                &challenge_refused,
+                admin ? req.which_body : 0);   // the grant is for this verb only
+            if (re == ERROR_CODE::SUCCESS) {
+                ec = call_locked(req, resp, expect, ctx);
+                // Still ADMIN_REQUIRED after we actually HELD an admin grant? Then the
+                // verb is not asking for a better credential and another handshake cannot
+                // help. Looping would also throw away the device's explanation, because
+                // call_locked clears last_dev_msg at the top of every round trip.
+                if (admin && resp.code == ef_v1_ErrorCode_ADMIN_REQUIRED) break;
+                continue;                      // a second refusal may want the other tier
+            }
+            // A handshake that failed for a NON-credential reason must not be reported as
+            // INVALID_PASSWORD: `ec` still holds the refused verb's code, so a cable
+            // glitch or a KDF failure mid-escalation told the user their correct password
+            // was wrong. Surface what actually went wrong instead.
+            if (re == ERROR_CODE::COMMUNICATION_ERROR || re == ERROR_CODE::UNKNOWN_FAILURE)
+                ec = re;
+            if (admin) {
+                if (re == ERROR_CODE::INVALID_PASSWORD && !admin_pw && !challenge_refused)
+                    // Only an actual credential refusal latches. COMMUNICATION_ERROR and
+                    // UNKNOWN_FAILURE mean the link or the KDF failed, not the password,
+                    // and latching on those turned one transient hiccup into a handle
+                    // that reported a correct admin password as wrong for its whole life.
+                    // A caller-supplied credential never latches: it is not the one the
+                    // latch describes.
+                    admin_pw_bad = true;
+                // Asking for a challenge REVOKES whatever grant the link held, so a
+                // refused escalation would otherwise leave the handle worse off than
+                // before it asked and break every later operator verb.
+                //
+                // ⚠ Not unconditional on the device side: a challenge REFUSED before it
+                // is issued costs the caller nothing, because the revoke happens only
+                // once the device has decided to answer. Restoring after such a refusal
+                // would tear down a live grant to re-earn it, which is why this is
+                // keyed on the stage rather than assumed from the loop's break above:
+                // resp.code there answers the original VERB, never the challenge.
+                if (ever_authed && !challenge_refused)
+                    (void)control_auth_locked(init.ble_password);
+            } else if (re == ERROR_CODE::INVALID_PASSWORD && !challenge_refused) {
+                // Same reasoning as admin_pw_bad, for the tier that had no latch: a
+                // wrong operator password otherwise re-ran a full challenge and PBKDF2
+                // on every call for the handle's whole life, because ever_authed is
+                // sticky-true and nothing else stopped the retry.
+                operator_pw_bad = true;
+            }
+            break;
         }
         return ec;
     }
+
 
     bool reauthing = false;   // guards the retry above against recursing
 
     // call()'s body. Assumes ctl_mtx is held, so the re-auth path can reuse it.
     ERROR_CODE call_locked(WireRequest& req, WireResponse& resp,
                            pb_size_t expect = 0, Ctx ctx = Ctx::CONTROL) {
+        // Cleared up front, not just before pb_decode: callers declare `WireResponse
+        // resp;` uninitialized, and the three failure paths below return without
+        // reaching a decode. Anything that inspects resp after a failed call would
+        // otherwise be reading indeterminate stack bytes -- call()'s ADMIN_REQUIRED
+        // check does exactly that.
+        std::memset(&resp, 0, sizeof resp);
         if (!connection) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
         req.corr_id = ++corr;
         uint8_t buf[8192];   // == proto::MAX_PAYLOAD: an OtaPushChunk request
@@ -680,7 +815,6 @@ struct Device::Impl {
         if (connection->request_raw(std::string((const char*)buf, os.bytes_written),
                                     reply, &type) != Status::SUCCESS)
             return ERROR_CODE::COMMUNICATION_ERROR;
-        std::memset(&resp, 0, sizeof resp);
         pb_istream_t is = pb_istream_from_buffer((const uint8_t*)reply.data(), reply.size());
         if (!pb_decode(&is, ef_v1_Response_fields, &resp))
             return ERROR_CODE::COMMUNICATION_ERROR;
@@ -958,7 +1092,7 @@ struct Device::Impl {
     }
 
     // No reply, as opposed to a reply saying "no". Only silence makes the view
-    // unknowable: a refusal still leaves what the ungated GetDeviceInformation
+    // unknowable: a refusal still leaves what GetDeviceInformation
     // supplied, which on a locked link is the real association.
     // DEVICE_NOT_AVAILABLE is deliberately absent -- err_from produces it from
     // DEVICE_SERVICE_UNREACHABLE, which IS a reply.
@@ -1050,40 +1184,124 @@ struct Device::Impl {
     // Atomic because is_authenticated() reads it outside ctl_mtx while call()
     // writes it under the lock.
     std::atomic<bool> authenticated{false};
+    // Sticky companion to `authenticated`. The retry path must ask "did this handle
+    // ever prove a credential", not "does it hold one now": a failed grant restore
+    // legitimately clears `authenticated`, and gating the retry on that made the
+    // failure permanent. Cleared with the rest of the auth state in open().
+    bool ever_authed = false;
+    // Latched when the handle's admin credential is refused, so a long-lived handle
+    // stops paying five round trips and two PBKDF2 derivations per call for a password
+    // that will not start working. Cleared by open() or by adopting a new one.
+    bool admin_pw_bad = false;
+    // The operator-tier twin of admin_pw_bad. Needed precisely BECAUSE ever_authed is
+    // sticky: without it a handle whose operator password stopped working retries the
+    // handshake on every call forever. Cleared by open() and by adopting a new one.
+    bool operator_pw_bad = false;
 
     ERROR_CODE control_auth(const std::string& pw) {
         std::lock_guard<std::mutex> lk(ctl_mtx);
         return control_auth_locked(pw);
     }
 
+    // Adopt a credential this handle just rotated successfully, so the next escalation
+    // or re-authentication uses the value the device now holds rather than the stale one
+    // open() was given. Under ctl_mtx because call() reads both fields under it.
+    void adopt_admin_password(const std::string& pw) {
+        std::lock_guard<std::mutex> lk(ctl_mtx);
+        init.admin_password = pw;
+        admin_pw_bad        = false;
+    }
+    void adopt_ble_password(const std::string& pw) {
+        std::lock_guard<std::mutex> lk(ctl_mtx);
+        init.ble_password = pw;
+        operator_pw_bad   = false;
+    }
+
     // Assumes ctl_mtx is held. The handshake is two round trips that must not be
     // interleaved with another thread's, and call()'s retry path already holds
     // the lock when it needs to re-run this.
-    ERROR_CODE control_auth_locked(const std::string& pw) {
+    //
+    // `role` picks WHICH credential is proven. It goes on the challenge as well as
+    // the proof: the device serves that credential's own salt and iteration count,
+    // so deriving with the wrong password cannot accidentally satisfy the other
+    // tier, and the device refuses a proof whose role disagrees with the nonce it
+    // issued.
+    // `refused_at_challenge` reports that the device turned the request down BEFORE
+    // issuing a nonce. That distinction is not cosmetic: no password was tested, so
+    // nothing may latch on it, and the device revokes the link's existing grant only
+    // once it has decided to answer, so there is nothing to restore either. err_from
+    // collapses the refusal to INVALID_PASSWORD, which is otherwise indistinguishable
+    // from a rejected PROOF.
+    // `admin_verb` is the Request tag an ADMIN grant is minted for; the device refuses an
+    // ADMIN handshake that names none. Unused for an operator handshake.
+    ERROR_CODE control_auth_locked(const std::string& pw,
+                                   ef_v1_AuthRole role = ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED,
+                                   bool* refused_at_challenge = nullptr,
+                                   pb_size_t admin_verb = 0) {
+        if (refused_at_challenge) *refused_at_challenge = false;
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_get_auth_challenge_tag;
+        req.body.get_auth_challenge.role = role;
         WireResponse resp;
         ERROR_CODE ec = call_locked(req, resp, ef_v1_Response_auth_challenge_tag);
         // Only AUTH_REQUIRED/AUTH_FAILED mean "wrong password". Everything else
         // (UNSUPPORTED, NOT_OPENED mid-OTA, transport loss) surfaces untranslated,
         // since no password was tested and INVALID_PASSWORD would mislead.
-        if (ec != ERROR_CODE::SUCCESS) return ec;
+        if (ec != ERROR_CODE::SUCCESS) {
+            if (refused_at_challenge) *refused_at_challenge = true;
+            return ec;
+        }
 
         const ef_v1_AuthChallenge& ch = resp.body.auth_challenge;
+        // The KDF parameters come from the peer, so a cost factor below what a real
+        // device sends is refused rather than derived against. Bounded on BOTH sides and
+        // compared in the same unsigned domain the field uses: `ch.iters < 200000` alone
+        // let 0x80000000 through, which the (int) cast below then made NEGATIVE,
+        // defeating the very cost factor the floor exists to guarantee.
+        //
+        // ⚠ NOT a copy of the firmware's AUTH_PBKDF2_ITERS, though they are equal today.
+        // That is "the cost this device chooses"; this is "the least cost this client
+        // will derive against for an untrusted peer". They are independent, and the
+        // coupling runs ONE WAY: a device may raise its value freely and this still
+        // holds, but a device that drops BELOW this floor is refused by every shipped
+        // client. So this may never be raised above what deployed firmware sends, and
+        // firmware may never lower AUTH_PBKDF2_ITERS under it. Stated at both ends;
+        // nothing enforces it, because the two live in different repos with no shared
+        // build.
+        static constexpr uint32_t kMinPbkdf2Iters = 200000u;
+        static constexpr uint32_t kMaxPbkdf2Iters = 10000000u;   // a peer must not stall us for hours
+        if (ch.iters < kMinPbkdf2Iters || ch.iters > kMaxPbkdf2Iters || ch.salt.size == 0)
+            return ERROR_CODE::COMMUNICATION_ERROR;
         uint8_t key[32], mac[32];
-        PKCS5_PBKDF2_HMAC(pw.c_str(), (int)pw.size(), ch.salt.bytes, (int)ch.salt.size,
-                          (int)ch.iters, EVP_sha256(), 32, key);
+        if (PKCS5_PBKDF2_HMAC(pw.c_str(), (int)pw.size(), ch.salt.bytes, (int)ch.salt.size,
+                              (int)ch.iters, EVP_sha256(), 32, key) != 1)
+            return ERROR_CODE::UNKNOWN_FAILURE;   // else `key` is used uninitialized
         unsigned int mlen = 0;
-        HMAC(EVP_sha256(), key, 32, ch.nonce.bytes, ch.nonce.size, mac, &mlen);
+        // Checked for the same reason as the derivation above, and it matters more here:
+        // on failure `mac` is uninitialized, gets sent as the proof, and comes back
+        // AUTH_FAILED -> INVALID_PASSWORD -> a latch that condemns a CORRECT password for
+        // the life of the handle. A nonce of zero length is refused on the same grounds:
+        // nanopb bounds it, but a zero-length one carries no freshness at all.
+        if (ch.nonce.size == 0 ||
+            HMAC(EVP_sha256(), key, 32, ch.nonce.bytes, ch.nonce.size, mac, &mlen) == nullptr ||
+            mlen != 32)
+            return ERROR_CODE::UNKNOWN_FAILURE;
 
         WireRequest areq = ef_v1_Request_init_zero;
         areq.which_body                     = ef_v1_Request_authenticate_tag;
+        // Set on the proof as well as the challenge, per docs/ble-integration.md. The
+        // device takes the granted tier from the nonce it issued, so this only lets it
+        // reject a caller whose claim disagrees -- but leaving it unset made the SDK
+        // the one client that never exercised its own documented contract.
+        areq.body.authenticate.role         = role;
+        areq.body.authenticate.admin_verb   = admin_verb;
         areq.body.authenticate.response.size = 32;
         std::memcpy(areq.body.authenticate.response.bytes, mac, 32);
         WireResponse aresp;
         // A wrong password answers AUTH_FAILED -> INVALID_PASSWORD via err_from.
         ERROR_CODE rc = call_locked(areq, aresp);
         authenticated = (rc == ERROR_CODE::SUCCESS);
+        if (rc == ERROR_CODE::SUCCESS) ever_authed = true;
         return rc;
     }
 

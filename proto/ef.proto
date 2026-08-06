@@ -37,7 +37,7 @@ message Request {
     StartUpload          start_upload           = 30;
     StopUpload           stop_upload            = 31;
     GetUploadStatus      get_upload_status      = 32;
-    // chunked upload (option b: app orchestrates via mTLS, device is a PUT-worker)
+    // chunked upload: the app orchestrates via mTLS, the device is a PUT-worker
     GetSessionManifest   get_session_manifest    = 33;
     PutChunks            put_chunks              = 34;
     GetChunkUploadStatus get_chunk_upload_status = 35;
@@ -80,12 +80,18 @@ message Request {
     Authenticate         authenticate           = 93;  // prove the control password (HMAC over nonce)
     SetBlePassword       set_ble_password       = 94;  // set/rekey; UNLOCKED usb may reset w/o old
     SetUsbLock           set_usb_lock           = 96;  // lock/unlock USB; locked USB gates like BLE
-    GetEncryptionKey     get_encryption_key     = 97;  // read the video-encryption key (gated)
-    FactoryReset         factory_reset          = 98;  // forgot-password escape; ungated on USB only
+    // ADMIN-gated once an administrator password exists, FactoryReset excepted; while
+    // none is set they are served at the control-password tier. See AuthRole.
+    GetEncryptionKey     get_encryption_key     = 97;  // read the video-encryption key
+    FactoryReset         factory_reset          = 98;  // lost-password recovery; over USB, possession authorises
     SetEncryption        set_encryption         = 99;  // turn at-rest video encryption on/off
-    CreateEncryptionKey  create_encryption_key  = 100; // generate a key; returned ONCE (gated)
-    DeleteEncryptionKey  delete_encryption_key  = 101; // destroy the key (gated, key_id must match)
+    CreateEncryptionKey  create_encryption_key  = 100; // generate a key; returned ONCE
+    DeleteEncryptionKey  delete_encryption_key  = 101; // destroy the key (key_id must match)
+    SetAdminPassword     set_admin_password     = 103; // provision one, or change it with the current
+    ClearAdminPassword   clear_admin_password   = 104; // REMOVE admin; needs the current one
+    SetEncryptionKey     set_encryption_key     = 105; // install a key the OPERATOR supplies
   }
+  reserved 102;
   reserved 90, 91, 95;
 }
 
@@ -113,7 +119,7 @@ message Response {
     StateInfo         state_info         = 75;
     Location          location           = 76;  // reply to GetLocation
     AuthChallenge     auth_challenge     = 92;  // reply to GetAuthChallenge
-    EncryptionKey     encryption_key     = 97;  // reply to Get/Create/DeleteEncryptionKey
+    EncryptionKey     encryption_key     = 97;  // reply to Get/Create/Delete/SetEncryptionKey
   }
   reserved 95;
 }
@@ -139,6 +145,10 @@ enum ErrorCode {
   AUTH_REQUIRED            = 16;  // BLE: authenticate before this verb is honored
   AUTH_FAILED              = 17;  // wrong password / bad challenge signature
   ALREADY_EXISTS           = 18;  // name conflict (e.g. start a recording whose name already exists)
+  ADMIN_REQUIRED           = 19;  // operator credential is not enough; authenticate with AUTH_ROLE_ADMIN
+  // The verb needs the USB link itself; no password satisfies it over BLE. Not the
+  // administrator tier, which is transport-independent.
+  USB_REQUIRED             = 20;
 }
 
 // ============================ Enums ============================
@@ -258,7 +268,7 @@ message UploadStatus {
   uint64 bytes_sent = 3; uint64 bytes_total = 4; ErrorCode last_error = 5;
 }
 
-// ============================ Chunked upload (option b) ============================
+// ============================ Chunked upload ============================
 // The APP (BLE central) holds the ONLY mTLS cert and runs the app-side ingest protocol
 // (create/finalize/refresh-url). The DEVICE is a PUT-worker: it lists a session's
 // chunks (GetSessionManifest), receives pre-signed per-chunk URLs (PutChunks),
@@ -280,7 +290,7 @@ message ChunkUploadStatus    { string name = 1; repeated ChunkResult results = 2
 // ============================ OTA (thin front-end over the device OTA) ============================
 // Thin front-end over the device OTA. Commit and rollback happen automatically
 // after boot; the host observes OTA_SUCCESS / OTA_ROLLEDBACK via OtaStatus.
-message OtaCheck     {}                      // RETIRED: the host queries the update-check service
+message OtaCheck     {}                      // the host queries the update-check service instead
 message OtaDownload  { string base_url = 1; }// required, one-shot; stages to the inactive slot
 message OtaApply     {}                      // apply the staged (verified) download, then reboot
 message OtaAbort     {}                      // kill a running download (apply = point of no return)
@@ -325,20 +335,26 @@ message HealthStatus {
 }
 
 // ============================ WiFi ============================
+// AUTO (the default) leaves band choice to the device: strongest AP in range wins.
+enum WifiBand { WIFI_BAND_AUTO = 0; WIFI_BAND_2_4_GHZ = 1; WIFI_BAND_5_GHZ = 2; }
+
 message WifiScan {}        message WifiScanResult { repeated WifiNetwork networks = 1; }
-message WifiNetwork { string ssid = 1; int32 rssi = 2; bool secured = 3; }
+// A dual-band AP publishes one SSID per radio, so it appears once per band.
+message WifiNetwork { string ssid = 1; int32 rssi = 2; bool secured = 3; int32 freq_mhz = 4; }
 message WifiAdd { string ssid = 1; string psk = 2;
                   // country: ISO 3166-1 alpha-2 (e.g. "US"); "" keeps the device regdomain (5 GHz needs it)
-                  string country = 3; }
+                  string country = 3;
+                  WifiBand band = 4; }  // AUTO leaves a stored band unchanged; WifiSelect clears it
 message WifiRemove { string ssid = 1; }
-message WifiSelect { string ssid = 1; }  // prefer a specific saved network
+// prefer a saved network; band is applied as given, so AUTO clears a pin
+message WifiSelect { string ssid = 1; WifiBand band = 2; }
 message WifiList {}        message WifiListResult { repeated string ssids = 1; }
 message StartWifiCheck {}  message GetWifiStatus {}
 message WifiStatus { bool connected = 1; string ssid = 2; int32 rssi = 3; string ip = 4;
                      bool internet = 5; double mbps_down = 6; double mbps_up = 7;
                      // Association phase from wpa_state: "connected" / "connecting"
                      // / "disconnected" / "auth_failed" (last connect rejected, e.g.
-                     // wrong password). "connected" stays for back-compat.
+                     // wrong password).
                      string state = 8;
                      int32  link_speed = 9;    // negotiated PHY link rate, Mbps (0 = unknown)
                      int32  freq_mhz   = 10;   // associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz)
@@ -371,7 +387,7 @@ message DeviceInformation {
   CameraIntrinsics camera = 7; ImuCalibration imu = 8;
   uint64 storage_total_bytes = 9;   // userdata (recording) filesystem, total
   uint64 storage_free_bytes  = 10;  // userdata (recording) filesystem, available
-  // ---- v1 additive (11+): previously host-struct-only, now reported on the wire.
+  // ---- v1 additive (11+)
   uint32       firmware_version_int   = 11;  // OTA monotonic int (from the version file)
   VideoConfig  current_config         = 12;  // current selected session config (w/h/fps/codec)
   RateControl  rate_control           = 13;  // current encoder rate-control
@@ -388,13 +404,17 @@ message DeviceInformation {
   EncryptionAlgorithm encryption_algorithm = 27;  // the installed key's cipher (UNSPECIFIED if none)
   // Reported ALONGSIDE usb_locked, which stays true: see SetUsbLock.session_only.
   bool         session_unlocked       = 28;
-  // An LE link is up on the device's radio right now -- in practice a central
-  // (phone app, ef-cli --ble), since the adapter only accepts. Read from the
-  // kernel's connection list per request, so it cannot outlive the link the way
-  // a cached flag would. Unlike bt_mac, which is identity, this is state.
-  // Always true when read over BLE (the request itself proves a link), so it
-  // cannot be used from a BLE session to detect a SECOND central.
+  // An LE central is connected now; always true when read over BLE.
   bool         ble_connected          = 30;
+  // This firmware enforces the ADMIN tier on the encryption-key verbs.
+  bool         admin_gate                = 31;
+  reserved 29, 32;
+  // An administrator password is set; there is no factory default. False means the
+  // encryption-key verbs are served at the control-password tier.
+  bool         admin_provisioned         = 34;
+  // A key exists with no administrator password, so the control password reads it.
+  // ⚠ Do not report such a device as protected. Setting one later protects it too.
+  bool         key_unprotected           = 33;
 }
 // Hardware capability menu, mirrors device.json (generated from CAPS[]).
 message CapMode { uint32 width = 1; uint32 height = 2; uint32 fps = 3; string binning = 4; bool usable = 5; }
@@ -413,7 +433,7 @@ message CameraIntrinsics {  // Double-Sphere
 message ImuCalibration {
   repeated double accel_bias = 1; repeated double gyro_bias = 2;
   double accel_noise_density = 3; double gyro_noise_density = 4; repeated double imu_to_camera = 5;
-  // ---- additive (6+): full per-sensor M·S·(x−b) model + noise-model + temporal (IMU lane, 2026-07-21).
+  // ---- additive (6+): full per-sensor M·S·(x−b) model, noise model, temporal offset.
   // Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
   // uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream.
   repeated double accel_scale_misalign = 6;   // accel 3x3 M·S, row-major (empty = identity)
@@ -435,20 +455,33 @@ message ResetCalibration { bool camera = 1; bool imu = 2; }
 
 
 // ============================ Auth / access control ============================
-// BLE control is gated by a user password (default 123456, rekeyable). The device
-// issues a nonce (GetAuthChallenge); the host proves the password with
-// Authenticate{response = HMAC-SHA256(key = PBKDF2(password), msg = nonce)}, the
-// password itself never crosses the air. SetBlePassword rekeys (BLE needs the old
-// password; the USB transport may reset without it, physical-access recovery).
-// USB control requires no password.
-message GetAuthChallenge {}
+// The device issues a nonce (GetAuthChallenge); the host proves a password with
+// Authenticate{response = HMAC-SHA256(PBKDF2(password, salt, iters), nonce)}. Two
+// credentials: OPERATOR (default 123456) and ADMIN, which guards the encryption-key
+// verbs. Full model: sdk/linux/README.md, "Access control and at-rest encryption".
+
+// Credential tier for the challenge and the proof. ADMIN grants are SINGLE-USE and
+// answered only once an administrator password is set (DeviceInformation.admin_provisioned).
+enum AuthRole {
+  AUTH_ROLE_UNSPECIFIED = 0;   // operator: the credential every verb below admin uses
+  AUTH_ROLE_ADMIN       = 1;
+}
+message GetAuthChallenge { AuthRole role = 1; }                        // whose KDF params to serve
 message AuthChallenge    { bytes nonce = 1;                            // 32-byte random, single-use
                            bytes salt = 2; uint32 iters = 3; }         // KDF params so host derives the key
-message Authenticate     { bytes response = 1; }                       // HMAC-SHA256(PBKDF2(pw,salt,iters), nonce)
+message Authenticate     { bytes response = 1;                         // HMAC-SHA256(PBKDF2(pw,salt,iters), nonce)
+                           AuthRole role = 2;                          // must match the challenge that issued the nonce
+                           uint32 admin_verb = 3; }                    // ADMIN only: the Request tag this grant may be spent on
 message SetBlePassword   { string old_password = 1; string new_password = 2; }
+// Provision the administrator password (empty old_password) or change it; changing
+// always requires the current value, on either transport.
+message SetAdminPassword { string old_password = 1; string new_password = 2; }
+// ⚠ Remove the administrator password: the key verbs drop back to the control
+// password. Needs an ADMIN grant AND the current password.
+message ClearAdminPassword { string current_password = 1; }
 
-// USB access control. Unlocked (factory default) USB has full privileges, matching
-// today's behavior. Locked, a USB session is gated exactly like a BLE one: only
+// USB access control. Unlocked (factory default) USB carries OPERATOR privilege with
+// no password, matching today's behavior for everything below the admin tier. Locked, a USB session is gated exactly like a BLE one: only
 // info, state, storage, the auth handshake, and FactoryReset answer without a
 // password. Toggling either way requires the current password.
 // session_only scopes it to this power session: {locked=false} opens a device that
@@ -464,20 +497,13 @@ enum EncryptionAlgorithm {
   ENC_ALG_AES_256_GCM = 1;
 }
 
-// Turn at-rest video encryption on or off for SUBSEQUENT recordings; existing
-// ones keep whatever they were written with. Enabling with no key is refused, so a
-// session can never silently record unencrypted after being told to encrypt.
-// `algorithm` must be one the device implements. Read the current state from
-// DeviceInformation.encryption_enabled.
+// Enable/disable at-rest encryption for SUBSEQUENT recordings; refused with no key.
+// State is DeviceInformation.encryption_enabled.
 message SetEncryption    { bool enabled = 1; EncryptionAlgorithm algorithm = 2; }
 
-// ---- key lifecycle ----
-// The device generates its own key and returns it ONCE, at creation. The operator
-// keeps that copy; the device keeps a working copy that a factory reset destroys.
-// Custody therefore moves to the operator at creation time, and there is no state
-// in which the device holds a key nobody else has.
-//
-// All three are gated on the control password (unlocked USB is trusted, as ever).
+// ---- key lifecycle: ADMIN-gated once an administrator password exists ----
+// A key is generated by the device (Create, returned ONCE) or supplied by the operator
+// (Set). Either way a factory reset destroys the device's copy.
 message GetEncryptionKey    {}
 // Refused when a key already exists: replacing one would make every recording
 // written under it permanently undecryptable, so rotation is delete-then-create,
@@ -492,6 +518,8 @@ message CreateEncryptionKey { EncryptionAlgorithm algorithm = 1; }   // 0 = devi
 // would keep encrypting under it, so the device would report the key destroyed
 // and then finish writing a recording that needs exactly that key.
 message DeleteEncryptionKey { string key_id = 1; }
+// Install a key the operator already holds. Exactly 32 bytes; refused while one exists.
+message SetEncryptionKey    { bytes key = 1; EncryptionAlgorithm algorithm = 2; }
 message EncryptionKey {
   EncryptionAlgorithm algorithm = 1;
   bytes  key      = 2;
@@ -499,21 +527,9 @@ message EncryptionKey {
   bool   present  = 4;   // false on a Delete reply: `key` is what was just destroyed
 }
 
-// Restore factory settings: password back to default, USB unlocked, encryption off,
-// wifi credentials and runtime state cleared.
-//
-// ⚠ It also DESTROYS the encryption key, which makes every recording ever written
-// under that key permanently undecryptable, including copies already uploaded
-// elsewhere. That is deliberate: while the reset preserved the key, a reset dropped
-// the password back to the default and the key could then simply be read out, so
-// physical access defeated encryption entirely. CreateEncryptionKey handing the key
-// to the operator once is what makes destroying it here acceptable.
-//
-// Device provisioning and factory-set identity survive the reset.
-//
-// Ungated on USB ONLY — physical possession is the credential, and that is the
-// forgot-password escape. Over BLE it requires auth like any other verb, because an
-// unauthenticated remote reset is now an unauthenticated remote way to destroy every
-// recording's key.
+// Restore factory settings: password, USB lock, encryption, wifi and runtime state.
+// ⚠ DESTROYS the encryption key, making every recording under it permanently
+// undecryptable. Provisioning and factory identity survive. Needs no password over
+// USB; over BLE it needs the control password.
 message FactoryReset     {}
 

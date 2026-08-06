@@ -40,24 +40,29 @@ cd efference
 ```
 
 On Debian or Ubuntu, pass `--deps` on the first build to install dependencies
-and the udev rule:
+and the udev rule, and `--install` to put `ef-cli` on your PATH:
 
 ```sh
-./build.sh --deps
+./build.sh --deps --install
 ```
+
+Unplug and replug the device afterwards so the new udev rule takes effect.
 
 With an Efference device connected over USB:
 
 ```sh
-./sdk/linux/build/ef-cli info
+ef-cli info                      # after --install
+./sdk/linux/build/ef-cli info    # or by full path, from a plain ./build.sh
 ```
 
-Recordings can be AES-256-GCM encrypted at rest under a key the device generates
-and hands over exactly once, and the USB control plane can be locked behind the
-same password that already gates Bluetooth LE. Both are off on a factory device:
+Recordings can be AES-256-GCM encrypted at rest, under a key the device generates and
+hands over exactly once or one you supply yourself, and the USB control plane can be
+locked behind the same password that already gates Bluetooth LE. Both are off on a
+factory device:
 
 ```sh
 ./sdk/linux/build/ef-cli encryption create   # generates the key and PRINTS IT, once
+./sdk/linux/build/ef-cli key set <64-hex>    # or install a key you already hold
 ./sdk/linux/build/ef-cli encryption on
 ./sdk/linux/build/ef-cli lock on             # USB now needs --password too
 ```

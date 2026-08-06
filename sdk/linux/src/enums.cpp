@@ -61,6 +61,8 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::STORAGE_FULL:                   return "STORAGE_FULL";
         case ERROR_CODE::RECORDING_NOT_FOUND:            return "RECORDING_NOT_FOUND";
         case ERROR_CODE::RECORDING_ALREADY_EXISTS:       return "RECORDING_ALREADY_EXISTS";
+        case ERROR_CODE::USB_REQUIRED:                   return "USB_REQUIRED";
+        case ERROR_CODE::DESTINATION_NOT_WRITABLE:       return "DESTINATION_NOT_WRITABLE";
         case ERROR_CODE::UNKNOWN_FAILURE:                return "UNKNOWN_FAILURE";
     }
     return "UNKNOWN_FAILURE";

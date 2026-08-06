@@ -42,12 +42,18 @@ using namespace ef;
 
 namespace {
 
+// Volatile, not memset: a wipe nothing reads again is a dead store the compiler may
+// drop. libcrypto is not linked here, so OPENSSL_cleanse is unavailable.
+void secure_zero(void* p, size_t n) {
+    volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) v[i] = 0;
+}
+
 // A key must not survive in this process longer than it is needed. Not a security
 // guarantee (the bytes were already on a socket and possibly a terminal), but it
 // keeps them out of a core dump or a later allocation of the same page.
 void wipe(std::vector<uint8_t>& k) {
-    volatile uint8_t* p = k.data();
-    for (size_t i = 0; i < k.size(); i++) p[i] = 0;
+    secure_zero(k.data(), k.size());
     k.clear();
 }
 
@@ -62,6 +68,65 @@ std::string key_hex_line(const std::vector<uint8_t>& k) {
     return s;
 }
 
+// A key's hex from a file, or stdin when `path` is "-". Whole-file, so a file with
+// no trailing newline works.
+bool read_key_source(const std::string& path, std::string& out) {
+    out.clear();
+    FILE* f = (path == "-") ? stdin : std::fopen(path.c_str(), "r");
+    if (!f) {
+        std::fprintf(stderr, "key set: %s: %s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
+    char buf[256];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    bool bad = std::ferror(f) != 0;
+    if (f != stdin) std::fclose(f);
+    secure_zero(buf, sizeof buf);
+    if (bad) { std::fprintf(stderr, "key set: %s: read failed\n", path.c_str()); return false; }
+    return true;
+}
+
+// -1 for anything that is not a hex digit.
+int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// The inverse of key_hex_line: exactly `2 * want` hex digits, either case, trailing
+// whitespace tolerated so a `key show --out` file reinstalls as-is. Rejected rather
+// than salvaged: a key parsed from a truncated string encrypts under bytes nobody
+// holds. Hand-decoded so nothing throws out of a CLI that catches nothing.
+bool key_from_hex(const std::string& in, size_t want, std::vector<uint8_t>& out) {
+    size_t n = in.find_last_not_of(" \t\n\v\f\r") + 1;   // npos + 1 == 0, all-whitespace
+    if (n != want * 2) return false;
+    out.assign(want, 0);
+    for (size_t i = 0; i < want; i++) {
+        int hi = hex_nibble(in[i * 2]), lo = hex_nibble(in[i * 2 + 1]);
+        if (hi < 0 || lo < 0) { wipe(out); return false; }
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+// Both ends of the key's life warn here, not only `info`: with no administrator
+// password the key is open to whoever holds the control password. To stderr, so a
+// piped `key show` is unaffected.
+//
+// key_unprotected, not !admin_provisioned: the device owns the definition of
+// "exposed", so a second copy of the formula here would silently stop agreeing.
+void warn_if_key_unprotected(ef::Device& dev) {
+    // ⚠ Refresh first: the cached snapshot is from open(), when `key set` had no key
+    // to report, so without this the warning could never fire on that command.
+    dev.refresh_device_information();
+    if (!dev.get_device_information().key_unprotected) return;
+    std::fputs("WARNING: no administrator password is set, so this key is readable by\n"
+               "anyone holding the control password. Set one with\n"
+               "'ef-cli set-admin-password <new>'.\n", stderr);
+}
+
 // Key to stdout, everything else to stderr, so `ef-cli key show > k` yields a file
 // holding the key and nothing else.
 void print_key_hex(const std::vector<uint8_t>& k) {
@@ -71,7 +136,7 @@ void print_key_hex(const std::vector<uint8_t>& k) {
     // buffered and the key would otherwise surface AFTER the instructions that
     // are meant to follow it.
     std::fflush(stdout);
-    std::memset(&line[0], 0, line.size());
+    secure_zero(&line[0], line.size());
 }
 
 // Write "<hex>\n" to `path`, 0600 at creation so it is never briefly world
@@ -93,7 +158,7 @@ int write_key_file(const std::string& path, const std::vector<uint8_t>& k) {
     std::string line = key_hex_line(k);
     bool ok = write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size());
     close(fd);
-    std::memset(&line[0], 0, line.size());
+    secure_zero(&line[0], line.size());
     if (!ok) {
         std::fprintf(stderr, "key show: writing %s failed\n", path.c_str());
         unlink(path.c_str());
@@ -107,21 +172,29 @@ void usage() {
     std::puts(
         "ef-cli: Efference M1 control tool\n"
         "\n"
-        "  ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--udp <host[:port]>]\n"
-        "     [--verbose] <command> [args]\n"
+        "  ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--admin-password <pw>]\n"
+        "     [--udp <host[:port]>] [--verbose] <command> [args]\n"
         "\n"
         "flags:\n"
         "  --ble <MAC>                       connect over Bluetooth instead of USB\n"
         "  --device <id>                     pick one of several USB devices\n"
         "  --password <pw>                   control password, default 123456; needed on\n"
         "                                    BLE always and on USB once locked\n"
+        "  --admin-password <pw>             administrator password, if one is set on the\n"
+        "                                    device; sent for 'key show', 'key set',\n"
+        "                                    'encryption create|delete|on|off', and as the\n"
+        "                                    rescue on 'set-password <new>'.\n"
+        "                                    set-admin-password and clear-admin-password\n"
+        "                                    take the current password positionally and\n"
+        "                                    ignore this flag\n"
         "  --udp <host[:port]>               with --ble: device streams video+IMU to\n"
         "                                    this host over WiFi/UDP (default port 5005)\n"
         "  --verbose                         print the control-plane traffic\n"
         "\n"
         "commands:\n"
         "  list [--scan-ble]                 discover devices (USB, and BLE with --scan-ble)\n"
-        "  info                              device information snapshot\n"
+        "  info [--json]                     device information snapshot; --json emits the\n"
+        "                                    machine-readable state for scripts\n"
         "  config                            list enabled capture modes + codecs\n"
         "  config set <W> <H> <fps> <codec>  set capture config (idle only; codec:\n"
         "                                    raw|h264|h264hq|h265|h265hq)\n"
@@ -149,7 +222,9 @@ void usage() {
         "  record status [name]              session status (+ storage, upload)\n"
         "  record list                       list device recordings\n"
         "  record delete <name>              delete a device recording\n"
-        "  download <name> [dest]            pull a recording over USB/BLE (default <name>.mcap)\n"
+        "  download <name> [dest]            pull a recording over USB/BLE. dest is a file\n"
+        "                                    path, or a directory to write <name>.mcap into\n"
+        "                                    (default <name>.mcap in the current directory)\n"
         "  upload <name> <url>               upload a recording to a pre-signed URL\n"
         "  stop-upload <name>                kill a running upload\n"
         "  check-update                      ask the update service what to run\n"
@@ -157,25 +232,45 @@ void usage() {
         "  update --url <url>                update from an explicit URL (no service call)\n"
         "  update --file <update.eff>        update from a local bundle over USB\n"
         "  abort-update                      cancel an update in progress\n"
-        "  wifi add <ssid> [psk [country]]   provision WiFi (quote an SSID with spaces;\n"
-        "                                    omit <psk> for a hidden prompt; \"US\" unlocks 5 GHz)\n"
-        "  wifi remove <ssid> | select <ssid>\n"
+        "  wifi add <ssid> [psk [country]] [--band auto|2.4|5]\n"
+        "                                    provision WiFi (quote an SSID with spaces; omit <psk>\n"
+        "                                    for a hidden prompt; country e.g. \"US\", else inferred\n"
+        "                                    from nearby beacons)\n"
+        "  wifi remove <ssid> | select <ssid> [--band auto|2.4|5]\n"
         "  wifi list                         saved networks (marks the connected one)\n"
         "  wifi scan                         access points in range (not while recording)\n"
         "  wifi status                       current association\n"
-        "  set-password <new>                rekey the control password (unlocked USB)\n"
+        "  set-password <new>                rekey the control password (unlocked USB, or\n"
+        "                                    with --admin-password: the administrator\n"
+        "                                    rescue for a forgotten worker password)\n"
         "  set-password <old> <new>          rekey the control password (BLE or locked USB)\n"
+        "  set-admin-password <new>          set the administrator password (none by default;\n"
+        "                                    minimum 8 characters)\n"
+        "  set-admin-password <old> <new>    change it; needs the current one\n"
+        "  clear-admin-password <current>    REMOVE it; the key drops back to the control\n"
+        "                                    password and becomes readable with it\n"
         "  lock on|off [--session]           lock/unlock the USB control plane\n"
         "                                    (--session: this power session only,\n"
         "                                     re-locks when power is lost)\n"
-        "  encryption on|off                 AES-256 encrypt new recordings\n"
-        "  encryption create                 generate the key; SHOWN ONCE, keep it\n"
-        "  encryption delete                 show the key and how to destroy it\n"
+        "  encryption on|off                 AES-256 encrypt new recordings;\n"
+        "                                    needs --admin-password when one is set\n"
+        "  encryption create                 generate the key; SHOWN ONCE, keep it;\n"
+        "                                    needs --admin-password when one is set\n"
+        "  encryption delete                 show the key and how to destroy it;\n"
+        "                                    needs --admin-password when one is set\n"
         "  encryption delete --confirm <id> [--yes]\n"
         "                                    destroy it (recordings become unreadable);\n"
         "                                    --yes is required without a terminal\n"
-        "  key show [--out <file>]           print the key, or write it to a 0600 file\n"
+        "  key show [--out <file>]           print the key, or write it to a 0600 file;\n"
+        "                                    needs --admin-password when one is set\n"
+        "  key set --in <file> | - | <64-hex>\n"
+        "                                    install a key you already hold; refused if one\n"
+        "                                    exists (delete it first). PREFER --in or - :\n"
+        "                                    a key passed as an argument is visible in ps\n"
+        "                                    and lands in shell history. Needs\n"
+        "                                    --admin-password when one is set\n"
         "  factory-reset [--yes]             defaults + unlock; DESTROYS the encryption key\n"
+        "                                    and REMOVES the administrator password\n"
         "  sync-time                         set the device clock from the host\n"
         "  time                              read the device wall clock\n"
         "  location                          read the device's current location\n"
@@ -319,7 +414,7 @@ UpdateFailure classify_update_failure(ERROR_CODE ec, const std::string& msg) {
     return UpdateFailure::GENERIC;
 }
 
-void print_info(const DeviceInformation& i) {
+void print_info(const DeviceInformation& i, DEVICE_STATE state) {
     // One identity, printed once. DeviceInformation::serial_number is the same
     // value parsed as an integer, so printing both read as two serials.
     std::printf("serial           : %s\n", i.serial.c_str());
@@ -331,6 +426,8 @@ void print_info(const DeviceInformation& i) {
     else
         std::printf("firmware_version : %u\n", i.firmware_version);
     std::printf("input_type       : %s\n", to_string(i.input_type));
+    // The same value `ef-cli state` prints, so the two can never disagree.
+    std::printf("state            : %s\n", to_string(state));
     const CameraConfiguration& c = i.camera_configuration;
     std::printf("camera           : %dx%d @ %d fps, %s\n",
                 c.resolution.width, c.resolution.height, c.fps,
@@ -400,8 +497,14 @@ void print_info(const DeviceInformation& i) {
         std::printf("wifi             : unknown (snapshot could not be refreshed)\n");
     else
         std::printf("wifi             : not connected\n");
-    for (const auto& n : w.saved_networks)
-        std::printf("saved network    : %s\n", n.c_str());
+    // A count, not the list -- `wifi list` shows them, marking the connected one.
+    // "none reported" rather than 0: an empty list means either none saved or none
+    // fetched, and the two are indistinguishable here.
+    if (!w.saved_networks.empty())
+        std::printf("saved networks   : %zu (see 'ef-cli wifi list')\n",
+                    w.saved_networks.size());
+    else
+        std::printf("saved networks   : none reported\n");
     // Access + at-rest state. Both come from the ungated GetDeviceInformation, so
     // `info` answers even on a locked device you cannot otherwise talk to; that is
     // how an operator discovers WHY everything else is refusing them.
@@ -423,6 +526,23 @@ void print_info(const DeviceInformation& i) {
         std::printf("encryption key   : present (password required for id)\n");
     else
         std::printf("encryption key   : %s (AES-256-GCM)\n", i.encryption_key_id.c_str());
+    // Say plainly whether the key is behind the admin credential. An older device
+    // reports admin_gate=false, and there reading the key needs no more than the
+    // operator password (nothing at all over unlocked USB), so printing "protected"
+    // unconditionally would be a lie on exactly the devices that need the warning.
+    // Three states, and key_unprotected is checked FIRST: on such a device
+    // admin_provisioned is also false, and "no administrator password set" alone would
+    // read as a setup nobody has finished rather than a key that is actually exposed.
+    std::printf("key access       : %s\n",
+                !i.admin_gate ? "operator password (this firmware has no admin tier)"
+                : i.key_unprotected
+                    ? "control password only, key UNPROTECTED (no administrator password "
+                      "is set, so anyone holding the control password can read this key; "
+                      "run 'set-admin-password' to protect it)"
+                : !i.admin_provisioned
+                    ? "control password (no administrator password set; run "
+                      "'set-admin-password' to require one for the encryption key)"
+                    : "administrator password");
 }
 
 // Parse "LAT,LON[,ALT]" into a Location (exception-free). Returns false on any
@@ -459,17 +579,17 @@ void print_recording(const RecordingStatus& r, bool show_target = true) {
     switch (r.stopped_reason) {
         case STOP_REASON::DISK_FULL:   why = " (disk full)"; break;
         case STOP_REASON::WRITE_ERROR: why = " (write error)"; break;
-        // r.partial: an unrepaired torso served as-is (decrypts with a
-        // truncated-tail warning) — say so rather than implying a finalized file.
-        case STOP_REASON::INTERRUPTED:
-            why = r.partial ? " (partial: recovered after power loss)"
-                            : " (recovered after power loss)";
-            break;
+        case STOP_REASON::INTERRUPTED: why = " (recovered after power loss)"; break;
         default: break;
     }
-    std::printf("%s%s  %.1f MB, %llu frames, %llu ms",
+    // r.partial: an unrepaired torso served as-is (decrypts with a truncated-tail
+    // warning). Independent of what ended the session — a write error strands one
+    // exactly as a power cut does — so it is not folded into the reason above.
+    const char* part = r.partial ? " [partial]" : "";
+    std::printf("%s%s%s  %.1f MB, %llu frames, %llu ms",
                 r.recording ? "RECORDING" : "complete",
                 r.recording ? "" : why,
+                r.recording ? "" : part,
                 r.bytes / (1024.0 * 1024.0), (unsigned long long)r.frames,
                 (unsigned long long)r.duration_ms);
     std::printf("  %s", r.encrypted ? "[encrypted]" : "[unencrypted]");
@@ -538,6 +658,8 @@ int main(int argc, char** argv) {
             init.device_id = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "--password") && i + 1 < argc) {
             init.ble_password = argv[++i];
+        } else if (!std::strcmp(argv[i], "--admin-password") && i + 1 < argc) {
+            init.admin_password = argv[++i];
         } else if (!std::strcmp(argv[i], "--udp") && i + 1 < argc) {
             std::string hp = argv[++i];
             std::string::size_type colon = hp.rfind(':');
@@ -604,7 +726,33 @@ int main(int argc, char** argv) {
             "ef-cli: control password not accepted; only info, state, storage"
             " and factory-reset will answer\n");
     if (cmd == "info") {
-        print_info(dev.get_device_information());
+        // --json exists so scripts stop deciding security-relevant questions by grepping
+        // the prose above, which reworded twice during this feature and silently inverted
+        // a CI harness's conclusion both times. Only the machine-checkable state, and
+        // these names are a contract: do not rename them to match a print.
+        if (std::find(args.begin(), args.end(), "--json") != args.end()) {
+            const DeviceInformation& i = dev.get_device_information();
+            std::printf("{\"serial\":\"%s\",\"model\":\"%s\","
+                        "\"firmware_version\":%u,\"firmware_version_str\":\"%s\","
+                        "\"state\":\"%s\","
+                        "\"usb_locked\":%s,\"session_unlocked\":%s,\"admin_gate\":%s,"
+                        "\"admin_provisioned\":%s,\"key_unprotected\":%s,"
+                        "\"encryption_enabled\":%s,\"encryption_key_present\":%s,"
+                        "\"encryption_key_id\":\"%s\"}\n",
+                        i.serial.c_str(), i.model_name.c_str(),
+                        i.firmware_version, i.firmware_version_str.c_str(),
+                        to_string(dev.get_state()),
+                        i.usb_locked ? "true" : "false",
+                        i.session_unlocked ? "true" : "false",
+                        i.admin_gate ? "true" : "false",
+                        i.admin_provisioned ? "true" : "false",
+                        i.key_unprotected ? "true" : "false",
+                        i.encryption_enabled ? "true" : "false",
+                        i.encryption_key_present ? "true" : "false",
+                        i.encryption_key_id.c_str());
+            return 0;
+        }
+        print_info(dev.get_device_information(), dev.get_state());
         return 0;
     }
     if (cmd == "config" && args.size() > 1 && args[1] == "set") {
@@ -878,7 +1026,23 @@ int main(int argc, char** argv) {
                 }
             }
             ec = dev.enable_recording(rp);
-            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "record start");
+            if (ec != ERROR_CODE::SUCCESS) {
+                // "Already recording" is only actionable with the session name,
+                // but that lookup is list-based and comes back empty past the 48
+                // `record list` reports, hence the fallback.
+                std::string detail = dev.last_error_message();
+                if (ec == ERROR_CODE::DEVICE_BUSY) {
+                    RecordingStatus live;
+                    if (dev.get_recording_status(live, "") == ERROR_CODE::SUCCESS &&
+                        live.recording && !live.name.empty())
+                        detail = "already recording '" + live.name +
+                                 "'; run 'record stop' first";
+                    else
+                        detail = "a recording or upload is already in progress; "
+                                 "run 'record stop' first";
+                }
+                return fail(ec, "record start", detail);
+            }
             std::puts("recording");
             return 0;
         }
@@ -931,9 +1095,13 @@ int main(int argc, char** argv) {
     }
     if (cmd == "download" && args.size() > 1) {
         std::string dest = args.size() > 2 ? args[2] : args[1] + ".mcap";
-        ec = dev.download_recording(args[1], dest);
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "download");
-        std::printf("saved %s\n", dest.c_str());
+        std::string saved;
+        ec = dev.download_recording(args[1], dest, &saved);
+        // The device names the specific problem ("recording not found: <name>");
+        // the code alone sends people hunting the wrong fault.
+        if (ec != ERROR_CODE::SUCCESS)
+            return fail(ec, "download", dev.last_error_message());
+        std::printf("saved %s\n", saved.c_str());
         return 0;
     }
     if (cmd == "upload" && args.size() > 2) {
@@ -1075,6 +1243,19 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "wifi" && args.size() > 1) {
+        // Pulled out before the positional parsing, which counts words to catch an
+        // unquoted SSID and would otherwise count this flag.
+        BAND band = BAND::AUTO;
+        for (size_t i = 1; i + 1 < args.size(); ) {
+            if (args[i] != "--band") { i++; continue; }
+            const std::string& v = args[i + 1];
+            if      (v == "auto")            band = BAND::AUTO;
+            else if (v == "2.4" || v == "2") band = BAND::GHZ_2_4;
+            else if (v == "5")               band = BAND::GHZ_5;
+            else { std::fprintf(stderr, "bad --band '%s' (use auto, 2.4 or 5)\n",
+                                v.c_str()); return 2; }
+            args.erase(args.begin() + i, args.begin() + i + 2);
+        }
         const std::string& sub = args[1];
         if (sub == "add" && args.size() > 2) {
             // A word count that can't be <ssid> <psk> [country] is almost always
@@ -1114,10 +1295,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "wifi add: password must be 8-63 characters\n");
                 return 2;
             }
-            ec = dev.wifi_add(args[2], psk, args.size() > 4 ? args[4] : "");
+            ec = dev.wifi_add(args[2], psk, args.size() > 4 ? args[4] : "", band);
         }
         else if (sub == "remove" && args.size() > 2) ec = dev.wifi_remove(args[2]);
-        else if (sub == "select" && args.size() > 2) ec = dev.wifi_select(args[2]);
+        else if (sub == "select" && args.size() > 2) ec = dev.wifi_select(args[2], band);
         else if (sub == "status") {
             const WirelessConfiguration& w = dev.get_device_information().wireless;
             if (w.wifi_state == "connecting") {
@@ -1126,13 +1307,20 @@ int main(int argc, char** argv) {
                 else
                     std::puts("connecting...");
             } else if (w.wifi_state == "auth_failed") {
-                // Device rejected the credentials (wrong password / bad auth);
-                // name the network so the user knows which one to re-add.
+                // The device gave up on this network, which happens for a wrong
+                // password and for an association it could never complete. It
+                // cannot tell them apart, so neither should this message.
+                const char* why = "wrong password, or the access point is too far "
+                                  "to complete the handshake";
                 if (!w.wifi_ssid.empty())
-                    std::printf("authentication failed for \"%s\"; check the password\n",
-                                w.wifi_ssid.c_str());
+                    std::printf("could not authenticate to \"%s\": %s\n",
+                                w.wifi_ssid.c_str(), why);
                 else
-                    std::puts("authentication failed; check the password");
+                    std::printf("could not authenticate: %s\n", why);
+                // Signal is the only evidence available to choose between them.
+                if (w.wifi_rssi != 0)
+                    std::printf("  last seen at %d dBm%s\n", w.wifi_rssi,
+                                w.wifi_rssi <= -75 ? " (weak; the link is the likelier cause)" : "");
             } else if (w.wifi_state == "connected" || w.wifi_connected) {
                 // Append only the detail the device reported; older firmware
                 // leaves security/freq/link_speed/rssi at ""/0, which drop out.
@@ -1180,9 +1368,14 @@ int main(int argc, char** argv) {
             } else {
                 // nets is sorted strongest-first by the SDK; show the top 10.
                 size_t show = std::min<size_t>(nets.size(), 10);
-                for (size_t i = 0; i < show; i++)
-                    std::printf("%-32s  %4d dBm  %s\n", nets[i].ssid.c_str(),
-                                nets[i].rssi, nets[i].secured ? "secured" : "open");
+                for (size_t i = 0; i < show; i++) {
+                    // A dual-band AP appears once per radio under one name, so
+                    // the band is what tells the two rows apart.
+                    const char* b = nets[i].freq_mhz == 0 ? ""
+                                  : nets[i].band() == BAND::GHZ_5 ? "  5 GHz" : "2.4 GHz";
+                    std::printf("%-32s  %4d dBm  %-7s  %s\n", nets[i].ssid.c_str(),
+                                nets[i].rssi, b, nets[i].secured ? "secured" : "open");
+                }
                 if (nets.size() > show)
                     std::printf("(%zu more; showing strongest %zu)\n",
                                 nets.size() - show, show);
@@ -1195,7 +1388,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "wifi remove: '%s' is not a saved network\n", args[2].c_str());
             return 1;
         }
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, std::string("wifi " + sub).c_str());
+        // The device explains a rejected band ("no 5 GHz radio in range") far
+        // better than the error code can; printing the bare code discards the
+        // only part of the answer that tells the user what to do instead.
+        if (ec != ERROR_CODE::SUCCESS) {
+            const std::string detail = dev.last_error_message();
+            if (!detail.empty()) {
+                std::fprintf(stderr, "wifi %s: %s\n", sub.c_str(), detail.c_str());
+                return 1;
+            }
+            return fail(ec, std::string("wifi " + sub).c_str());
+        }
         if (sub == "add")
             std::printf("wifi add accepted, connecting to '%s' (poll `ef-cli wifi status`)\n",
                         args[2].c_str());
@@ -1210,10 +1413,74 @@ int main(int argc, char** argv) {
         // BLE: set-password <old> <new>.
         std::string old_pw = args.size() > 2 ? args[1] : "";
         std::string new_pw = args.size() > 2 ? args[2] : args[1];
+        // The administrator rescue for a forgotten worker password: an admin grant
+        // substitutes for the old one. It must be earned immediately before the verb,
+        // because set_ble_password is not admin-gated and so never triggers the
+        // automatic escalation. Only when no old password was given -- with both, the
+        // old one is the proof and the grant would be spent for nothing.
+        if (old_pw.empty() && !init.admin_password.empty()) {
+            ec = dev.authenticate_admin(init.admin_password);
+            if (ec != ERROR_CODE::SUCCESS)
+                return fail(ec, "set-password (administrator rescue)",
+                            dev.last_error_message());
+        }
         ec = dev.set_ble_password(old_pw, new_pw);
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "set-password");
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "set-password", dev.last_error_message());
         std::puts("control password updated (BLE and USB)");
         return 0;
+    }
+    // <new> alone provisions a device that has none; <old> <new> changes an existing
+    // one. The device makes the first case reachable at OPERATOR with no old password,
+    // so demanding two arguments here would make provisioning unreachable from the
+    // CLI entirely.
+    // Changing an existing one demands the old password on both transports alike: there
+    // is no physical-access shortcut here, deliberately.
+    // ⚠ Exact counts, and never args.back(): an unquoted passphrase arrives as several
+    // arguments, and taking the last one silently provisions a fragment of what the
+    // operator typed. They cannot reproduce it, and the documented recovery is a factory
+    // reset, which destroys the key. Anything longer falls through to the usage text.
+    if (cmd == "set-admin-password" && (args.size() == 2 || args.size() == 3)) {
+        const bool first_time = (args.size() == 2);
+        ec = dev.set_admin_password(first_time ? "" : args[1],
+                                    first_time ? args[1] : args[2]);
+        // Carry the device's message: it is what tells a caller who used the wrong form
+        // which one this device wants.
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "set-admin-password", dev.last_error_message());
+        std::puts(first_time ? "administrator password set"
+                             : "administrator password updated");
+        std::fputs("this is the credential that releases the encryption key; if it is\n"
+                   "lost, the only recovery is a factory reset, which destroys the key\n"
+                   "and every recording made under it\n", stderr);
+        return 0;
+    }
+    if (cmd == "clear-admin-password") {
+        if (args.size() != 2) {   // args[0] is the verb; args[1] is the password
+            std::fprintf(stderr,
+                         "clear-admin-password: needs the current password: "
+                         "clear-admin-password <current>\n"
+                         "this REMOVES the administrator credential\n");
+            return 2;
+        }
+        ec = dev.clear_admin_password(args[1]);
+        if (ec != ERROR_CODE::SUCCESS)
+            return fail(ec, "clear-admin-password", dev.last_error_message());
+        std::puts("administrator password removed");
+        // The device says whether this just exposed a key, but only in its SUCCESS
+        // reply, and last_error_message() carries the last FAILED one and is cleared
+        // on every success. So re-read the state instead of printing a warning that
+        // may not apply.
+        if (dev.refresh_device_information() == ERROR_CODE::SUCCESS &&
+            dev.get_device_information().encryption_key_present)
+            std::fputs("the encryption key is now readable with the control password "
+                       "alone\n", stderr);
+        return 0;
+    }
+    if (cmd == "set-admin-password") {
+        std::fprintf(stderr,
+                     "set-admin-password: needs a password:\n"
+                     "  set-admin-password <new>          set one, if the device has none\n"
+                     "  set-admin-password <old> <new>    change the existing one\n");
+        return 2;
     }
     if (cmd == "lock" && args.size() > 1) {
         bool want = (args[1] == "on" || args[1] == "true" || args[1] == "1");
@@ -1324,10 +1591,47 @@ int main(int argc, char** argv) {
         ec = dev.get_encryption_key(k);
         if (ec != ERROR_CODE::SUCCESS) return fail(ec, "key show", dev.last_error_message());
         if (!k.present) { std::puts("no encryption key"); return 0; }
+        warn_if_key_unprotected(dev);
         if (out_path.empty()) { print_key_hex(k.key); wipe(k.key); return 0; }
         int rc = write_key_file(out_path, k.key);
         wipe(k.key);
         return rc;
+    }
+    if (cmd == "key" && args.size() > 1 && args[1] == "set") {
+        // --in and `-` mirror `key show --out`. A positional key is visible in ps and
+        // lands in shell history.
+        std::string hex, in_path;
+        for (size_t a = 2; a + 1 < args.size(); a++)
+            if (args[a] == "--in") in_path = args[a + 1];
+        if (!in_path.empty() || (args.size() == 3 && args[2] == "-")) {
+            std::string src = in_path.empty() ? "-" : in_path;
+            if (!read_key_source(src, hex)) return 2;
+        } else if (args.size() == 3) {
+            hex = args[2];
+        } else {
+            std::fprintf(stderr, "usage: ef-cli key set <64-hex> | --in <file> | -\n");
+            return 2;
+        }
+        std::vector<uint8_t> raw;
+        bool ok = key_from_hex(hex, 32, raw);
+        secure_zero(&hex[0], hex.size());
+        if (!ok) {
+            std::fprintf(stderr, "key set: expected exactly 64 hex characters "
+                                 "(a 32-byte AES-256 key)\n");
+            return 2;
+        }
+        EncryptionKey k;
+        ec = dev.set_encryption_key(raw, k);
+        wipe(raw);
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "key set", dev.last_error_message());
+        std::printf("key %s installed\n", k.key_id.c_str());
+        warn_if_key_unprotected(dev);   // the other end of the key's life; refreshes
+        // delete turned encryption off and set does not turn it back on, so say so
+        // rather than let the next recording go out in the clear.
+        if (!dev.get_device_information().encryption_enabled)
+            std::fputs("NOTE: encryption is OFF, so new recordings are NOT encrypted. "
+                       "Run 'ef-cli encryption on'.\n", stderr);
+        return 0;
     }
     if (cmd == "factory-reset") {
         // Ungated on the device by design (the escape when the password is lost),
@@ -1342,11 +1646,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::fprintf(stderr,
-                "This erases recordings, wifi credentials, calibration, capture config\n"
-                "and the control password.\n"
+                "This erases recordings, wifi credentials, calibration, capture config,\n"
+                "and resets BOTH the control and administrator passwords.\n"
                 "It also DESTROYS the encryption key. Every recording ever made under\n"
                 "it becomes permanently undecryptable, including copies already\n"
-                "uploaded elsewhere. Save the key first ('ef-cli key show --out <file>')\n"
+                "uploaded elsewhere. Save the key first\n"
+                "('ef-cli --admin-password <pw> key show --out <file>')\n"
                 "if you will ever need to read those recordings.\n"
                 "Type 'reset' to confirm: ");
             char line[32] = {0};
@@ -1359,8 +1664,8 @@ int main(int argc, char** argv) {
         ec = dev.factory_reset();
         if (ec != ERROR_CODE::SUCCESS) return fail(ec, "factory-reset");
         std::puts("factory settings restored "
-                  "(password default, USB unlocked, encryption off; "
-                  "encryption key DESTROYED)");
+                  "(control password default, administrator password REMOVED, "
+                  "USB unlocked, encryption off; encryption key DESTROYED)");
         return 0;
     }
     if (cmd == "sync-time") {
