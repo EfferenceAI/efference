@@ -259,6 +259,15 @@ ERROR_CODE Device::open(InitParameters params) {
     impl_->imu_backlog.clear();
     impl_->imu_backlog_dropped = 0;
 
+    // Diagnostics: stamp the open so open->first-frame latency is measurable, and
+    // announce the session (opt-in via init.verbose >= internal::kDiagLevel).
+    impl_->diag_open_mono_ns = internal::diag_mono_ns();
+    if (impl_->diag())
+        std::fprintf(stderr, "[ef.diag] t=%llu s=%llu ev=open_requested transport=%s\n",
+                     (unsigned long long)impl_->diag_open_mono_ns,
+                     (unsigned long long)(impl_->diag_session_id + 1),
+                     to_string(params.input_type));
+
     // ---- MCAP replay (file-replay source): no transport, the file is the source --
     if (params.input_type == INPUT_TYPE::MCAP) {
         if (params.mcap_path.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
@@ -278,8 +287,18 @@ ERROR_CODE Device::open(InitParameters params) {
           impl_->info.input_type = INPUT_TYPE::MCAP;
           impl_->info.camera_configuration.resolution  = {r->width(), r->height()};
           impl_->info.camera_configuration.compression = impl_->init.compression; }
+        impl_->diag_reset_session();
+        r->set_debug(params.verbose, impl_->diag_session_id);
         impl_->set_reader(std::move(r));
         impl_->state = DEVICE_STATE::STREAMING;
+        if (impl_->diag())
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=open_completed ec=SUCCESS "
+                         "elapsed_ms=%.3f (mcap replay)\n",
+                         (unsigned long long)internal::diag_mono_ns(),
+                         (unsigned long long)impl_->diag_session_id,
+                         internal::diag_ms_since(impl_->diag_open_mono_ns,
+                                                 internal::diag_mono_ns()));
         return ERROR_CODE::SUCCESS;
     }
 
@@ -423,15 +442,35 @@ ERROR_CODE Device::open(InitParameters params) {
     impl_->stream_res = res;
     impl_->state      = DEVICE_STATE::IDLE;
     impl_->refresh_device_state();
+    if (impl_->diag()) {
+        const uint64_t now = internal::diag_mono_ns();
+        std::fprintf(stderr,
+                     "[ef.diag] t=%llu s=%llu ev=open_completed ec=SUCCESS "
+                     "elapsed_ms=%.3f (data plane starts on first grab)\n",
+                     (unsigned long long)now,
+                     (unsigned long long)(impl_->diag_session_id + 1),
+                     internal::diag_ms_since(impl_->diag_open_mono_ns, now));
+    }
     return ERROR_CODE::SUCCESS;
 }
 
 void Device::close() {
     if (!impl_) return;
+    const bool diag = impl_->diag();
+    const uint64_t t0 = diag ? internal::diag_mono_ns() : 0;
+    if (diag)
+        std::fprintf(stderr, "[ef.diag] t=%llu s=%llu ev=close_requested state=%s\n",
+                     (unsigned long long)t0, (unsigned long long)impl_->diag_session_id,
+                     to_string(impl_->state.load()));
     if (impl_->state == DEVICE_STATE::CLOSED) {
         // A failed update() reconnect can strand a host recorder with the transport
         // gone; release it so a later open() doesn't append to the old file.
         impl_->stop_host_rec();
+        if (diag)
+            std::fprintf(stderr,
+                         "[ef.diag] t=%llu s=%llu ev=close_completed (already closed)\n",
+                         (unsigned long long)internal::diag_mono_ns(),
+                         (unsigned long long)impl_->diag_session_id);
         return;
     }
     // A DEVICE_LOCAL recording survives host disconnect by design: closing the
@@ -450,6 +489,13 @@ void Device::close() {
       impl_->imu_backlog.clear();
       impl_->imu_backlog_dropped = 0; }
     impl_->flip_latched        = -1;
+    if (diag) {
+        const uint64_t t1 = internal::diag_mono_ns();
+        std::fprintf(stderr,
+                     "[ef.diag] t=%llu s=%llu ev=close_completed elapsed_ms=%.3f\n",
+                     (unsigned long long)t1, (unsigned long long)impl_->diag_session_id,
+                     internal::diag_ms_since(t0, t1));
+    }
 }
 
 bool         Device::is_open() const { return impl_ && impl_->state != DEVICE_STATE::CLOSED; }

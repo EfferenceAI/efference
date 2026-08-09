@@ -33,6 +33,7 @@
 
 #include "ef/Core.hpp"   // ef::ImuSample
 #include "internal_status.hpp"
+#include "stream_debug.hpp"
 
 namespace ef {
 namespace internal {
@@ -68,8 +69,39 @@ public:
         int            width = 0, height = 0;
         uint8_t        pixfmt = 0;
         bool           complete = false;   // false => transit loss (CORRUPTED_FRAME)
+        bool           keyframe = false;   // IDR/IRAP (encoded) or intra (RAW); diagnostics
     };
     bool current_video(RawFrame* out) const;
+
+    // ---- diagnostics (opt-in, off by default) --------------------------------
+    // Enable the stream/frame diagnostics for this reader and stamp every line
+    // with the host-side session id. level reuses InitParameters::verbose
+    // (>=kDiagLevel turns it on); no effect on any streaming behavior.
+    void set_debug(int level, uint64_t session_id) {
+        diag_level_.store(level, std::memory_order_relaxed);
+        diag_session_ = session_id;
+    }
+
+    // Read-only snapshot of the assembler's queue/gap state, for the timeout and
+    // frame-gap diagnostics the Device layer emits (it owns the decoder/device
+    // state the assembler cannot see). Best-effort: resync_pending is a
+    // transport-thread flag read here for observation only.
+    struct StreamStats {
+        uint32_t last_frame_id       = 0;
+        bool     have_frame_id       = false;
+        uint32_t last_keyframe_id    = 0;
+        uint64_t last_keyframe_ts_ns = 0;   // device timestamp of that keyframe
+        uint64_t last_frame_mono_ns  = 0;   // host monotonic rx time of last frame
+        uint64_t frames_dropped      = 0;   // superseded/gated before grab
+        uint64_t total_frames        = 0;   // complete frames reassembled
+        int      ready_slot          = -1;
+        int      reasm_slot          = -1;
+        int      consuming_slot      = -1;
+        bool     resync_pending      = false;
+        bool     running             = false;
+        size_t   imu_queue_depth     = 0;
+    };
+    void get_stats(StreamStats* out) const;
 
     // Drain IMU samples since the last call. latest_only keeps only the newest;
     // *dropped (optional) gets the ring-overrun count.
@@ -129,6 +161,21 @@ protected:
     uint32_t last_vseq_ = 0;
     bool     have_vseq_ = false;
 
+    // ---- diagnostics state ---------------------------------------------------
+    // diag_level_ is set/read across threads (Device sets it, transport reads it
+    // per packet), so it is atomic. The rest below are written on the transport
+    // thread inside vmtx_ (or, for first_packet_seen_, transport-thread only) and
+    // read via get_stats() under vmtx_.
+    std::atomic<int> diag_level_{0};
+    uint64_t         diag_session_    = 0;
+    bool             first_packet_seen_ = false;   // transport-thread only
+    uint32_t         last_frame_id_     = 0;       // last frame id that started reassembly
+    bool             have_frame_id_     = false;
+    uint32_t         last_keyframe_id_    = 0;      // last complete IDR/IRAP (or intra) frame
+    uint64_t         last_keyframe_ts_ns_ = 0;      // its device timestamp
+    uint64_t         last_frame_mono_ns_  = 0;      // host monotonic rx time of last frame
+    uint64_t         total_frames_        = 0;      // complete frames reassembled
+
     // Drop-until-IDR resync gate (encoded streams only). Set on wire loss or consumer
     // supersede; while set, on_packet withholds complete frames until an IDR/IRAP
     // resets the decoder reference chain. Starts true so the first frame is a
@@ -139,7 +186,7 @@ protected:
     std::atomic<int> vcodec_{0};
 
     // ---- IMU ring ----
-    std::mutex             imtx_;
+    mutable std::mutex     imtx_;   // mutable: get_stats() reads imu_.size() const
     std::deque<ImuSample>  imu_;
     uint64_t               imu_dropped_ = 0;
     static constexpr size_t IMU_CAP = 8192;
