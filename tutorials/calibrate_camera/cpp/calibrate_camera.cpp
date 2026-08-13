@@ -22,10 +22,10 @@
 // Captures 40 detected views at 0.5-second intervals, then fits the identifiable
 // Double Sphere submodel [fx, fy, cx, cy, xi=0, alpha].
 //
-//   ./build/opencv_02_calibrate_camera
-//   ./build/opencv_02_calibrate_camera --pattern 9x6
-//   ./build/opencv_02_calibrate_camera --square-size 25.0
-//   ./build/opencv_02_calibrate_camera --ble <MAC>
+//   ./build/calibrate_camera
+//   ./build/calibrate_camera --pattern 9x6
+//   ./build/calibrate_camera --square-size 25.0
+//   ./build/calibrate_camera --ble <MAC>
 
 #include <chrono>
 #include <cstdio>

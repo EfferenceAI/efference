@@ -28,7 +28,6 @@ ef.v1.Capabilities.pixel_formats          max_count:4
 ef.v1.Capabilities.containers             max_size:8
 ef.v1.Capabilities.containers             max_count:4
 ef.v1.Capabilities.modes                  max_count:24
-ef.v1.PackerInfo.format                   max_size:8
 
 # ---- stream ----
 ef.v1.StreamTarget.dest_host              max_size:64

@@ -17,17 +17,25 @@ After `open()`, the wireless state lives on the cached `DeviceInformation`.
 const WirelessConfiguration& wifi = device.get_device_information().wireless;
 ```
 
-Everything you need is on that struct: whether it is connected, and if so the
+Everything you need is on that struct: whether it is usable, and if so the
 SSID, IP, RSSI, and whether the internet is reachable:
 
 ```cpp
 if (!wifi.wifi_connected)
     std::cout << "The M1 is not connected to any WiFi network.\n";
+else if (wifi.wifi_health != WIFI_HEALTH::UNSPECIFIED &&
+         wifi.wifi_health <  WIFI_HEALTH::UNVERIFIED)
+    std::cout << "The M1 is associated with \"" << wifi.wifi_ssid
+              << "\" but the link cannot carry traffic yet.\n";
 else
     std::cout << "The M1 is on \"" << wifi.wifi_ssid << "\" (ip "
               << wifi.wifi_ip_address << ", rssi " << wifi.wifi_rssi
               << ", internet " << (wifi.internet_reachable ? "yes" : "no") << ").\n";
 ```
+
+`wifi_connected` is true in that middle branch, which is why it is not the field to
+branch on. `UNSPECIFIED` is excluded because it means the firmware does not report
+`wifi_health` at all, and that asserts nothing either way.
 
 Association is asynchronous, so just after provisioning the snapshot may still
 read disconnected. Call `refresh_device_information()` for a fresh one, then read
@@ -44,7 +52,7 @@ works too but is the long way round.
 
 ## Expected output
 
-One line: either not connected, or the association details.
+One line: not connected, associated but not yet usable, or the full details.
 
 ```text
 The M1 is on "MyNetwork" (ip 192.168.1.50, rssi -47, internet yes).

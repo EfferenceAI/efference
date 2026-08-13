@@ -3,7 +3,7 @@
 // Opens over USB, runs a health sweep, and prints every probe. Pass `--deep`
 // to include the stress tier.
 //
-//   ./wired_02_health_check [--deep]
+//   ./health_check [--deep]
 
 #include <iostream>
 #include <string>

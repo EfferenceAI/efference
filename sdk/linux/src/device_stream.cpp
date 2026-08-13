@@ -192,6 +192,14 @@ void apply_imu_convention(ImuSample& s, bool flip, COORDINATE_SYSTEM cs) {
 
 }  // namespace
 
+ERROR_CODE Device::get_stream_stats(StreamStats& out) const {
+    if (!impl_) return ERROR_CODE::INVALID_FUNCTION_CALL;   // moved-from handle
+    auto reader = impl_->reader_snapshot();
+    if (!reader) return ERROR_CODE::INVALID_FUNCTION_CALL;
+    reader->get_stats(&out);
+    return ERROR_CODE::SUCCESS;
+}
+
 ERROR_CODE Device::retrieve_imu(SensorsData& data, TIME_REFERENCE ref) {
     if (!impl_) return ERROR_CODE::INVALID_FUNCTION_CALL;   // moved-from handle
     auto reader = impl_->reader_snapshot();

@@ -37,7 +37,18 @@ constexpr uint8_t  kFragStart   = 0x01, kFragEnd = 0x02;
 constexpr int      kVidHdr      = 44;   // 8 + 36
 constexpr int      kImuHdr      = 20;   // 8 + 12
 constexpr int      kImuSample   = 40;
-// Untrusted wire (no retransmit, crc unchecked): cap reassembly at 4K NV12.
+// Plausibility bounds. A sequence number that moves absurdly is a bad read, not a
+// real gap, and these counters are monotonic, so anything booked on one is
+// permanent. Ahead by more than these books nothing. kMaxGap is ~2 min of solid
+// blackout at 30 fps and kMaxSeqGap ~30 s of raw 1200p, both far past any outage a
+// session survives.
+constexpr int32_t kMaxGap    = 1 << 12;
+constexpr int32_t kMaxSeqGap = 1 << 20;
+// Consecutive frame ids behind the current one before it is a device that
+// restarted its numbering rather than reordered fragments. A reorder cannot
+// produce a run: the late frames are late once, and the stream resumes ahead.
+constexpr int      kRestartRun = 4;
+// The wire is not trusted to size an allocation: cap reassembly at 4K NV12.
 constexpr uint32_t kMaxFrameBytes = 3840u * 2160u * 3u / 2u;
 
 uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -78,6 +89,33 @@ bool is_keyframe(const uint8_t* d, size_t n, int codec) {
 }
 }  // namespace
 
+// Insert [lo,hi) and merge with anything it touches. Ranges stay sorted and
+// disjoint, so the in-order case (lo == cov_[0].hi) just extends the first one.
+void StreamAssembler::cov_add(uint32_t lo, uint32_t hi) {
+    if (cov_full_ || hi <= lo) return;
+    int i = 0;
+    while (i < ncov_ && cov_[i].hi < lo) i++;          // ranges entirely below
+    if (i == ncov_ || cov_[i].lo > hi) {               // no overlap: insert
+        if (ncov_ == kCovRanges) { cov_full_ = true; return; }
+        for (int j = ncov_; j > i; j--) cov_[j] = cov_[j - 1];
+        cov_[i] = { lo, hi };
+        ncov_++;
+        return;
+    }
+    if (lo < cov_[i].lo) cov_[i].lo = lo;              // absorb into cov_[i]
+    if (hi > cov_[i].hi) cov_[i].hi = hi;
+    int j = i + 1;                                     // swallow now-touching ones
+    while (j < ncov_ && cov_[j].lo <= cov_[i].hi) {
+        if (cov_[j].hi > cov_[i].hi) cov_[i].hi = cov_[j].hi;
+        j++;
+    }
+    if (j > i + 1) {
+        int drop = j - (i + 1);
+        for (int k = i + 1; k + drop < ncov_; k++) cov_[k] = cov_[k + drop];
+        ncov_ -= drop;
+    }
+}
+
 int StreamAssembler::free_vbuf() const {
     for (int i = 0; i < VBUFS; i++)
         if (i != ready_ && i != consuming_ && i != reasm_) return i;
@@ -107,6 +145,12 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
         // lock; call on_loss() BEFORE vmtx_ so the override never runs under it.
         uint32_t seq = rd32(b + 4);
         if (have_vseq_ && seq != (uint32_t)(last_vseq_ + 1)) {
+            // Signed delta so a reordered packet (UDP) reads negative and counts
+            // nothing; only a forward jump is missing packets, and only a plausible
+            // one, since a bad read here is booked permanently.
+            int32_t adv = (int32_t)(seq - last_vseq_);
+            if (adv > 1 && adv <= kMaxSeqGap)
+                packets_lost_.fetch_add((uint32_t)(adv - 1), std::memory_order_relaxed);
             resync_pending_ = true;   // withhold P-frames until the next IDR
             on_loss();
         }
@@ -118,23 +162,60 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
         uint16_t w = rd16(b + 24), h = rd16(b + 26);
         uint8_t  pixfmt = b[28];
         uint64_t ts = rd64(b + 32);
+
+        // Frame accounting keys on EF_FRAG_START, the one packet that marks a frame
+        // boundary, so a stream joined mid-frame does not book the frame it walked
+        // in on.
+        if (flags & kFragStart) {
+            const int32_t adv = (int32_t)(frame_id - last_fid_);
+            if (!have_fid_) {
+                last_fid_ = frame_id;
+                have_fid_ = true;
+            } else if (adv > 0) {
+                // Leaving an id closes it out; it never reached EF_FRAG_END, so its
+                // tail was lost.
+                if (!finalized_) frames_broken_.fetch_add(1, std::memory_order_relaxed);
+                // Ids strictly in between are frames of which nothing arrived at all.
+                if (adv > 1 && adv <= kMaxGap)
+                    frames_gone_.fetch_add((uint32_t)adv - 1, std::memory_order_relaxed);
+                last_fid_    = frame_id;
+                finalized_   = false;
+                behind_run_  = 0;
+            } else if (adv < 0 && ++behind_run_ >= kRestartRun) {
+                // A run of ids behind the current one is the device numbering from
+                // zero again, which a UDP reader outlives. The run is what separates
+                // it from a single reordered straggler.
+                if (!finalized_) frames_broken_.fetch_add(1, std::memory_order_relaxed);
+                last_fid_   = frame_id;
+                finalized_  = false;
+                behind_run_ = 0;
+            }
+            // else: the same id again, or a straggler; neither is news.
+        }
         int paylen = len - kVidHdr;   // >= 0 (guarded by len < kVidHdr above)
         // Unsigned compare: a plen > INT_MAX would make (int)plen negative and
         // silently skip this clamp, letting the memcpy below over-read the packet.
         if ((uint32_t)paylen < plen) plen = (uint32_t)paylen;  // defensive
 
-        bool superseded = false;
-        bool need_pli   = false;
+        bool superseded  = false;
+        bool need_pli    = false;
+        bool frame_whole = false;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
-            if (flags & kFragStart) {
+            // A START that does not move the id forward is a duplicate or a late
+            // straggler. Honouring it would reset cur_size_ and the coverage of the
+            // frame being built, destroying it.
+            const bool stale_start = in_frame_ &&
+                                     (int32_t)(frame_id - cur_frame_id_) <= 0;
+            if ((flags & kFragStart) && !stale_start) {
                 if (fsize == 0 || fsize > kMaxFrameBytes) {
                     in_frame_ = false;   // reject corrupt/oversized frame
                 } else {
                     if (reasm_ == -1) reasm_ = free_vbuf();
                     if (reasm_ >= 0) {
                         grow_vbufs(fsize);
-                        in_frame_ = true; cur_frame_id_ = frame_id; cur_size_ = fsize; cur_accum_ = 0;
+                        in_frame_ = true; cur_frame_id_ = frame_id; cur_size_ = fsize;
+                        cov_reset();
                         RawFrame m; m.frame_id = frame_id; m.ts_ns = ts;
                         m.width = w; m.height = h; m.pixfmt = pixfmt;
                         vmeta_[reasm_] = m;
@@ -144,18 +225,29 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
             if (in_frame_ && reasm_ >= 0 && frame_id == cur_frame_id_ &&
                 (size_t)offset + plen <= vbuf_[reasm_].size()) {
                 std::memcpy(vbuf_[reasm_].data() + offset, b + kVidHdr, plen);
-                cur_accum_ += plen;
+                cov_add(offset, offset + plen);
             }
-            if (flags & kFragEnd) {
-                if (in_frame_ && reasm_ >= 0) {
+            // The id guard belongs on the WHOLE end-of-frame block, not just on the
+            // finalize inside it. An END for another frame must neither publish the
+            // wrong frame nor clear in_frame_ underneath the one being built, and
+            // END(N) swapped with START(N+1) is the most ordinary reorder there is.
+            if ((flags & kFragEnd) && in_frame_ && frame_id == cur_frame_id_) {
+                if (reasm_ >= 0) {
                     vmeta_[reasm_].data     = vbuf_[reasm_].data();
                     vmeta_[reasm_].size     = cur_size_;
-                    vmeta_[reasm_].complete = (cur_accum_ == cur_size_);
+                    vmeta_[reasm_].complete = cov_covers(cur_size_);
+                    frame_whole = vmeta_[reasm_].complete;
 
                     // A supersede (consumer never grabbed the last ready_, e.g. vsync
                     // throttled while stalled) breaks the reference chain for whatever
                     // it grabs next, so enter resync.
-                    if (ready_ != -1) { superseded = true; resync_pending_ = true; }
+                    if (ready_ != -1) {
+                        superseded = true; resync_pending_ = true;
+                        // The frame ALREADY waiting died ungrabbed. Booked here and
+                        // not below because a supersede and a gate are facts about
+                        // two different frames, and both can be true at once.
+                        frames_superseded_.fetch_add(1, std::memory_order_relaxed);
+                    }
 
                     // Drop-until-IDR gate (encoded streams only). While resync pending,
                     // withhold every frame until an IDR/IRAP arrives, never feed the
@@ -173,15 +265,24 @@ void StreamAssembler::on_packet(const uint8_t* b, int len) {
                     }
 
                     if (gated) {
-                        frames_dropped_++;   // new frame dropped; last ready_ kept
+                        // THIS frame is withheld until the next keyframe, which is a
+                        // consequence of loss rather than loss itself.
+                        frames_gated_.fetch_add(1, std::memory_order_relaxed);
                         reasm_ = -1;   // drop; the last good ready_ (if any) stays
                         need_pli = true;     // keep asking for an IDR to resync
                     } else {
-                        if (ready_ != -1) frames_dropped_++;  // replaced ungrabbed
                         ready_ = reasm_;
                         reasm_ = -1;
                         vcv_.notify_one();
                     }
+                }
+                // Booked once per id, outside the buffer guard above so a frame that
+                // found no free vbuf still counts as sent. A stale duplicate id
+                // books nothing.
+                if (frame_id == last_fid_ && !finalized_) {
+                    finalized_ = true;
+                    (frame_whole ? frames_whole_ : frames_broken_)
+                        .fetch_add(1, std::memory_order_relaxed);
                 }
                 in_frame_ = false;
             }
@@ -255,6 +356,25 @@ void StreamAssembler::drain_imu(std::vector<ImuSample>& out, bool latest_only,
     if (latest_only) { out.assign(1, imu_.back()); imu_.clear(); return; }
     out.assign(imu_.begin(), imu_.end());
     imu_.clear();
+}
+
+void StreamAssembler::get_stats(StreamStats* out) const {
+    *out = StreamStats{};
+    out->received_whole   = frames_whole_.load(std::memory_order_relaxed);
+    out->received_partial = frames_broken_.load(std::memory_order_relaxed);
+    out->lost_in_transit  = frames_gone_.load(std::memory_order_relaxed);
+    out->packets_lost     = packets_lost_.load(std::memory_order_relaxed);
+    out->dropped_by_host  = frames_superseded_.load(std::memory_order_relaxed);
+    out->withheld_resync  = frames_gated_.load(std::memory_order_relaxed);
+
+    // The buckets partition every frame the device numbered up to the last one
+    // that ended, so their sum IS what it sent. The frame still in flight is in
+    // none of them, which is why this never reports a loss that later un-happens.
+    out->device_frames = out->received_whole + out->received_partial +
+                         out->lost_in_transit;
+    out->loss_percent  = out->device_frames
+        ? 100.f * (float)out->lost() / (float)out->device_frames
+        : 0.f;
 }
 
 bool StreamAssembler::peek_latest_accel(float out[3]) {

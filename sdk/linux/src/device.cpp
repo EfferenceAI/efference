@@ -176,6 +176,8 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
     di.admin_gate                 = d.admin_gate;
     di.admin_provisioned          = d.admin_provisioned;
     di.key_unprotected            = d.key_unprotected;
+    di.recordings_volume_attached = d.recordings_volume_attached;
+    di.recordings_volume_files    = d.recordings_volume_files;
 
     di.wireless.wifi_mac_address = d.wifi_mac;   // vendor storage; "" if unprovisioned
     di.wireless.bt_mac_address   = d.bt_mac;
@@ -191,6 +193,7 @@ void info_from_wire(const WireDeviceInfo& d, INPUT_TYPE transport,
         di.wireless.wifi_link_speed    = d.wifi.link_speed;
         di.wireless.wifi_freq_mhz      = d.wifi.freq_mhz;
         di.wireless.wifi_security      = d.wifi.security;
+        di.wireless.wifi_health        = static_cast<WIFI_HEALTH>(d.wifi.health);
         // Same back-compat derivation refresh_wireless uses: firmware predating
         // WifiStatus.state leaves it empty.
         di.wireless.wifi_state =
@@ -306,8 +309,8 @@ ERROR_CODE Device::open(InitParameters params) {
         // AUTH_REQUIRED to everything.
         //
         // A wrong password does not fail the open, matching the USB path: the
-        // device still answers info/state/storage unauthenticated on either
-        // transport, and those are what an operator needs to diagnose a device
+        // gated verbs report INVALID_PASSWORD on their own, which is what an
+        // operator needs to diagnose a device
         // whose password they have lost. Gated verbs report INVALID_PASSWORD.
         (void)impl_->control_auth(params.ble_password);
 #else
@@ -344,12 +347,10 @@ ERROR_CODE Device::open(InitParameters params) {
         // means every later verb sees an authed session. Unlocked USB (the
         // factory default) skips this entirely.
         //
-        // A wrong password does NOT fail the open: the device still answers
-        // info/state/storage/factory-reset unauthenticated, and those are exactly
-        // what an operator needs to diagnose a device whose password they have
-        // lost. Failing here would hide them behind the very credential they are
-        // trying to recover from. Gated verbs then report INVALID_PASSWORD on
-        // their own.
+        // A wrong password does NOT fail the open: an operator diagnosing a device
+        // whose password they have lost still needs to identify it, and failing
+        // here would hide that behind the very credential they are recovering.
+        // Gated verbs report INVALID_PASSWORD on their own.
         if (params.input_type != INPUT_TYPE::STREAM &&
             resp.body.device_information.usb_locked) {
             if (impl_->control_auth(params.ble_password) == ERROR_CODE::SUCCESS) {
@@ -457,6 +458,21 @@ bool         Device::is_authenticated() const { return impl_ && impl_->authentic
 DEVICE_STATE Device::get_state() const {
     return impl_ ? impl_->state.load() : DEVICE_STATE::CLOSED;
 }
+
+ERROR_CODE Device::refresh_state() {
+    // An MCAP replay has no device to ask, and its state is a property of the file
+    // rather than something to overwrite from a wire that is not there.
+    //
+    // Deliberately NOT gated on is_open(), unlike its siblings. is_open() is
+    // `cached state != CLOSED`, and CLOSED is what the device's INIT, RESET,
+    // HEALTH_TEST and SLEEP all map to — so gating on it makes this call refuse
+    // exactly the states it exists to poll a device out of, and a health check
+    // would leave get_state() pinned at CLOSED over a healthy link. The real
+    // precondition is having a transport, which refresh_device_state checks.
+    if (!impl_ || impl_->init.input_type == INPUT_TYPE::MCAP)
+        return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    return impl_->refresh_device_state();
+}
 bool Device::poll_fault(std::string* reason) {
     if (!impl_) { if (reason) reason->clear(); return false; }
     impl_->refresh_device_state();  // live: also refreshes the cached DEVICE_STATE
@@ -504,6 +520,8 @@ ERROR_CODE Device::refresh_device_information() {
             std::lock_guard<std::mutex> lk(impl_->info_mtx);
             impl_->forget_wifi_association();
             impl_->info.wireless.ble_connected = false;
+            impl_->info.recordings_volume_attached = false;
+            impl_->info.recordings_volume_files    = 0;
         }
         return ec;
     }

@@ -98,9 +98,11 @@ public:
     // "rec_<utc>_<seq>"). The recording survives host disconnect.
     std::string name;
 
-    // Optional per-session location override: when set, this recording uses
-    // `location` instead of the persistent/default. Does not change the default
-    // (use Device::set_location for that).
+    // Location for this recording only, used whether or not the device has one
+    // stored, and only for RECORDING_TARGET::DEVICE_LOCAL. Leaves the stored
+    // location alone (use Device::set_location for that). has_location is the
+    // opt-in; Location::is_set and clear_supported are get_location outputs and
+    // are ignored here.
     bool     has_location = false;
     Location location;
 };

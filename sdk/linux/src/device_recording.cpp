@@ -74,6 +74,10 @@ ERROR_CODE Device::enable_recording(RecordingParameters params) {
         req.body.start_recording.location.longitude       = params.location.longitude;
         req.body.start_recording.location.altitude        = params.location.altitude;
         req.body.start_recording.location.covariance_diag = params.location.covariance_diag;
+        // Say so explicitly rather than letting the device infer intent from the
+        // coordinates, which would drop a deliberate 0,0 as a default-constructed
+        // struct.
+        req.body.start_recording.location.state           = ef_v1_LocationState_LOCATION_SET;
     }
     WireResponse resp;
     ERROR_CODE ec = impl_->call(req, resp, 0, Ctx::RECORDING);
@@ -123,7 +127,7 @@ void recording_from_wire(const WireRecording& s, RecordingStatus* out) {
     // UNSPECIFIED rather than aliasing an existing reason.
     out->stopped_reason =
         (s.stopped_reason >= ef_v1_StopReason_STOP_USER &&
-         s.stopped_reason <= ef_v1_StopReason_STOP_INTERRUPTED)
+         s.stopped_reason <= ef_v1_StopReason_STOP_DEVICE)
             ? (STOP_REASON)s.stopped_reason
             : STOP_REASON::UNSPECIFIED;
     out->partial = s.partial;
@@ -170,7 +174,10 @@ ERROR_CODE Device::get_recording_status(RecordingStatus& out, const std::string&
         } else if (ec != ERROR_CODE::UNSUPPORTED) {
             return ec;                    // real failure, including NOT_FOUND
         }
-        // UNSUPPORTED: firmware predating the verb. Fall through to the list.
+        // UNSUPPORTED: firmware predating the verb, which is how firmware older than
+        // COMMAND_NOT_FOUND reports an unrouted one. Newer firmware answers
+        // COMMAND_NOT_FOUND instead, so a fallback added from here on must key on that.
+        // Fall through to the list.
     }
     if (!have) {
         // Also the only way to answer "which session is live?", which no
@@ -223,7 +230,7 @@ ERROR_CODE Device::get_recording_status(RecordingStatus& out, const std::string&
                     break;
                 case ef_v1_UploadState_UPLOAD_FAILED: {
                     out.upload = UPLOAD_STATE::OFF;
-                    ERROR_CODE le = err_from(u.last_error, Ctx::UPLOAD);
+                    ERROR_CODE le = err_from(u.last_error, Ctx::UPLOAD_STATUS);
                     out.last_error = (le == ERROR_CODE::SUCCESS)
                                          ? ERROR_CODE::UNKNOWN_FAILURE : le;
                     break;
@@ -406,7 +413,8 @@ static bool is_http_url(const std::string& u) {
     return starts_with_ci("http://") || starts_with_ci("https://");
 }
 
-ERROR_CODE Device::upload_recording(const std::string& name, const std::string& url) {
+ERROR_CODE Device::upload_recording(const std::string& name, const std::string& url,
+                                    bool resumable) {
     if (!is_open())                 return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (name.empty() || url.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
     if (!is_http_url(url))          return ERROR_CODE::INVALID_FUNCTION_CALL;
@@ -417,6 +425,7 @@ ERROR_CODE Device::upload_recording(const std::string& name, const std::string& 
     req.body.start_upload.has_spec  = true;
     req.body.start_upload.spec.dest = ef_v1_UploadDest_UPLOAD_CLOUD_URL;
     req.body.start_upload.spec.mode = ef_v1_UploadMode_UPLOAD_AFTER_STOP;
+    req.body.start_upload.spec.resumable = resumable;
     // Reject rather than silently truncate a URL longer than the wire buffer.
     if (url.size() >= sizeof req.body.start_upload.spec.presigned_url)
         return ERROR_CODE::INVALID_FUNCTION_CALL;

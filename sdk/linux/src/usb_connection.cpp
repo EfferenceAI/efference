@@ -22,6 +22,7 @@
 
 #include "usb_connection.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -197,37 +198,48 @@ Status UsbConnection::request_raw(const std::string& payload, std::string& out,
     // stale reply (prior timed-out call) or unsolicited EVENT could otherwise return
     // the wrong payload. `acc` may hold multiple coalesced frames, so extract from it
     // before reading more.
+    //
+    // A header that does not parse resyncs rather than failing the exchange, which
+    // matters more here than on BLE: `acc` is per-call, so a desynced tail is not
+    // sitting in it where the next call would clear it -- it is unread in the
+    // endpoint queue, and lands at the head of the NEXT request's first bulk read.
     std::vector<uint8_t> acc;
-    acc.reserve(proto::MAX_FRAME);
+    acc.reserve(proto::MAX_RX);
     uint8_t chunk[4096];
+    // A frame can only ever be MAX_FRAME long, so `acc` must never grow past MAX_RX
+    // between scans; if it could, append_bounded would CLEAR a buffer holding a
+    // legitimate reply rather than bounding junk.
+    static_assert(sizeof chunk <= proto::MAX_RX - proto::MAX_FRAME,
+                  "a single read must not be able to overflow the reassembly cap");
+
+    // Resyncing replaced a fast-fail, so the loop needs its own ceiling: `guard`
+    // counts reads, not time, and a bulk IN completes on a short packet. A device
+    // dribbling one byte per read would otherwise hold a verb for minutes. Generous
+    // against a legitimate multi-read reply, immediate against a stuck one.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(4 * kTimeoutMs);
     for (int guard = 0; guard < 256; ++guard) {
-        // Extract every complete frame currently buffered.
-        while (acc.size() >= proto::HDR_LEN) {
-            if (acc[0] != proto::MAGIC || acc[1] != proto::VERSION)
-                return Status::USB_ERROR;
+        if (std::chrono::steady_clock::now() > deadline) return Status::USB_ERROR;
+        size_t before = acc.size();
+        proto::Scan s = proto::scan_for_reply(acc, corr);
+        if (verbose_ && acc.size() != before)
+            fprintf(stderr, "[ef] skipped %zu byte(s) of stale/event data\n",
+                    before - acc.size());
+        if (s == proto::Scan::MATCH) {
             uint32_t plen = proto::get_le32(&acc[8]);
-            if (plen > proto::MAX_PAYLOAD) return Status::USB_ERROR;
-            size_t need = proto::HDR_LEN + plen;
-            if (acc.size() < need) break;             // wait for the rest
-            uint8_t  type  = acc[2];
-            uint32_t rcorr = proto::get_le32(&acc[4]);
-            bool matches = (type == proto::RESPONSE || type == proto::ERROR) &&
-                           (rcorr == corr);
+            if (out_type) *out_type = acc[2];
             if (verbose_)
-                fprintf(stderr, "[ef] reply type=%u corr=%u len=%u%s\n",
-                        type, rcorr, plen, matches ? "" : " (stale/event, skipping)");
-            if (matches) {
-                if (out_type) *out_type = type;
-                out.assign((const char*)acc.data() + proto::HDR_LEN, plen);
-                return Status::SUCCESS;
-            }
-            acc.erase(acc.begin(), acc.begin() + need);  // drop it, keep the rest
+                fprintf(stderr, "[ef] reply type=%u len=%u\n", acc[2], plen);
+            out.assign((const char*)acc.data() + proto::HDR_LEN, plen);
+            return Status::SUCCESS;
         }
         // Need more bytes from the wire.
         int got = 0;
         rc = libusb_bulk_transfer(handle_, ep_in_, chunk, (int)sizeof chunk, &got, kTimeoutMs);
         if (rc < 0) return Status::USB_ERROR;
-        if (got > 0) acc.insert(acc.end(), chunk, chunk + (size_t)got);
+        // Unlike BLE's notification callback, this loop has a caller to fail.
+        if (got > 0 && !proto::append_bounded(acc, chunk, (size_t)got))
+            return Status::USB_ERROR;
     }
     return Status::USB_ERROR;   // too many stale frames without a match
 }

@@ -38,8 +38,7 @@ using namespace ef;
 static volatile std::sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
 
-// Flags live in usage() below, which --help prints. Not repeated here: a second
-// copy is how the README came to claim this tool had no --help.
+// Flags live in usage() below, which --help prints. Do not duplicate them here.
 //
 // --flip is a host-side display transform only. It does not touch the stream sent
 // to a --udp target, so a remote receiver applies its own.
@@ -54,6 +53,8 @@ static void usage(const char* argv0) {
         "  --udp <host[:port]>                   device forwards video+IMU here over WiFi\n"
         "  --flip on|off|auto                    rotate the display 180 (auto reads the IMU)\n"
         "  --headless, --no-window               hold the session without an OpenCV window\n"
+        "  --stats                               add a frame-accounting line: what the device\n"
+        "                                        sent against what this host received\n"
         "\n"
         "Rectification is on-device: see `ef-cli calibration --camera --rectify`.\n"
         "Q, Esc, closing the window, or Ctrl-C quits.\n", argv0);
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
     InitParameters init;
     bool headless = false;
     bool flip_set = false;
+    bool show_stats = false;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
             usage(argv[0]);
@@ -101,6 +103,8 @@ int main(int argc, char** argv) {
             flip_set = true;
         } else if (!std::strcmp(argv[i], "--password") && i + 1 < argc) {
             init.ble_password = argv[++i];
+        } else if (!std::strcmp(argv[i], "--stats")) {
+            show_stats = true;
         } else if (!std::strcmp(argv[i], "--headless") || !std::strcmp(argv[i], "--no-window")) {
             headless = true;
         } else {
@@ -172,11 +176,22 @@ int main(int argc, char** argv) {
     auto heartbeat = [&](uint64_t now) {
         if (!headless || now - last_log_ns < 1000000000ULL) return;
         last_log_ns = now;
+        char extra[128] = "";
+        if (show_stats) {
+            StreamStats hs;
+            dev.get_stream_stats(hs);
+            std::snprintf(extra, sizeof extra,
+                          "  device=%llu received=%llu lost=%llu (%.2f%%)",
+                          (unsigned long long)hs.device_frames,
+                          (unsigned long long)hs.received_whole,
+                          (unsigned long long)hs.lost(), hs.loss_percent);
+        }
         std::fprintf(stderr, "streaming %s -> %s:%u  frames=%llu timeouts=%llu "
-                     "imu=%llu  up %llus\n", to_string(init.compression),
+                     "imu=%llu%s  up %llus\n",
+                     to_string(init.compression),
                      init.udp_host.c_str(), init.udp_port,
                      (unsigned long long)frames_ok, (unsigned long long)timeouts,
-                     (unsigned long long)imu_total,
+                     (unsigned long long)imu_total, extra,
                      (unsigned long long)((now - start_ns) / 1000000000ULL));
     };
 
@@ -208,22 +223,52 @@ int main(int argc, char** argv) {
         cv::Mat frame = ef::toCvMat(image);
         if (frame.empty()) continue;
 
-        // Dark status strip above the video (never covers it) with frame + IMU.
-        char hud[256];
-        std::snprintf(hud, sizeof hud,
-                      "frame %u    accel[%+.2f %+.2f %+.2f] m/s^2    gyro[%+.2f %+.2f %+.2f] rad/s",
-                      image.getFrameId(), ax, ay, az, gx, gy, gz);
-        const int    bar_h      = 44;
+        // Dark status strip above the video (never covers it). IMU always; the
+        // frame-accounting line only under --stats, so the default view is the
+        // one line it has always been.
+        StreamStats st;
+        const bool stats = show_stats &&
+                           dev.get_stream_stats(st) == ERROR_CODE::SUCCESS;
+        char hud[2][256];
+        int nlines = 0;
+        if (stats) {
+            std::snprintf(hud[nlines++], sizeof hud[0],
+                          "frame %u    device %llu    received %llu    lost %llu (%.2f%%)"
+                          "    host-dropped %llu    resync-held %llu",
+                          image.getFrameId(),
+                          (unsigned long long)st.device_frames,
+                          (unsigned long long)st.received_whole,
+                          (unsigned long long)st.lost(),
+                          st.loss_percent,
+                          (unsigned long long)st.dropped_by_host,
+                          (unsigned long long)st.withheld_resync);
+            std::snprintf(hud[nlines++], sizeof hud[0],
+                          "accel[%+.2f %+.2f %+.2f] m/s^2    gyro[%+.2f %+.2f %+.2f] rad/s",
+                          ax, ay, az, gx, gy, gz);
+        } else {
+            std::snprintf(hud[nlines++], sizeof hud[0],
+                          "frame %u    accel[%+.2f %+.2f %+.2f] m/s^2    "
+                          "gyro[%+.2f %+.2f %+.2f] rad/s",
+                          image.getFrameId(), ax, ay, az, gx, gy, gz);
+        }
+        const int    line_h     = 26;
+        const int    bar_h      = nlines * line_h + 8;
         const double font_scale = 0.6;
         const int    thickness  = 1;
-        int baseline = 0;
-        cv::Size ts = cv::getTextSize(hud, cv::FONT_HERSHEY_SIMPLEX, font_scale,
-                                      thickness, &baseline);
+        // Under --stats the accounting line goes red once a frame is missing on the
+        // link; the IMU line stays green.
+        const cv::Scalar green(0, 255, 0);
+        const cv::Scalar first = (stats && st.lost()) ? cv::Scalar(0, 0, 255) : green;
         cv::Mat bar(bar_h, frame.cols, frame.type(), cv::Scalar(28, 28, 28));
-        int tx = (frame.cols - ts.width) / 2; if (tx < 0) tx = 0;   // centered
-        cv::putText(bar, hud, cv::Point(tx, (bar_h + ts.height) / 2),
-                    cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 255, 0),
-                    thickness, cv::LINE_AA);
+        for (int i = 0; i < nlines; i++) {
+            int baseline = 0;
+            cv::Size ts = cv::getTextSize(hud[i], cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                                          thickness, &baseline);
+            int tx = (frame.cols - ts.width) / 2; if (tx < 0) tx = 0;   // centered
+            cv::putText(bar, hud[i], cv::Point(tx, 8 + line_h * i + ts.height),
+                        cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        i == 0 ? first : green, thickness, cv::LINE_AA);
+        }
 
         cv::Mat canvas;
         cv::vconcat(bar, frame, canvas);
@@ -233,11 +278,22 @@ int main(int argc, char** argv) {
         uint64_t now = dev.get_timestamp().nanoseconds();
         if (now - last_log_ns >= 1000000000ULL) {
             last_log_ns = now;
+            char extra[160] = "";
+            if (stats)
+                std::snprintf(extra, sizeof extra,
+                              "  device=%llu received=%llu lost=%llu (%.2f%%) "
+                              "partial=%llu host-dropped=%llu packets-lost=%llu",
+                              (unsigned long long)st.device_frames,
+                              (unsigned long long)st.received_whole,
+                              (unsigned long long)st.lost(), st.loss_percent,
+                              (unsigned long long)st.received_partial,
+                              (unsigned long long)st.dropped_by_host,
+                              (unsigned long long)st.packets_lost);
             std::fprintf(stderr,
                 "frame %u  accel[%+.2f %+.2f %+.2f] m/s^2  gyro[%+.2f %+.2f %+.2f] rad/s  "
-                "imu=%llu\n",
+                "imu=%llu%s\n",
                 image.getFrameId(), ax, ay, az, gx, gy, gz,
-                (unsigned long long)imu_total);
+                (unsigned long long)imu_total, extra);
         }
 
         // waitKey paints the window and polls for quit (ESC/q); run it each frame.

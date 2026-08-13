@@ -5,7 +5,7 @@
 // code (e.g. "US") unlocks 5 GHz channels. This is the prerequisite for the
 // WiFi/UDP livestream in example 04.
 //
-//   ./wireless_03_wifi_provisioning <ssid> <password> [country] [ble_mac]
+//   ./wifi_provisioning <ssid> <password> [country] [ble_mac]
 
 #include <iostream>
 #include <string>
@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
                   << w.wifi_ip_address << ").\n";
     else
         std::cout << "Provisioned \"" << ssid
-                  << "\". Association in progress - re-check with wired_04_wifi_status.\n";
+                  << "\". Association in progress - re-check with wifi_status.\n";
 
     device.close();
     return 0;

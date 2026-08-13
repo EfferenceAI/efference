@@ -10,6 +10,7 @@
   <a href="https://efference.ai"><u>Website</u></a> ·
   <a href="https://docs.efference.ai/introduction"><u>Documentation</u></a> ·
   <a href="https://docs.efference.ai/api/device"><u>API Reference</u></a> ·
+  <a href="https://docs.efference.ai/changelog/sdk"><u>Changelog</u></a> ·
   <a href="https://x.com/EfferenceAI"><u>X</u></a>
 </p>
 
@@ -67,11 +68,11 @@ factory device:
 ./sdk/linux/build/ef-cli lock on             # USB now needs --password too
 ```
 
-Encrypted recordings come off the device as `.enc`, so keep that key: reading one
-back needs `ef-decrypt`, which the same build produces.
+Encrypted recordings keep their `.mcap` name, so keep that key: reading one back
+needs `ef-decrypt`, which the same build produces.
 
 ```sh
-./sdk/linux/build/ef-decrypt <in.enc> <key-file> <out>   # key: 32 raw bytes or 64 hex chars
+./sdk/linux/build/ef-decrypt <in.mcap> <key-file> <out>   # key: 32 raw bytes or 64 hex chars
 ```
 
 The build also produces `efference-viewer`, a live video and IMU window. Both it

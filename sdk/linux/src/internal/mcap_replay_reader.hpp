@@ -59,8 +59,12 @@ private:
     int         verbose_ = 0;
     std::string fmt_;
     int         w_ = 0, h_ = 0;
-    uint32_t    vseq_ = 0;      // synthesized ef_stream packet sequence
-    uint64_t    iseq_ = 0;      // synthesized IMU sample sequence
+    // One counter per stream, as the device does: sharing them makes the video
+    // frame ids advance at the IMU rate and the stream read as almost all lost.
+    uint32_t    vseq_ = 0;         // synthesized VIDEO packet sequence
+    uint32_t    imu_pkt_seq_ = 0;  // synthesized IMU packet sequence
+    uint32_t    vframe_ = 0;       // synthesized video frame id
+    uint64_t    iseq_ = 0;         // synthesized IMU sample sequence
 };
 
 }  // namespace internal

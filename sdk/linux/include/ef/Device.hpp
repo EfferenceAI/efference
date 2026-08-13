@@ -69,7 +69,14 @@ public:
     bool           is_authenticated() const;
     void           close();
 
+    // Last known state. Free and never blocks; open() and every verb that moves the
+    // device keep it current, so poll it as often as you like.
     DEVICE_STATE get_state() const;
+
+    // Re-read state from the device, for a caller that has been idle and wants to
+    // see a change it did not cause. On failure the cached value is kept, so an
+    // error means get_state() is stale, not that the device is gone.
+    ERROR_CODE refresh_state();
 
     // Live fault poll. Refreshes the device state from the device firmware's state machine (so a
     // subsequent get_state() is fresh too). Returns true iff a fault is LATCHED (the
@@ -100,6 +107,10 @@ public:
     ERROR_CODE retrieve_image(Mat& mat, VIEW view = VIEW::NV12);
     ERROR_CODE retrieve_imu(SensorsData& data,
                             TIME_REFERENCE ref = TIME_REFERENCE::IMAGE);
+
+    // Frame accounting for the open stream. Counts reset when streaming starts.
+    // INVALID_FUNCTION_CALL before the first grab(), with `out` left untouched.
+    ERROR_CODE get_stream_stats(StreamStats& out) const;
 
     Timestamp get_timestamp(TIME_REFERENCE ref = TIME_REFERENCE::CURRENT) const;
 
@@ -135,7 +146,18 @@ public:
                                   const std::string& dest_path,
                                   std::string* saved_path = nullptr);
 
-    ERROR_CODE upload_recording(const std::string& name, const std::string& url);
+    // Hand the device a URL to upload a recording to, over WiFi. Returns once the
+    // URL is attached, not when the transfer finishes; poll get_recording_status(),
+    // whose upload, upload_bytes_sent/total and last_error track it.
+    // Returns DEVICE_BUSY if an upload of this recording is already running.
+    // Set resumable when url is a resumable-session URI, so an interrupted
+    // transfer continues instead of restarting. Minting that URI is the caller's job.
+    ERROR_CODE upload_recording(const std::string& name, const std::string& url,
+                                bool resumable = false);
+    // Abort the upload of a recording: a transfer in flight is cut off, and the URL
+    // is detached so it is not retried. Succeeds whether or not one was running.
+    // With a resumable URI the destination keeps what it already committed, so
+    // re-attaching the same URI continues rather than restarting.
     ERROR_CODE stop_upload(const std::string& name);
 
     // Ask the update-check service what this device should be running. A host-side
@@ -174,11 +196,17 @@ public:
     // Rekey the device control password (shared by BLE and USB). The old password
     // is required, except on an unlocked USB link, where it may be "".
     //
-    // ⚠ An ADMINISTRATOR grant also substitutes for the old password. Call
+    // An ADMINISTRATOR grant also substitutes for the old password. Call
     // authenticate_admin() immediately before this to use it; the alternative for a
     // forgotten password is factory_reset(), which destroys the encryption key.
     ERROR_CODE set_ble_password(const std::string& old_password,
                                 const std::string& new_password);
+
+    // Clear every BLE pairing, for a phone that paired before and will no longer
+    // connect. USB only, since it drops the bond of the link it would answer on.
+    // Clears the DEVICE side only: each phone must also forget the device before
+    // it will pair again. Passwords are unchanged.
+    ERROR_CODE forget_ble_bonds();
 
     // Rekey the ADMINISTRATOR password, the separate credential that guards reading
     // and destroying the encryption key.
@@ -194,7 +222,7 @@ public:
     ERROR_CODE set_admin_password(const std::string& old_password,
                                   const std::string& new_password);
 
-    // ⚠ REMOVE the administrator credential, returning the device to "no administrator
+    // REMOVE the administrator credential, returning the device to "no administrator
     // password": the encryption-key verbs and set_encryption drop back to the control
     // password, and any installed key becomes readable by whoever holds it. A
     // DOWNGRADE, so the device demands the current password on top of the admin grant.
@@ -203,7 +231,7 @@ public:
     // Prove the administrator credential NOW, instead of waiting for a verb to demand
     // it. Needed only for set_ble_password()'s rescue, which cannot escalate by itself.
     //
-    // ⚠ The grant is SINGLE-USE and the device spends it on the first admin-gated verb.
+    // The grant is SINGLE-USE and the device spends it on the first admin-gated verb.
     // Call the verb you want immediately afterwards, with nothing in between, or you
     // will spend the grant on something else. The intended sequence is exactly:
     //     authenticate_admin(admin_pw);
@@ -212,10 +240,10 @@ public:
     // INVALID_PASSWORD means refused, and the handle keeps whatever it already held.
     ERROR_CODE authenticate_admin(const std::string& admin_password);
 
-    // Lock or unlock the USB control plane. Unlocked (factory default) USB answers at
-    // the CONTROL-password tier with no password at all; the administrator verbs still
-    // refuse it, because physical access is not admin. Locked, it gates exactly like BLE and open() authenticates
-    // with InitParameters::ble_password. Toggling requires the current password.
+    // Lock or unlock the USB control plane. Unlocked (factory default) USB carries
+    // control-password privilege; the administrator verbs still refuse it. Locked, it
+    // gates exactly like BLE and open() authenticates with
+    // InitParameters::ble_password. Toggling requires the current password.
     //
     // session_only opens a LOCKED device for this power session without changing
     // the stored policy: gated verbs answer with no password until set_usb_lock(
@@ -270,9 +298,7 @@ public:
     // Restore factory settings: the control password back to its default, the
     // administrator password REMOVED (it has no default to restore), USB unlocked,
     // encryption off, and wifi, calibration, capture config, recordings and runtime
-    // state cleared. Unauthenticated only over USB, so physical possession is the
-    // escape when the password is lost; over BLE it needs the password like any
-    // other verb.
+    // state cleared. Over BLE it needs the password like any other verb.
     //
     // WARNING: DESTROYS the encryption key. Every recording made under it becomes
     // permanently undecryptable, including copies already uploaded elsewhere.
@@ -286,13 +312,16 @@ public:
     // returned Timestamp is the device CLOCK_REALTIME at the time of the reply.
     ERROR_CODE get_device_time(Timestamp& out);
 
-    // Persist the device location (replaces the default); every subsequent
-    // recording uses it until changed. For a one-off, use
-    // RecordingParameters::location instead.
+    // Store the device location; every subsequent recording carries it until
+    // changed. IDLE only. For a one-off, use RecordingParameters::location.
+    // All four values are replaced, so omitting covariance_diag stores 0, which
+    // reports the fix as accuracy-unknown rather than keeping a previous value.
     ERROR_CODE set_location(double latitude, double longitude,
                             double altitude = 0.0, double covariance_diag = 0.0);
-    // Read the device's current effective location (the persisted value if one
-    // has been set, otherwise the factory default).
+    // Drop the stored location; recordings then carry none. IDLE only. Returns
+    // UNSUPPORTED on firmware that cannot hold an empty location.
+    ERROR_CODE clear_location();
+    // Read the stored location. Location::is_set is false when none is stored.
     ERROR_CODE get_location(Location& out);
 
     ERROR_CODE reboot();

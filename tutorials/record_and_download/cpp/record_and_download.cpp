@@ -4,7 +4,7 @@
 // even if the host disconnects. Here we start one, let it run briefly, stop it,
 // and download the resulting .mcap over the USB control link (no WiFi needed).
 //
-//   ./wired_05_record_and_download [seconds]
+//   ./record_and_download [seconds]
 
 #include <chrono>
 #include <iostream>

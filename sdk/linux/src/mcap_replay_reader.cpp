@@ -209,8 +209,8 @@ void McapReplayReader::run() {
             uint8_t* p = pkt.data();
             std::memset(p, 0, kVidHdr);
             p[0] = kMagic; p[1] = 1; p[2] = kTypeVideo; p[3] = kFragStart | kFragEnd;
-            wr32(p + 4, ++vseq_);
-            wr32(p + 8, vseq_);                       // frame_id
+            wr32(p + 4, ++vseq_);                     // video packet seq
+            wr32(p + 8, vframe_++);                   // frame_id, its own counter
             wr32(p + 12, 0);                          // offset
             wr32(p + 16, (uint32_t)vm.size);          // plen
             wr32(p + 20, (uint32_t)vm.size);          // fsize
@@ -230,7 +230,10 @@ void McapReplayReader::run() {
             uint8_t* p = pkt.data();
             std::memset(p, 0, pkt.size());
             p[0] = kMagic; p[1] = 1; p[2] = kTypeImu; p[3] = 0;
-            wr32(p + 4, ++vseq_);
+            // IMU has its OWN packet seq. Sharing the video one made the frame ids
+            // jump by the IMU rate (840 Hz against 30 fps), which a consumer reads
+            // as near-total frame loss on a file that is intact.
+            wr32(p + 4, ++imu_pkt_seq_);
             wr64(p + 8, iseq_++);                     // base_seq
             wr16(p + 16, 1);                          // n samples
             wr16(p + 18, (uint16_t)kImuSample);       // stride

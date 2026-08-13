@@ -112,7 +112,10 @@ struct CtxGuard {
 }  // namespace
 
 void BleConnection::on_response_bytes(const uint8_t* data, size_t len) {
-    rx_.insert(rx_.end(), data, data + len);
+    // Dropping the buffer is all a notification callback can do about overflow:
+    // there is no caller to fail. pump_until then times out on its own.
+    if (!proto::append_bounded(rx_, data, len) && verbose_)
+        fprintf(stderr, "[ble] response buffer overflow (+%zu); resetting\n", len);
 }
 
 // PropertiesChanged on the Response characteristic -> append the Value bytes.
@@ -295,6 +298,9 @@ Status BleConnection::open(const std::string& address) {
     if (address.empty()) return Status::DEVICE_NOT_FOUND;
     if (is_open())       return Status::BLE_ERROR;   // not idempotent; close() first
 
+    // A reconnect must not inherit the last link's tail.
+    rx_.clear();
+
     // Any failure after latching of characteristic paths begins must leave the
     // handle reporting !is_open(), so a caller can't mistake a half-open handle
     // for a live one. Clear what discovery may have set on every early exit.
@@ -442,28 +448,15 @@ Status BleConnection::request_raw(const std::string& payload, std::string& out,
     // Reassemble frames from notifications (header carries len); accept only the
     // RESPONSE/ERROR whose corr_id matches THIS request (same stale-reply/EVENT
     // skipping as the USB path). Non-matching complete frames are dropped up front.
-    bool bad = false;
     auto have_match = [&]() -> bool {
-        for (;;) {
-            if (rx_.size() < proto::HDR_LEN) return false;
-            if (rx_[0] != proto::MAGIC || rx_[1] != proto::VERSION) {
-                bad = true;   // desynced stream (e.g. tail of a stale frame)
-                return true;
-            }
-            uint32_t plen = proto::get_le32(&rx_[8]);
-            if (plen > proto::MAX_PAYLOAD) { bad = true; return true; }
-            if (rx_.size() < proto::HDR_LEN + plen) return false;
-            uint8_t  type  = rx_[2];
-            uint32_t rcorr = proto::get_le32(&rx_[4]);
-            bool matches = (type != proto::EVENT) && (rcorr == corr);
-            if (verbose_)
-                fprintf(stderr, "[ble] reply type=%u corr=%u len=%u%s\n",
-                        type, rcorr, plen, matches ? "" : " (stale/event, skipping)");
-            if (matches) return true;
-            rx_.erase(rx_.begin(), rx_.begin() + proto::HDR_LEN + plen);
-        }
+        size_t before = rx_.size();
+        bool matched = proto::scan_for_reply(rx_, corr) == proto::Scan::MATCH;
+        if (verbose_ && rx_.size() != before)
+            fprintf(stderr, "[ble] skipped %zu byte(s) of stale/event data\n",
+                    before - rx_.size());
+        return matched;
     };
-    if (!pump_until(have_match, REQUEST_MS) || bad)
+    if (!pump_until(have_match, REQUEST_MS))
         return Status::BLE_ERROR;
 
     uint8_t  type = rx_[2];

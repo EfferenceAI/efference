@@ -3,7 +3,7 @@
 // With no argument, opens over USB. Given a BLE MAC, opens the control plane
 // over Bluetooth LE instead (video/IMU over WiFi is example 04).
 //
-//   ./wireless_01_choosing_a_connection [BLE_MAC]
+//   ./choosing_a_connection [BLE_MAC]
 
 #include <iostream>
 #include <string>

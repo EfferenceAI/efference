@@ -270,6 +270,9 @@ PB_BIND(ef_v1_ClearAdminPassword, ef_v1_ClearAdminPassword, AUTO)
 PB_BIND(ef_v1_SetUsbLock, ef_v1_SetUsbLock, AUTO)
 
 
+PB_BIND(ef_v1_ForgetBleBonds, ef_v1_ForgetBleBonds, AUTO)
+
+
 PB_BIND(ef_v1_SetEncryption, ef_v1_SetEncryption, AUTO)
 
 
@@ -289,6 +292,10 @@ PB_BIND(ef_v1_EncryptionKey, ef_v1_EncryptionKey, AUTO)
 
 
 PB_BIND(ef_v1_FactoryReset, ef_v1_FactoryReset, AUTO)
+
+
+
+
 
 
 

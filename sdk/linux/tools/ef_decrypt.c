@@ -59,10 +59,8 @@ int main(int argc, char **argv) {
         errno = saved;
         /* Name the two failures a user can act on; anything else is corruption. */
         if (errno == EKEYREJECTED)
-            /* The header is unauthenticated at this point (the chunk tags are what
-             * bind it), so a modified key_id is indistinguishable from the wrong
-             * key. Say both rather than asserting a key that may never have
-             * existed. */
+            /* A modified header is indistinguishable from the wrong key, so say
+             * both rather than asserting a key that may never have existed. */
             fprintf(stderr, "ef-decrypt: header names key %s: wrong key, "
                             "or a modified header\n", info.key_id);
         else if (errno == ENOTSUP)

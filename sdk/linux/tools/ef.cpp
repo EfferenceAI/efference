@@ -40,18 +40,35 @@
 
 using namespace ef;
 
+// Why the link is not usable, or nullptr when it is (UNSPECIFIED included: older
+// firmware reports it and it asserts nothing).
+static const char *wifi_health_reason(ef::WIFI_HEALTH h) {
+    switch (h) {
+        case ef::WIFI_HEALTH::DISCONNECTED: return "not associated with any access point";
+        case ef::WIFI_HEALTH::NO_ADDRESS:   return "associated but holds no address (no DHCP lease)";
+        case ef::WIFI_HEALTH::NO_DNS:       return "addressed but no DNS resolver is configured";
+        case ef::WIFI_HEALTH::UNREACHABLE:  return "the last transfer got no answer from its destination";
+        default: return nullptr;   // UNVERIFIED and OK are both usable
+    }
+}
+
+// The same verdict as a trailing clause, worded identically, for one-line summaries.
+static std::string wifi_health_suffix(ef::WIFI_HEALTH h) {
+    const char *why = wifi_health_reason(h);
+    return why ? std::string("  NOT USABLE: ") + why : std::string();
+}
+
 namespace {
 
 // Volatile, not memset: a wipe nothing reads again is a dead store the compiler may
-// drop. libcrypto is not linked here, so OPENSSL_cleanse is unavailable.
+// drop.
 void secure_zero(void* p, size_t n) {
     volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
     for (size_t i = 0; i < n; i++) v[i] = 0;
 }
 
-// A key must not survive in this process longer than it is needed. Not a security
-// guarantee (the bytes were already on a socket and possibly a terminal), but it
-// keeps them out of a core dump or a later allocation of the same page.
+// A key must not survive in this process longer than it is needed: keep it out of a
+// core dump or a later allocation of the same page.
 void wipe(std::vector<uint8_t>& k) {
     secure_zero(k.data(), k.size());
     k.clear();
@@ -118,7 +135,7 @@ bool key_from_hex(const std::string& in, size_t want, std::vector<uint8_t>& out)
 // key_unprotected, not !admin_provisioned: the device owns the definition of
 // "exposed", so a second copy of the formula here would silently stop agreeing.
 void warn_if_key_unprotected(ef::Device& dev) {
-    // ⚠ Refresh first: the cached snapshot is from open(), when `key set` had no key
+    // Refresh first: the cached snapshot is from open(), when `key set` had no key
     // to report, so without this the warning could never fire on that command.
     dev.refresh_device_information();
     if (!dev.get_device_information().key_unprotected) return;
@@ -175,107 +192,86 @@ void usage() {
         "  ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--admin-password <pw>]\n"
         "     [--udp <host[:port]>] [--verbose] <command> [args]\n"
         "\n"
-        "flags:\n"
-        "  --ble <MAC>                       connect over Bluetooth instead of USB\n"
-        "  --device <id>                     pick one of several USB devices\n"
-        "  --password <pw>                   control password, default 123456; needed on\n"
-        "                                    BLE always and on USB once locked\n"
-        "  --admin-password <pw>             administrator password, if one is set on the\n"
-        "                                    device; sent for 'key show', 'key set',\n"
-        "                                    'encryption create|delete|on|off', and as the\n"
-        "                                    rescue on 'set-password <new>'.\n"
-        "                                    set-admin-password and clear-admin-password\n"
-        "                                    take the current password positionally and\n"
-        "                                    ignore this flag\n"
-        "  --udp <host[:port]>               with --ble: device streams video+IMU to\n"
-        "                                    this host over WiFi/UDP (default port 5005)\n"
-        "  --verbose                         print the control-plane traffic\n"
+        "flags\n"
+        "  --ble <MAC>            connect over Bluetooth LE instead of USB\n"
+        "  --device <id>          pick one of several USB devices\n"
+        "  --password <pw>        control password (default 123456); needed on BLE, and\n"
+        "                         on USB once locked\n"
+        "  --admin-password <pw>  administrator password, when the device has one; sent\n"
+        "                         only for the verbs that can demand it\n"
+        "  --udp <host[:port]>    with --ble, stream video and IMU here (default port 5005)\n"
+        "  --verbose              print the control-plane traffic\n"
         "\n"
-        "commands:\n"
-        "  list [--scan-ble]                 discover devices (USB, and BLE with --scan-ble)\n"
-        "  info [--json]                     device information snapshot; --json emits the\n"
-        "                                    machine-readable state for scripts\n"
-        "  config                            list enabled capture modes + codecs\n"
-        "  config set <W> <H> <fps> <codec>  set capture config (idle only; codec:\n"
-        "                                    raw|h264|h264hq|h265|h265hq)\n"
-        "  calibration [--get]               show camera + IMU calibration\n"
-        "  calibration --camera --set <fx> <fy> <cx> <cy> <xi> <alpha> <W> <H> [--rectify on|off] [--fov-scale <s>]\n"
-        "                                    set camera intrinsics (idle only; always\n"
-        "                                    published as metadata; --rectify on|off toggles\n"
-        "                                    on-device FEC rectification, default off, needs FEC fw;\n"
-        "                                    --fov-scale sets the rectified FOV, default 1.0, <1 wider)\n"
+        "discover and inspect\n"
+        "  list [--scan-ble]                  discover devices (add --scan-ble for BLE)\n"
+        "  info [--json]                      device snapshot; --json for scripts\n"
+        "  state                              current DEVICE_STATE\n"
+        "  storage                            free and total space on the recording store\n"
+        "  health [--deep]                    health sweep; --deep adds the stress tier\n"
+        "  time | sync-time                   read the device clock, or set it from the host\n"
+        "  reboot                             reboot the device\n"
+        "\n"
+        "capture configuration (idle only)\n"
+        "  config                             list the enabled modes and codecs\n"
+        "  config set <W> <H> <fps> <codec>   codec: raw|h264|h264hq|h265|h265hq\n"
+        "  calibration [--get]                show camera and IMU calibration\n"
+        "  calibration --camera --set <fx> <fy> <cx> <cy> <xi> <alpha> <W> <H>\n"
         "  calibration --camera [--rectify on|off] [--fov-scale <s>]\n"
-        "                                    change only those flags, keeping the stored\n"
-        "                                    intrinsics (no need to retype --set)\n"
         "  calibration --imu --mode <raw|calibrated|both>\n"
-        "                                    select on-device IMU handling for the session\n"
-        "                                    (calibrated applies M*S*(x-b) per sample)\n"
         "  calibration [--camera|--imu] --reset\n"
-        "                                    reset calibration to factory default\n"
-        "  storage                           free/total space on the recording store\n"
-        "  state                             current DEVICE_STATE\n"
-        "  health [--deep]                   run the on-device health sweep\n"
+        "  location [set <lat> <lon> [alt] | clear]  read, store or drop the device location\n"
+        "\n"
+        "recordings\n"
         "  record start [name] [--location LAT,LON[,ALT]]\n"
-        "                                    start a device-local (eMMC) recording\n"
-        "                                    (--location overrides just this recording)\n"
-        "  record stop                       stop it\n"
-        "  record status [name]              session status (+ storage, upload)\n"
-        "  record list                       list device recordings\n"
-        "  record delete <name>              delete a device recording\n"
-        "  download <name> [dest]            pull a recording over USB/BLE. dest is a file\n"
-        "                                    path, or a directory to write <name>.mcap into\n"
-        "                                    (default <name>.mcap in the current directory)\n"
-        "  upload <name> <url>               upload a recording to a pre-signed URL\n"
-        "  stop-upload <name>                kill a running upload\n"
-        "  check-update                      ask the update service what to run\n"
-        "  update                            update to whatever the service offers\n"
-        "  update --url <url>                update from an explicit URL (no service call)\n"
-        "  update --file <update.eff>        update from a local bundle over USB\n"
-        "  abort-update                      cancel an update in progress\n"
+        "  record stop\n"
+        "  record status [name]               status, storage and upload progress\n"
+        "  record list                        device recordings, oldest first\n"
+        "  record delete <name>               returns at once; reclaimed in the background\n"
+        "  download <name> [dest]             pull a recording over USB or BLE\n"
+        "\n"
+        "uploads\n"
+        "  upload <name> <url>                upload to a pre-signed URL over WiFi\n"
+        "  upload <name> <url> --resumable    <url> is a resumable-session URI, so an\n"
+        "                                     interrupted transfer continues instead of\n"
+        "                                     restarting. Mint the URI yourself\n"
+        "  stop-upload <name>                 abort the transfer and detach the URL\n"
+        "\n"
+        "updates\n"
+        "  check-update                       ask the service what this device should run\n"
+        "  update [--url <url> | --file <update.eff>]\n"
+        "                                     update from the service, a URL, or a local\n"
+        "                                     bundle pushed over USB\n"
+        "  abort-update                       cancel an update in progress\n"
+        "\n"
+        "wifi\n"
         "  wifi add <ssid> [psk [country]] [--band auto|2.4|5]\n"
-        "                                    provision WiFi (quote an SSID with spaces; omit <psk>\n"
-        "                                    for a hidden prompt; country e.g. \"US\", else inferred\n"
-        "                                    from nearby beacons)\n"
-        "  wifi remove <ssid> | select <ssid> [--band auto|2.4|5]\n"
-        "  wifi list                         saved networks (marks the connected one)\n"
-        "  wifi scan                         access points in range (not while recording)\n"
-        "  wifi status                       current association\n"
-        "  set-password <new>                rekey the control password (unlocked USB, or\n"
-        "                                    with --admin-password: the administrator\n"
-        "                                    rescue for a forgotten worker password)\n"
-        "  set-password <old> <new>          rekey the control password (BLE or locked USB)\n"
-        "  set-admin-password <new>          set the administrator password (none by default;\n"
-        "                                    minimum 8 characters)\n"
-        "  set-admin-password <old> <new>    change it; needs the current one\n"
-        "  clear-admin-password <current>    REMOVE it; the key drops back to the control\n"
-        "                                    password and becomes readable with it\n"
-        "  lock on|off [--session]           lock/unlock the USB control plane\n"
-        "                                    (--session: this power session only,\n"
-        "                                     re-locks when power is lost)\n"
-        "  encryption on|off                 AES-256 encrypt new recordings;\n"
-        "                                    needs --admin-password when one is set\n"
-        "  encryption create                 generate the key; SHOWN ONCE, keep it;\n"
-        "                                    needs --admin-password when one is set\n"
-        "  encryption delete                 show the key and how to destroy it;\n"
-        "                                    needs --admin-password when one is set\n"
+        "  wifi select <ssid> [--band auto|2.4|5]\n"
+        "  wifi remove <ssid>                 forget a network\n"
+        "  wifi list                          saved networks, marking the connected one\n"
+        "  wifi scan                          access points in range, strongest first\n"
+        "  wifi status                        current association\n"
+        "\n"
+        "access control\n"
+        "  lock on|off [--session]            lock or unlock the USB control plane\n"
+        "  set-password <new>                 rekey over unlocked USB\n"
+        "  set-password <old> <new>           rekey over BLE, or on locked USB\n"
+        "  set-admin-password [<old>] <new>   set or change it (minimum 8 characters)\n"
+        "  clear-admin-password <current>     remove it\n"
+        "  forget-ble-bonds                   clear every BLE pairing (USB only). Each\n"
+        "                                     phone must forget the device too\n"
+        "  factory-reset [--yes]              restore defaults; DESTROYS the encryption\n"
+        "                                     key and REMOVES the administrator password\n"
+        "\n"
+        "at-rest encryption (administrator password, when one is set)\n"
+        "  encryption on|off                  AES-256 encrypt new recordings\n"
+        "  encryption create                  generate the key; SHOWN ONCE, save it\n"
+        "  encryption delete                  show the key and how to destroy it\n"
         "  encryption delete --confirm <id> [--yes]\n"
-        "                                    destroy it (recordings become unreadable);\n"
-        "                                    --yes is required without a terminal\n"
-        "  key show [--out <file>]           print the key, or write it to a 0600 file;\n"
-        "                                    needs --admin-password when one is set\n"
-        "  key set --in <file> | - | <64-hex>\n"
-        "                                    install a key you already hold; refused if one\n"
-        "                                    exists (delete it first). PREFER --in or - :\n"
-        "                                    a key passed as an argument is visible in ps\n"
-        "                                    and lands in shell history. Needs\n"
-        "                                    --admin-password when one is set\n"
-        "  factory-reset [--yes]             defaults + unlock; DESTROYS the encryption key\n"
-        "                                    and REMOVES the administrator password\n"
-        "  sync-time                         set the device clock from the host\n"
-        "  time                              read the device wall clock\n"
-        "  location                          read the device's current location\n"
-        "  location set <lat> <lon> [alt]    persist the device location (all recordings)\n"
-        "  reboot                            reboot the device\n");
+        "                                     destroy it; those recordings become unreadable\n"
+        "  key show [--out <file>]            print the key, or write it to a 0600 file\n"
+        "  key set --in <file> | - | <64-hex> install a key you already hold; prefer --in\n"
+        "\n"
+        "Full reference, including what each flag does: sdk/linux/README.md\n");
 }
 
 // True when the device gates this link and we failed to authenticate: the point
@@ -491,8 +487,9 @@ void print_info(const DeviceInformation& i, DEVICE_STATE state) {
     std::printf("ble link         : %s\n",
                 w.ble_connected ? "a central is connected" : "none reported");
     if (w.wifi_connected)
-        std::printf("wifi             : connected \"%s\" (%s, rssi %d)\n",
-                    w.wifi_ssid.c_str(), w.wifi_ip_address.c_str(), w.wifi_rssi);
+        std::printf("wifi             : connected \"%s\" (%s, rssi %d)%s\n",
+                    w.wifi_ssid.c_str(), w.wifi_ip_address.c_str(), w.wifi_rssi,
+                    wifi_health_suffix(w.wifi_health).c_str());
     else if (w.wifi_state == "unknown")
         std::printf("wifi             : unknown (snapshot could not be refreshed)\n");
     else
@@ -515,6 +512,13 @@ void print_info(const DeviceInformation& i, DEVICE_STATE state) {
                 : i.session_unlocked ? "LOCKED, open for this session "
                                        "(re-locks when power is lost)"
                                      : "LOCKED (password required)");
+    if (i.recordings_volume_attached)
+        std::printf("recordings drive : attached (%u recording%s)\n",
+                    i.recordings_volume_files,
+                    i.recordings_volume_files == 1 ? "" : "s");
+    else
+        std::printf("recordings drive : not attached%s\n",
+                    i.usb_locked && !i.session_unlocked ? " (USB is locked)" : "");
     std::printf("encryption       : %s\n",
                 i.encryption_enabled ? "ON (new recordings encrypted)" : "off");
     // The key_id, never the key: it is how an operator matches a device against
@@ -579,7 +583,8 @@ void print_recording(const RecordingStatus& r, bool show_target = true) {
     switch (r.stopped_reason) {
         case STOP_REASON::DISK_FULL:   why = " (disk full)"; break;
         case STOP_REASON::WRITE_ERROR: why = " (write error)"; break;
-        case STOP_REASON::INTERRUPTED: why = " (recovered after power loss)"; break;
+        case STOP_REASON::INTERRUPTED: why = " (interrupted; recovered at next boot)"; break;
+        case STOP_REASON::DEVICE:      why = " (stopped by the device)"; break;
         default: break;
     }
     // r.partial: an unrepaired torso served as-is (decrypts with a truncated-tail
@@ -726,10 +731,8 @@ int main(int argc, char** argv) {
             "ef-cli: control password not accepted; only info, state, storage"
             " and factory-reset will answer\n");
     if (cmd == "info") {
-        // --json exists so scripts stop deciding security-relevant questions by grepping
-        // the prose above, which reworded twice during this feature and silently inverted
-        // a CI harness's conclusion both times. Only the machine-checkable state, and
-        // these names are a contract: do not rename them to match a print.
+        // Scripts read this, not the prose above. These field names are a contract:
+        // do not rename them to match a print.
         if (std::find(args.begin(), args.end(), "--json") != args.end()) {
             const DeviceInformation& i = dev.get_device_information();
             std::printf("{\"serial\":\"%s\",\"model\":\"%s\","
@@ -738,7 +741,9 @@ int main(int argc, char** argv) {
                         "\"usb_locked\":%s,\"session_unlocked\":%s,\"admin_gate\":%s,"
                         "\"admin_provisioned\":%s,\"key_unprotected\":%s,"
                         "\"encryption_enabled\":%s,\"encryption_key_present\":%s,"
-                        "\"encryption_key_id\":\"%s\"}\n",
+                        "\"encryption_key_id\":\"%s\","
+                        "\"recordings_volume_attached\":%s,"
+                        "\"recordings_volume_files\":%u}\n",
                         i.serial.c_str(), i.model_name.c_str(),
                         i.firmware_version, i.firmware_version_str.c_str(),
                         to_string(dev.get_state()),
@@ -749,7 +754,9 @@ int main(int argc, char** argv) {
                         i.key_unprotected ? "true" : "false",
                         i.encryption_enabled ? "true" : "false",
                         i.encryption_key_present ? "true" : "false",
-                        i.encryption_key_id.c_str());
+                        i.encryption_key_id.c_str(),
+                        i.recordings_volume_attached ? "true" : "false",
+                        i.recordings_volume_files);
             return 0;
         }
         print_info(dev.get_device_information(), dev.get_state());
@@ -1111,15 +1118,48 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "upload: URL must be an http(s):// address\n");
             return 2;
         }
-        ec = dev.upload_recording(args[1], args[2]);
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "upload");
-        std::printf("upload started: '%s'\n", args[1].c_str());
+        bool resumable = false;
+        for (size_t i = 3; i < args.size(); i++) {
+            if (args[i] == "--resumable") { resumable = true; continue; }
+            std::fprintf(stderr, "upload: unknown option '%s'\n", args[i].c_str());
+            return 2;
+        }
+        ec = dev.upload_recording(args[1], args[2], resumable);
+        // The device names the reason -- "upload already in progress for X" is the
+        // common one -- and without the message a duplicate request shows only a
+        // bare DEVICE_BUSY.
+        if (ec != ERROR_CODE::SUCCESS)
+            return fail(ec, "upload", dev.last_error_message());
+        std::printf("upload started: '%s'%s\n", args[1].c_str(),
+                    resumable ? " (resumable)" : "");
+        return 0;
+    }
+    if (cmd == "forget-ble-bonds") {
+        // Say why, rather than letting the SDK's INVALID_FUNCTION_CALL surface as a
+        // bare code. The device refuses this over BLE too, but the SDK never gets
+        // that far, so this is the only place the reason can reach the user.
+        if (init.input_type != INPUT_TYPE::USB) {
+            std::fprintf(stderr,
+                "forget-ble-bonds needs USB: it drops the bond of every paired peer,\n"
+                "  including the BLE link it would have to answer on.\n"
+                "  Connect over USB and run it there.\n");
+            return 1;
+        }
+        ec = dev.forget_ble_bonds();
+        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "forget-ble-bonds");
+        std::puts("BLE bonds cleared on the device.\n"
+                  "  Each phone must also forget this device before it will pair again\n"
+                  "  (iOS: Settings > Bluetooth > the device > Forget This Device).");
         return 0;
     }
     if (cmd == "stop-upload" && args.size() > 1) {
         ec = dev.stop_upload(args[1]);
-        if (ec != ERROR_CODE::SUCCESS) return fail(ec, "stop-upload");
-        std::printf("upload stopped: '%s'\n", args[1].c_str());
+        if (ec != ERROR_CODE::SUCCESS)
+            return fail(ec, "stop-upload", dev.last_error_message());
+        std::printf("upload stopped: '%s'\n"
+                    "  Any transfer in flight was aborted and the URL detached.\n"
+                    "  Re-attach the same resumable URI to continue from what the\n"
+                    "  server already holds.\n", args[1].c_str());
         return 0;
     }
     if (cmd == "check-update") {
@@ -1324,7 +1364,11 @@ int main(int argc, char** argv) {
             } else if (w.wifi_state == "connected" || w.wifi_connected) {
                 // Append only the detail the device reported; older firmware
                 // leaves security/freq/link_speed/rssi at ""/0, which drop out.
+                // internet is a bool and cannot drop out that way, so it is shown
+                // only when true: on older firmware it is always false, and printing
+                // "no internet" there would report a fault that was never measured.
                 std::string x;
+                if (w.internet_reachable) x += ", internet";
                 if (!w.wifi_security.empty()) x += ", " + w.wifi_security;
                 if (w.wifi_freq_mhz > 0)
                     x += w.wifi_freq_mhz < 3000 ? ", 2.4 GHz" : ", 5 GHz";
@@ -1334,6 +1378,10 @@ int main(int argc, char** argv) {
                     x += ", signal " + std::to_string(w.wifi_rssi) + " dBm";
                 std::printf("connected to \"%s\" (%s%s)\n",
                             w.wifi_ssid.c_str(), w.wifi_ip_address.c_str(), x.c_str());
+                // "connected" is association alone; say so plainly when the link
+                // cannot actually carry traffic.
+                const char *why = wifi_health_reason(w.wifi_health);
+                if (why) std::printf("  NOT USABLE: %s\n", why);
             } else if (w.wifi_state == "unknown") {
                 // The snapshot could not be refreshed, so the link is unknowable.
                 // Printing "not connected" here would assert something no round
@@ -1409,8 +1457,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "set-password" && args.size() > 1) {
-        // USB: set-password <new> (old not required, physical access resets).
-        // BLE: set-password <old> <new>.
+        // USB: set-password <new>.  BLE and locked USB: set-password <old> <new>.
         std::string old_pw = args.size() > 2 ? args[1] : "";
         std::string new_pw = args.size() > 2 ? args[2] : args[1];
         // The administrator rescue for a forgotten worker password: an admin grant
@@ -1435,7 +1482,7 @@ int main(int argc, char** argv) {
     // CLI entirely.
     // Changing an existing one demands the old password on both transports alike: there
     // is no physical-access shortcut here, deliberately.
-    // ⚠ Exact counts, and never args.back(): an unquoted passphrase arrives as several
+    // Exact counts, and never args.back(): an unquoted passphrase arrives as several
     // arguments, and taking the last one silently provisions a fragment of what the
     // operator typed. They cannot reproduce it, and the documented recovery is a factory
     // reset, which destroys the key. Anything longer falls through to the usage text.
@@ -1598,8 +1645,7 @@ int main(int argc, char** argv) {
         return rc;
     }
     if (cmd == "key" && args.size() > 1 && args[1] == "set") {
-        // --in and `-` mirror `key show --out`. A positional key is visible in ps and
-        // lands in shell history.
+        // --in and `-` mirror `key show --out`.
         std::string hex, in_path;
         for (size_t a = 2; a + 1 < args.size(); a++)
             if (args[a] == "--in") in_path = args[a + 1];
@@ -1634,8 +1680,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "factory-reset") {
-        // Ungated on the device by design (the escape when the password is lost),
-        // so the CLI is the only place a typo can be caught. Confirm on a TTY;
+        // Destroys the encryption key and every credential, so confirm on a TTY.
         // --yes keeps it scriptable.
         bool assume_yes = std::find(args.begin(), args.end(), "--yes") != args.end();
         if (!assume_yes) {
@@ -1692,18 +1737,51 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "location set: need <lat> <lon> [alt]\n");
                 return 2;
             }
-            double lat = std::strtod(args[2].c_str(), nullptr);
-            double lon = std::strtod(args[3].c_str(), nullptr);
-            double alt = args.size() > 4 ? std::strtod(args[4].c_str(), nullptr) : 0.0;
+            if (args.size() > 5) {
+                std::fprintf(stderr, "location set: takes <lat> <lon> [alt]\n");
+                return 2;
+            }
+            // Parsed strictly, like `record start --location`: a bare strtod turns
+            // a typo into 0,0 and stores Null Island as a real fix.
+            Location in;
+            std::string joined = args[2] + "," + args[3] +
+                                 (args.size() > 4 ? "," + args[4] : "");
+            if (!parse_location(joined, in)) {
+                std::fprintf(stderr, "location set: <lat> <lon> [alt] must be numbers\n");
+                return 2;
+            }
+            double lat = in.latitude, lon = in.longitude, alt = in.altitude;
             ec = dev.set_location(lat, lon, alt);
             if (ec != ERROR_CODE::SUCCESS) return fail(ec, "location set");
             std::printf("location set: %.6f, %.6f  (alt %.1f m), persisted\n",
                         lat, lon, alt);
             return 0;
         }
+        if (args.size() > 1 && args[1] == "clear") {
+            if (args.size() > 2) {
+                std::fprintf(stderr, "location clear: takes no arguments\n");
+                return 2;
+            }
+            ec = dev.clear_location();
+            if (ec != ERROR_CODE::SUCCESS) return fail(ec, "location clear");
+            std::printf("location cleared; recordings will carry no location\n");
+            return 0;
+        }
+        // Reject an unknown subcommand rather than falling through to the read: a
+        // typo returning 0 reads as success to whatever called it.
+        if (args.size() > 1) {
+            std::fprintf(stderr, "location: unknown subcommand '%s'"
+                                 " (expected 'set' or 'clear')\n", args[1].c_str());
+            return 2;
+        }
         Location loc;
         ec = dev.get_location(loc);
         if (ec != ERROR_CODE::SUCCESS) return fail(ec, "location");
+        if (!loc.is_set) {
+            std::printf("location         : not set "
+                        "(recordings carry no location)\n");
+            return 0;
+        }
         std::printf("location         : %.6f, %.6f  (alt %.1f m)\n",
                     loc.latitude, loc.longitude, loc.altitude);
         return 0;

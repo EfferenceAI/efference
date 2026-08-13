@@ -5,7 +5,7 @@
 // it, write it to the inactive A/B slot, and reboot. Control can stay on USB, or
 // pass a BLE MAC to drive the whole update untethered over Bluetooth.
 //
-//   ./wireless_06_ota_update <url> [ble_mac]
+//   ./ota_update <url> [ble_mac]
 
 #include <iostream>
 #include <string>

@@ -2,7 +2,7 @@
 //
 // The smallest possible SDK program: open over USB, read one field.
 //
-//   ./wired_01_serial_number
+//   ./serial_number
 
 #include <iostream>
 

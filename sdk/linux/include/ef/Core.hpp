@@ -47,13 +47,20 @@ struct Resolution {
     int height = 0;
 };
 
-// Device geographic location, written into each recording's location metadata.
-// covariance_diag fills the diagonal of the 3x3 position covariance (0 = unknown).
+// Device geographic location, published as each recording's foxglove.LocationFix
+// on /camera/location. covariance_diag fills the diagonal of the 3x3 position
+// covariance in m^2 (0 = accuracy unknown).
 struct Location {
     double latitude        = 0;
     double longitude       = 0;
     double altitude        = 0;
     double covariance_diag = 0;
+    // Reported by Device::get_location. False means the device holds no location,
+    // the coordinates above are meaningless, and its recordings carry none.
+    bool   is_set          = false;
+    // Reported by Device::get_location. False on firmware that always carried a
+    // location and cannot drop one; clear_location() then returns UNSUPPORTED.
+    bool   clear_supported = false;
 };
 
 struct Matrix4x4 {
@@ -143,6 +150,20 @@ struct ImuCalibrationParameters {
     int64_t time_offset_ns = 0;             // IMU->camera temporal offset (0 = HW-sync only)
 };
 
+// Whether the WiFi link actually works. Values increase with usability, so
+// Usable is `h == UNSPECIFIED || h >= WIFI_HEALTH::UNVERIFIED`. UNSPECIFIED is 0
+// and means the firmware predates this field, so it must not read as a failure.
+// UNSPECIFIED = firmware predating the field, which asserts nothing.
+enum class WIFI_HEALTH {
+    UNSPECIFIED = 0,
+    DISCONNECTED,   // not associated
+    NO_ADDRESS,     // associated, but holds no address
+    NO_DNS,         // addressed, but no resolver is configured
+    UNREACHABLE,    // the last transfer got no answer
+    UNVERIFIED,     // usable so far as the device can tell; nothing has proven it
+    OK              // a real transfer got an answer
+};
+
 struct WirelessConfiguration {
     std::string wifi_mac_address;
     std::string bt_mac_address;
@@ -154,6 +175,11 @@ struct WirelessConfiguration {
     std::string wifi_ssid;
     std::string wifi_ip_address;
     int         wifi_rssi = 0;
+    // The last upload or time sync got an answer from its destination, so the whole
+    // path works and not just the association. False also means "not proven yet":
+    // nothing has been sent since boot; wifi_health separates those two. It changes only when a transfer actually
+    // succeeds or fails, so it can lag a link that drops while nothing is being
+    // sent. Firmware predating this always reports false.
     bool        internet_reachable = false;
     // Live association detail (best-effort; empty/0 = not reported by this firmware).
     std::string wifi_state;           // "connected"/"connecting"/"disconnected"/"auth_failed"
@@ -162,6 +188,8 @@ struct WirelessConfiguration {
     int         wifi_link_speed = 0;  // negotiated PHY link rate, Mbps
     int         wifi_freq_mhz = 0;    // channel frequency, MHz (2.4 vs 5 GHz derivable)
     std::string wifi_security;        // "WPA2" / "WPA3" / "WPA2/WPA3" / "Open"
+    // Branch on this rather than wifi_connected, which reports association alone.
+    WIFI_HEALTH wifi_health = WIFI_HEALTH::UNSPECIFIED;
     std::vector<std::string> saved_networks;
 };
 
@@ -222,8 +250,8 @@ struct DeviceInformation {
     SensorsConfiguration sensors_configuration;
     WirelessConfiguration wireless;
     Capabilities         capabilities;   // enabled capture modes + codecs (device CAPS)
-    // Access + at-rest state. Reported on the ungated GetDeviceInformation, so a
-    // host can read these before authenticating and know what it is dealing with.
+    // Access + at-rest state. Always readable, so a host knows what it is
+    // dealing with before it does anything else.
     bool usb_locked         = false;  // USB gates like BLE; authenticate first
     // Read WITH usb_locked, not instead: the policy is still locked, but gated
     // verbs answer without a password until re-locked or power is lost.
@@ -243,9 +271,18 @@ struct DeviceInformation {
     // verbs are open to the control password.
     bool admin_provisioned = false;
     // A key is installed AND no administrator password is set, so it is guarded by the
-    // control password alone. ⚠ Do not report such a device as protected. Derived, so
+    // control password alone. Do not report such a device as protected. Derived, so
     // setting an administrator password later protects the existing key too.
     bool key_unprotected = false;
+    // The recordings drive is exposed to the host right now. False on older firmware,
+    // and on a locked device; neither is a fault. Check it before reporting a drive
+    // as missing. Both fields move without the SDK doing anything -- a host eject, a
+    // recording completing -- so call refresh_device_information() before reading
+    // them, rather than trusting the snapshot taken at open().
+    bool     recordings_volume_attached = false;
+    // Files published on the drive: 0 when detached, and a recording still in
+    // progress is not among them, so this need not equal list_recordings().size().
+    uint32_t recordings_volume_files    = 0;
 };
 
 
@@ -313,6 +350,20 @@ struct SensorsData {
     MOTION_STATE motion_state = MOTION_STATE::STATIC;   // ZUPT / free-fall
 };
 
+// Video accounting for the open stream, filled by get_stream_stats().
+struct StreamStats {
+    uint64_t device_frames    = 0;   // frames the device put on the stream
+    uint64_t received_whole   = 0;   // arrived with every fragment
+    uint64_t received_partial = 0;   // arrived with fragments missing
+    uint64_t lost_in_transit  = 0;   // no usable fragment arrived
+    uint64_t dropped_by_host  = 0;   // superseded before grab() took it
+    uint64_t withheld_resync  = 0;   // arrived, held back until the next keyframe
+    uint64_t packets_lost     = 0;   // gaps in the video packet sequence
+    float    loss_percent     = 0.f; // 100 * lost() / device_frames
+
+    // Frames the device sent that the host could not use whole.
+    uint64_t lost() const { return received_partial + lost_in_transit; }
+};
 
 struct HealthCheck {
     std::string name;
@@ -338,6 +389,7 @@ struct RecordingStatus {
     bool             recording = false;
     uint64_t         bytes       = 0;
     uint64_t         frames      = 0;
+    // Grows while the recording runs, for both device-local and host-file targets.
     uint64_t         duration_ms = 0;
     // Stored segments are AES-256-GCM encrypted. Reflects what is actually on
     // disk, so it is right even for sessions predating the current setting.
@@ -356,8 +408,12 @@ struct RecordingStatus {
 
     // Upload of this session (upload_recording()).
     UPLOAD_STATE upload             = UPLOAD_STATE::OFF;
+    // Both move while the transfer runs; total is known before the first byte, so
+    // a progress bar has a denominator immediately.
     uint64_t     upload_bytes_sent  = 0;
     uint64_t     upload_bytes_total = 0;
+    // Why the last upload failed. UPLOAD_URL_REJECTED and STORAGE_FULL are terminal
+    // for that URL; WIFI_NOT_CONNECTED and DEVICE_BUSY are worth retrying.
     ERROR_CODE   last_error         = ERROR_CODE::SUCCESS;
 };
 

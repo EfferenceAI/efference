@@ -6,7 +6,7 @@
 // http://<host>:<port>/<path> receiver on your network. Nothing streams to this
 // host; the device does the upload itself and we just poll its progress.
 //
-//   ./wireless_05_record_and_upload <ble_mac> <url> [seconds]
+//   ./record_and_upload <ble_mac> <url> [seconds]
 
 #include <chrono>
 #include <iostream>

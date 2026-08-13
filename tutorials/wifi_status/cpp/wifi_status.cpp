@@ -2,7 +2,7 @@
 //
 // Opens over USB and reads the wireless snapshot cached at open().
 //
-//   ./wired_04_wifi_status
+//   ./wifi_status
 
 #include <iostream>
 
@@ -27,6 +27,11 @@ int main() {
         std::cout << "The snapshot could not be refreshed, so the link is unknown.\n";
     else if (!wifi.wifi_connected)
         std::cout << "The M1 is not connected to any WiFi network.\n";
+    else if (wifi.wifi_health != WIFI_HEALTH::UNSPECIFIED &&
+             wifi.wifi_health <  WIFI_HEALTH::UNVERIFIED)
+        // Associated but not usable: no address, no resolver, or nothing reachable.
+        std::cout << "The M1 is associated with \"" << wifi.wifi_ssid
+                  << "\" but the link cannot carry traffic yet.\n";
     else
         std::cout << "The M1 is on \"" << wifi.wifi_ssid << "\" (ip "
                   << wifi.wifi_ip_address << ", rssi " << wifi.wifi_rssi

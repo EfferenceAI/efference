@@ -43,6 +43,7 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::INSUFFICIENT_PERMISSIONS:       return "INSUFFICIENT_PERMISSIONS";
         case ERROR_CODE::UNSUPPORTED:                    return "UNSUPPORTED";
         case ERROR_CODE::DEVICE_BUSY:                    return "DEVICE_BUSY";
+        case ERROR_CODE::COMMAND_NOT_FOUND:              return "COMMAND_NOT_FOUND";
         case ERROR_CODE::INVALID_RESOLUTION:             return "INVALID_RESOLUTION";
         case ERROR_CODE::INVALID_FPS:                    return "INVALID_FPS";
         case ERROR_CODE::UNSUPPORTED_COMPRESSION:        return "UNSUPPORTED_COMPRESSION";
@@ -63,6 +64,7 @@ const char* to_string(ERROR_CODE e) {
         case ERROR_CODE::RECORDING_ALREADY_EXISTS:       return "RECORDING_ALREADY_EXISTS";
         case ERROR_CODE::USB_REQUIRED:                   return "USB_REQUIRED";
         case ERROR_CODE::DESTINATION_NOT_WRITABLE:       return "DESTINATION_NOT_WRITABLE";
+        case ERROR_CODE::UPLOAD_URL_REJECTED:            return "UPLOAD_URL_REJECTED";
         case ERROR_CODE::UNKNOWN_FAILURE:                return "UNKNOWN_FAILURE";
     }
     return "UNKNOWN_FAILURE";
@@ -209,6 +211,7 @@ const char* to_string(STOP_REASON r) {
         case STOP_REASON::DISK_FULL:   return "DISK_FULL";
         case STOP_REASON::WRITE_ERROR: return "WRITE_ERROR";
         case STOP_REASON::INTERRUPTED: return "INTERRUPTED";
+        case STOP_REASON::DEVICE:      return "DEVICE";
         default:                       return "UNSPECIFIED";
     }
 }

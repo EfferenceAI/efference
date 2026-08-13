@@ -5,12 +5,13 @@ here so `ef-decrypt` can read a recording without a firmware checkout. Do not
 edit them: the device writes what this code reads, and an edit on one side only
 changes what the two agree on.
 
-| File | Upstream path (firmware repo) |
+| File | Provides |
 |---|---|
-| `enc_sink.c` / `enc_sink.h` | `project/app/efference-capture/rec/` |
-| `efr_keyid.c` / `efr_keyid.h` | `project/app/libefr/{src,include}/` |
+| `enc_sink.c` / `enc_sink.h` | the encrypted-container reader |
+| `efr_keyid.c` / `efr_keyid.h` | key-ID derivation |
 
-Copied from firmware v00.09.16 lock/encryption fix pass (adds `enc_dec_info.tag_failed`, distinguishing chunk-auth failure from truncation).
+`enc_dec_info.tag_failed` distinguishes a chunk-authentication failure from a
+truncated file.
 
 ```
 524a6033ebf3fbfee527ecb82685d8b714f5c364d14e943aafafc69ba16324f1  efr_keyid.c
@@ -19,8 +20,8 @@ Copied from firmware v00.09.16 lock/encryption fix pass (adds `enc_dec_info.tag_
 c72fd1907cbb3bdc0a90bfd6d44a45ace6803298da9b6766babf17b03ac8895f  enc_sink.h
 ```
 
-Nothing checks these hashes automatically. Refresh the copies, and this table,
-whenever the format changes upstream. A format that has genuinely moved on
+Refresh the copies, and this table, whenever the format changes upstream. A
+format that has genuinely moved on
 announces itself rather than misreading: the header carries a version at 0x04 and
 an algorithm id at 0x0C, and `enc_decrypt_fd()` returns `ENOTSUP` for an id it
 does not implement. The format itself is specified in the header comment of

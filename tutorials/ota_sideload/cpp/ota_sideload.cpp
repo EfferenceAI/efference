@@ -6,7 +6,7 @@
 // an interrupted or bad update never bricks the device: it falls back to the
 // slot that was already running.
 //
-//   ./wired_06_ota_sideload <path-to-update.eff>
+//   ./ota_sideload <path-to-update.eff>
 
 #include <fstream>
 #include <iostream>

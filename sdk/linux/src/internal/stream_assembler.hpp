@@ -80,6 +80,10 @@ public:
     // samples a later drain_imu() owes the recorder. False if none yet.
     bool peek_latest_accel(float out[3]);
 
+    // Frame accounting since this assembler was constructed, i.e. since the
+    // stream opened. Safe from any thread.
+    void get_stats(StreamStats* out) const;
+
     // Video codec for the drop-until-IDR keyframe gate (0 = RAW/MJPEG never gated,
     // 1 = H264, 2 = H265). Set once by the Device before the stream flows.
     void set_video_codec(int codec) {
@@ -119,15 +123,58 @@ protected:
     int                          ready_ = -1;          // complete frame awaiting grab
     int                          consuming_ = -1;      // slot held by grab()/retrieve
     bool                         ended_ = false;       // transport gone / fatal
-    uint64_t                     frames_dropped_ = 0;  // superseded before grab
 
     // reassembly progress for the current in-flight frame
     bool     in_frame_ = false;
-    uint32_t cur_frame_id_ = 0, cur_size_ = 0, cur_accum_ = 0;
+    uint32_t cur_frame_id_ = 0, cur_size_ = 0;
+
+    // Which BYTES of the current frame have arrived, as merged half-open ranges.
+    // A running total is not enough: duplicate one fragment and lose another of
+    // the same size and the total still reaches cur_size_, so a frame with a hole
+    // reads as complete and the hole reaches the decoder. In-order delivery keeps
+    // this at exactly one range, so the common path is a compare and an add.
+    // Reordering past kCovRanges sets cov_full_ and the frame is called incomplete,
+    // which is the safe direction.
+    static constexpr int kCovRanges = 8;
+    struct ByteRange { uint32_t lo, hi; };
+    ByteRange cov_[kCovRanges];
+    int       ncov_     = 0;
+    bool      cov_full_ = false;
+
+    void cov_reset() { ncov_ = 0; cov_full_ = false; }
+    void cov_add(uint32_t lo, uint32_t hi);
+    bool cov_covers(uint32_t size) const {
+        return !cov_full_ && ncov_ == 1 && cov_[0].lo == 0 && cov_[0].hi == size;
+    }
 
     // video packet-seq tracking for loss detection (transport-thread only, no lock)
     uint32_t last_vseq_ = 0;
     bool     have_vseq_ = false;
+
+    // ---- frame accounting (transport thread is the sole writer) ----
+    // The device numbers every frame it puts on the stream, whether or not the
+    // frame reaches the wire, so a gap in the ids is one the host never saw. It
+    // numbers from zero again when it restarts a session.
+    //
+    // A frame is counted once, when it ends, into exactly one bucket. The buckets
+    // are independent rather than derived from each other, so the frame currently
+    // being reassembled sits in none of them instead of reading as loss until it
+    // lands.
+    //
+    // Atomic because get_stats() reads them from the consumer thread; relaxed is
+    // enough with a single writer and no ordering needed between them.
+    uint32_t              last_fid_   = 0;      // transport-thread only
+    bool                  have_fid_   = false;  // transport-thread only
+    bool                  finalized_  = false;  // current id already counted
+    int                   behind_run_ = 0;      // consecutive ids behind last_fid_
+    std::atomic<uint64_t> frames_whole_{0};     // ended with every fragment
+    std::atomic<uint64_t> frames_broken_{0};    // ended with fragments missing
+    std::atomic<uint64_t> frames_gone_{0};      // ids skipped entirely
+    std::atomic<uint64_t> packets_lost_{0};
+    // Kept apart because they mean opposite things to a caller: a supersede is a
+    // consumer that did not keep up, a gated frame is withheld while resyncing.
+    std::atomic<uint64_t> frames_superseded_{0};
+    std::atomic<uint64_t> frames_gated_{0};
 
     // Drop-until-IDR resync gate (encoded streams only). Set on wire loss or consumer
     // supersede; while set, on_packet withholds complete frames until an IDR/IRAP

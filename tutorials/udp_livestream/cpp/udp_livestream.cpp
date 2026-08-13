@@ -6,7 +6,7 @@
 // cannot infer it over BLE). The M1 must already be on WiFi (see example 03),
 // and this host must be on the same network.
 //
-//   ./wireless_04_udp_livestream <ble_mac> <this_host_ip> [udp_port] [num_frames]
+//   ./udp_livestream <ble_mac> <this_host_ip> [udp_port] [num_frames]
 
 #include <iostream>
 #include <string>

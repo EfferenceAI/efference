@@ -4,7 +4,7 @@
 // Each grab() latches a frame; retrieve_image() / retrieve_imu()
 // hand back the pixels and the IMU samples captured since the previous grab().
 //
-//   ./wired_03_data_stream [num_frames]
+//   ./data_stream [num_frames]
 
 #include <iostream>
 #include <string>

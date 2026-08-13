@@ -4,7 +4,7 @@
 // scans for M1s advertising over Bluetooth LE. No open() required, this is how
 // you find a device's BLE MAC to hand to the other wireless examples.
 //
-//   ./wireless_02_discover_devices [ble_scan_ms]
+//   ./discover_devices [ble_scan_ms]
 
 #include <iostream>
 #include <string>

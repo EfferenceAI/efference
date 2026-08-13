@@ -88,125 +88,250 @@ line to your `~/.bashrc`.
 ```text
 ef-cli [--ble <MAC>] [--device <id>] [--password <pw>] [--admin-password <pw>]
        [--udp <host[:port]>] [--verbose] <command> [args]
+```
 
-global flags
+**Global flags**
+
+```text
   --ble <MAC>            connect over Bluetooth LE instead of USB
   --device <id>          pick one of several USB devices
-  --password <pw>        control password (factory default 123456); always needed on BLE,
-                         and on USB once locked
-  --admin-password <pw>  administrator password, if one is set on the device. Sent only
-                         for the verbs that can demand it -- `key show`, `key set`,
-                         `encryption create|delete`, `encryption on|off` -- never on
-                         others. `set-admin-password` and `clear-admin-password` take
-                         the current password positionally and ignore this flag.
-                         Unset by default; there is no factory default (below)
-  --udp <host[:port]>    with --ble: device streams video+IMU to this host over WiFi/UDP (default port 5005)
-  --verbose              print the control-plane traffic; over BLE, also print
-                         phase-by-phase connect timing (`[ble] +NNNN ms <phase>`)
-
-commands
-  list [--scan-ble]              discover devices (USB; add BLE with --scan-ble)
-  info [--json]                  device information snapshot (serial, fw, camera, IMU, WiFi, MACs);
-                                 --json emits only the machine-checkable state, for scripts
-  config                         list the ENABLED capture modes + codecs (+ current config)
-  config set <W> <H> <fps> <codec>  set capture config (idle only; codec: raw|h264|h264hq|h265|h265hq)
-  calibration [--get]            show camera + IMU calibration
-  calibration --camera --set <fx> <fy> <cx> <cy> <xi> <alpha> <W> <H> [--rectify on|off] [--fov-scale <s>]
-                                 set camera intrinsics (idle only; published as recording
-                                 metadata; --rectify on|off toggles on-device rectification,
-                                 default off; when on, recordings ship rectified (rectilinear) frames,
-                                 else raw fisheye (double_sphere); --fov-scale sets the rectified
-                                 output FOV, default 1.0, <1 wider / >1 zoom)
-  calibration --camera [--rectify on|off] [--fov-scale <s>]
-                                 toggle rectify without re-typing intrinsics: reads the
-                                 current calibration, changes only the named flag(s), resends
-                                 (idle only; e.g. `calibration --camera --rectify on`)
-  calibration [--camera|--imu] --reset   reset calibration to factory default
-  calibration --imu --mode <raw|calibrated|both>   how recordings carry IMU calibration:
-                                 raw (default) = params as metadata; calibrated = pre-applied
-                                 on device; both = raw plus a pre-applied *_calibrated stream
-  storage                        free/total space on the recording store (/userdata)
-  state                          current DEVICE_STATE
-  health [--deep]                run the on-device health sweep (add --deep for the stress tier)
-  record start [name] [--location LAT,LON[,ALT]]
-                                 start a device-local (eMMC) recording (survives host disconnect;
-                                 --location overrides the LocationFix for this recording only)
-  record stop                    stop the current device recording
-  record status [name]           session status (+ storage + upload); says why a completed
-                                 session ended, e.g. "complete (disk full)"
-  record list                    list device recordings, oldest first (each marked
-                                 [encrypted]/[unencrypted])
-  record delete <name>           delete a device recording (returns immediately;
-                                 large files are reclaimed in the background)
-  download <name> [dest]         pull a recording over USB/BLE; dest is a file path or a
-                                 directory to write into (default <name>.mcap)
-  upload <name> <url>            device uploads a recording to a pre-signed URL (over WiFi)
-  stop-upload <name>             cancel a running upload
-  check-update                   ask the update service what this device should run
-  update                         update to whatever the service offers
-  update --url <url>             update from an explicit URL, skipping the service
-  update --file <update.eff>     update from a local bundle, pushed over USB
-  abort-update                   cancel an update in progress
-  wifi add <ssid> [psk [country]] [--band auto|2.4|5]
-                                   save + connect a WiFi network (quote an SSID with spaces;
-                                   omit <psk> for a hidden prompt). country is an ISO code;
-                                   leave it off and the device reads the regulatory domain
-                                   from nearby beacons, which decides whether channels 12-13
-                                   and 5 GHz are usable at all.
-  wifi select <ssid> [--band auto|2.4|5]
-                                   force a specific saved network (overrides the auto-best
-                                   pick). A dual-band AP publishes one SSID per radio, so
-                                   --band is how you choose between them; auto clears the
-                                   pin. A band the AP does not offer is refused without
-                                   disturbing the current link.
-  wifi list                        list saved networks (marks the connected one)
-  wifi remove <ssid>               forget a saved network (disconnects it if it's the current one)
-  wifi scan                        access points in range, strongest first (top 10);
-                                   a dual-band AP appears once per band
-  wifi status                      current association (connected / connecting / disconnected /
-                                   auth_failed, the last two both meaning no link right now)
-  set-password <new>             rekey the control password (over UNLOCKED USB, no old
-                                 password; or on a locked device with --admin-password,
-                                 the administrator rescue for a forgotten one)
-  set-password <old> <new>       rekey the control password (over BLE, or locked USB)
-  set-admin-password <new>       set the administrator password (there is no factory
-                                 default; a device without one uses the control password;
-                                 minimum 8 characters)
-  set-admin-password <old> <new> change it; needs the current one
-  clear-admin-password <current> remove it; the encryption verbs return to the control
-                                 password [administrator password]
-  lock on|off [--session]        lock/unlock the USB control plane (needs the current password;
-                                 --session applies to this power session only, and re-locks
-                                 when power is lost)
-  encryption on|off              AES-256 encrypt new recordings (refused with no key)
-                                 [administrator password, when one is set]
-  encryption create              generate the device's key; SHOWN ONCE, save it
-                                 [administrator password, when one is set]
-  encryption delete              show the key and how to destroy it (destroys nothing)
-                                 [administrator password, when one is set]
-  encryption delete --confirm <key_id> [--yes]
-                                 destroy the key; recordings under it become unreadable
-                                 [administrator password, when one is set]
-  key show [--out <file>]        print the key, or write it to a new 0600 file
-                                 [administrator password, when one is set]
-  key set --in <file> | - | <64-hex>
-                                 install a key you already hold, instead of letting the
-                                 device generate one; refused while a key exists.
-                                 Prefer --in or - over a positional key
-                                 [administrator password, when one is set]
-  factory-reset [--yes]          restore defaults; DESTROYS the key and REMOVES the
-                                 administrator password. Unauthenticated use is USB-only
-  sync-time                      set the device clock from the host
-  time                           read the device wall clock
-  location                       read the device's current location (the persisted value, else the default)
-  location set <lat> <lon> [alt] persist the device location -> every recording's LocationFix
-  reboot                         reboot the device
+  --password <pw>        control password (factory default 123456)
+  --admin-password <pw>  administrator password, when the device has one
+  --udp <host[:port]>    with --ble, stream video and IMU to this host (default port 5005)
+  --verbose              print the control-plane traffic
 ```
+
+`--password` is always needed over BLE, and over USB once the device is locked.
+`--admin-password` is sent only for the verbs that can demand it, never on others;
+`set-admin-password` and `clear-admin-password` take the current password positionally
+and ignore the flag.
+
+**Discover and inspect**
+
+```text
+  list [--scan-ble]                    discover devices (add --scan-ble for BLE)
+  info [--json]                        device snapshot; --json emits machine-readable state
+  state                                current DEVICE_STATE
+  storage                              free and total space on the recording store
+  health [--deep]                      on-device health sweep; --deep adds the stress tier
+  time                                 read the device wall clock
+  sync-time                            set the device clock from the host
+  reboot                               reboot the device
+```
+
+**Capture configuration**
+
+```text
+  config                               list the enabled modes and codecs
+  config set <W> <H> <fps> <codec>     codec: raw|h264|h264hq|h265|h265hq
+  calibration [--get]                  show camera and IMU calibration
+  calibration --camera --set <fx> <fy> <cx> <cy> <xi> <alpha> <W> <H>
+  calibration --camera [--rectify on|off] [--fov-scale <s>]
+  calibration --imu --mode <raw|calibrated|both>
+  calibration [--camera|--imu] --reset reset to factory default
+  location                             read the device location
+  location set <lat> <lon> [alt]       store it, and stamp it into every recording
+  location clear                       drop it, so recordings carry no location
+```
+
+A device has no location until you set one, and it does not update as the device
+moves. Until then `location` reports `not set` and recordings carry no location.
+Setting one stamps it into every subsequent recording; `location clear` stops that
+again.
+
+All of the commands above are idle-only. Camera intrinsics are published as
+recording metadata.
+`--rectify on` ships rectilinear frames instead of raw fisheye, and `--fov-scale`
+sets the rectified field of view (default 1.0, below 1 is wider). The second
+`calibration --camera` form changes only the named flags and keeps the stored
+intrinsics, so there is no need to retype `--set`.
+
+For IMU, `raw` (the default) carries the calibration as metadata, `calibrated`
+applies it on the device, and `both` adds a pre-applied `*_calibrated` stream
+alongside the raw one.
+
+**Recordings**
+
+```text
+  record start [name] [--location LAT,LON[,ALT]]
+  record stop
+  record status [name]                 session status, storage and upload progress
+  record list                          device recordings, oldest first
+  record delete <name>                 returns at once; large files are reclaimed in the background
+  download <name> [dest]               pull a recording over USB or BLE
+```
+
+A device-local recording writes to eMMC and survives host disconnect. `record status`
+says why a completed session ended, for example `complete (disk full)`, and while a
+recording or upload runs its duration and byte counts advance each time you ask.
+`--location` sets the location for that recording only, whether or not one is
+stored. For `download`, `dest` is a file path or a directory to write into,
+defaulting to `<name>.mcap`.
+
+**The recordings drive** (device firmware >= v00.09.19). Connecting the device to a
+computer also presents the recordings as a removable drive named `EFFERENCE`, with
+each session as `<name>.mcap`. No driver or SDK is needed: copy them off with the
+file manager.
+Nothing is duplicated on the device to do this, so presenting the drive costs no
+storage.
+
+Things to know about it:
+
+- **Deleting a file on the drive deletes the recording on the device.** There is no
+  recycle bin, and moving a file to the Trash or Recycle Bin is not an undo: the
+  recording is removed from the device, and the copy the Trash appears to hold
+  disappears the next time the drive is attached. Eject the drive before you
+  unplug it, so a delete finishes. Copy anything you want to keep off the drive
+  first.
+- **You cannot rename files on the drive.** The names are produced from the session
+  names, and a rename does not stick. The recording itself is untouched. Copy a
+  file off first and rename the copy.
+- **A recording still in progress does not appear** until it completes. Recordings
+  that finish while the drive is connected appear a few seconds later.
+- **The drive follows the USB lock.** `lock on` removes it and `lock off` brings it
+  back with no need to unplug. `ef-cli info` reports it as `recordings drive`, and
+  `DeviceInformation::recordings_volume_attached` carries the same to an SDK caller,
+  and `recordings_volume_files` the number of recordings the drive publishes, which
+  `ef-cli info --json` emits under those names. Call `refresh_device_information()`
+  first: the drive moves on its own and the snapshot is taken at `open()`. Ejecting it
+  from the host also removes it, until the recordings change or you reconnect.
+  `recordings_volume_files` counts what the drive publishes, so it can differ from
+  `record list`: the drive omits a session still being written, and `record list`
+  shows at most 48 entries.
+
+The files on the drive are byte-for-byte the same as `download` produces. If at-rest
+encryption is on, they are ciphertext; see [Reading an encrypted
+recording](#reading-an-encrypted-recording).
+
+**Uploads**
+
+```text
+  upload <name> <url>                  device uploads to a pre-signed URL over WiFi
+  upload <name> <url> --resumable      <url> is a resumable-session URI
+  stop-upload <name>                   abort the transfer and detach the URL
+```
+
+Without `--resumable` the recording goes up as one PUT, and an interrupted transfer
+restarts from the first byte. With it, the file goes up in 32 MiB chunks and an
+interrupted transfer continues from the byte the server confirms holding. Mint the
+session URI yourself; the device never does.
+
+`stop-upload` succeeds whether or not a transfer was running. With a resumable URI the
+destination keeps what it already committed, so re-attaching the same URI continues
+rather than restarting.
+
+**WiFi**
+
+```text
+  wifi add <ssid> [psk [country]] [--band auto|2.4|5]
+  wifi select <ssid> [--band auto|2.4|5]
+  wifi remove <ssid>                   forget a network, disconnecting it if current
+  wifi list                            saved networks, marking the connected one
+  wifi scan                            access points in range, strongest first
+  wifi status                          current association
+```
+
+Quote an SSID containing spaces, and omit the PSK for a hidden prompt. `country` is an
+ISO code; leave it off and the device infers the regulatory domain from nearby beacons,
+which decides whether channels 12 and 13 and the 5 GHz band are usable at all.
+
+A dual-band AP publishes one SSID per radio, so `--band` chooses between them and `auto`
+clears the pin. A band the AP does not offer is refused without disturbing the current
+link. `wifi status` reports `connected`, `connecting`, `disconnected` or `auth_failed`,
+the last two both meaning there is no link right now, and shows `internet` when the last
+upload or time sync got an answer from its destination.
+
+**`connected` means associated, not usable.** A device can finish the WPA handshake and
+still hold no address, have no resolver, or reach nothing, and `connected` is true in all
+three cases. `wifi_health` is the field to branch on. It is layered, each level requiring
+every level below it, and it increases with usability. The test for "this link can carry
+traffic" is:
+
+```cpp
+wifi_health == WIFI_HEALTH::UNSPECIFIED || wifi_health >= WIFI_HEALTH::UNVERIFIED
+```
+
+`UNSPECIFIED` is `0`, so it sorts *below* every real verdict: a bare `>=` test would read
+every device on firmware older than this field as unusable. It means the firmware does not
+report the field, which asserts nothing either way, so treat it as usable.
+
+| `wifi_health` | meaning |
+|---|---|
+| `DISCONNECTED` | not associated |
+| `NO_ADDRESS` | associated, but holds no address |
+| `NO_DNS` | addressed, but no resolver is configured |
+| `UNREACHABLE` | the last transfer got no answer |
+| `UNVERIFIED` | every layer the device can check locally is good, but nothing has sent traffic to prove the path |
+| `OK` | a real transfer got an answer |
+
+`UNVERIFIED` and `OK` are both usable; they differ only in whether anything has proven it
+end to end. Both `ef-cli wifi status` and `ef-cli info` print a `NOT USABLE:` line naming
+the failing layer. Firmware predating the field reports `UNSPECIFIED`, which asserts
+nothing.
+
+`wifi scan` returns `DEVICE_BUSY` during a recording, livestream or update. The other
+WiFi verbs are accepted then, but `wifi add` and `wifi select` reassociate and can
+interrupt a transfer in progress.
+
+**Updates**
+
+```text
+  check-update                         ask the update service what this device should run
+  update                               update to whatever the service offers
+  update --url <url>                   update from an explicit URL, skipping the service
+  update --file <update.eff>           update from a local bundle, pushed over USB
+  abort-update                         cancel an update in progress
+```
+
+**Access control**
+
+```text
+  lock on|off [--session]              lock or unlock the USB control plane
+  set-password <new>                   rekey over unlocked USB
+  set-password <old> <new>             rekey over BLE, or on locked USB
+  set-admin-password <new>             set the administrator password
+  set-admin-password <old> <new>       change it
+  clear-admin-password <current>       remove it
+  forget-ble-bonds                     clear every BLE pairing (USB only)
+  factory-reset [--yes]                restore defaults
+```
+
+`lock --session` applies to this power session only and re-locks when power is lost.
+The administrator password has no factory default; a device without one uses the control
+password for the encryption verbs. It must be at least 8 characters, and longer is
+better. On an unlocked USB link `set-password <new>` needs no old password, and with
+`--admin-password` it is the rescue path for a forgotten control password.
+
+`forget-ble-bonds` clears the **device** side only. Each phone must also forget the device
+before it will pair again (on iOS, Settings > Bluetooth > the device > Forget This Device);
+until it does, its connection attempts fail. Passwords and every other setting are left
+alone.
+
+`factory-reset` destroys the encryption key and removes the administrator password. It also
+clears BLE bonds, saved WiFi networks, recordings and operator calibration. Over BLE it
+requires the password like any other verb.
+
+**At-rest encryption**
+
+```text
+  encryption on|off                    AES-256 encrypt new recordings
+  encryption create                    generate the device key
+  encryption delete                    show the key and how to destroy it
+  encryption delete --confirm <key_id> [--yes]
+  key show [--out <file>]              print the key, or write it to a new 0600 file
+  key set --in <file> | - | <64-hex>   install a key you already hold
+```
+
+Every verb here takes the administrator password when one is set. `encryption on` is
+refused with no key. `encryption create` shows the key once, so save it then. Plain
+`encryption delete` destroys nothing; the `--confirm` form does, and recordings written
+under that key become unreadable. `key set` is refused while a key exists, so delete the
+existing one first, and prefer `--in` or `-` over passing the key as an argument.
 
 ### `efference-viewer`: live viewer
 
 ```text
-efference-viewer [--codec raw|h264|h265|h264hq|h265hq] [--h264|--h265] [--ble MAC] [--password PW] [--udp HOST[:PORT]] [--flip on|off|auto] [--headless|--no-window]
+efference-viewer [--codec raw|h264|h265|h264hq|h265hq] [--h264|--h265] [--ble MAC] [--password PW] [--udp HOST[:PORT]] [--flip on|off|auto] [--headless|--no-window] [--stats]
 ```
 Opens an OpenCV window with the decoded video; a status bar above the video
 shows the live frame number and the latest **IMU values** (accel m/s², gyro
@@ -217,6 +342,16 @@ rad/s), and the same values are echoed to the console once per second. `--flip o
 
 `--h264` and `--h265` are shorthand for the matching `--codec`. Run
 `efference-viewer --help` for the current flag list.
+
+`--stats` adds frame accounting to the status bar: how many frames the device put on
+the stream against how many arrived whole. The same numbers are available to an SDK
+caller through `get_stream_stats(StreamStats&)`, which separates frames lost in
+transit from frames that arrived incomplete, frames the host superseded before
+`grab()` took them, and frames held back until the next keyframe. Counts reset when
+streaming starts, and the call returns `INVALID_FUNCTION_CALL` before the first
+`grab()`. Useful for telling a device-side problem from a host-side one: if
+`device_frames` keeps climbing while `received_whole` does not, the loss is on the
+wire or in the host, not in the camera.
 
 `--headless` (alias `--no-window`) skips the window and just holds the session,
 printing a once-per-second heartbeat. Pair it with `--udp <host>` to make the
@@ -230,10 +365,10 @@ applies its own).
 
 | Transport | Control | Video + IMU | How |
 |---|---|---|---|
-| **USB** | ✓ | ✓ live | default; `open()` over USB |
-| **Bluetooth LE** | ✓ (GATT, password-gated) | n/a (control only) | `--ble <MAC>` / `InitParameters::input_type = STREAM` |
-| **WiFi / UDP** | via USB or BLE | ✓ live UDP | `--udp <host[:port]>` over USB or `--ble`; device pushes to that host (yours, or a remote) |
-| **MCAP replay** | n/a | ✓ from file | `InitParameters::input_type = MCAP`, `mcap_path` |
+| **USB** | yes | yes, live | default; `open()` over USB |
+| **Bluetooth LE** | yes (GATT, password-gated) | n/a (control only) | `--ble <MAC>` / `InitParameters::input_type = STREAM` |
+| **WiFi / UDP** | via USB or BLE | yes, live UDP | `--udp <host[:port]>` over USB or `--ble`; device pushes to that host (yours, or a remote) |
+| **MCAP replay** | n/a | yes, from file | `InitParameters::input_type = MCAP`, `mcap_path` |
 
 USB isoc video is sized to the negotiated link speed automatically (SuperSpeed
 32 KB/interval, high-speed 1 KB); live streaming works at both.
@@ -243,9 +378,15 @@ device open, a second USB open is refused with `DEVICE_BUSY` ("in use by another
 process"). BLE stays available in parallel, so a long-running USB app does not
 lock an operator out of the device. `ef-cli info` reports whether a BLE central
 holds the link, which is otherwise only visible as a `DEVICE_BUSY` on a verb that
-needs the radio. There is deliberately no "is it paired" counterpart: the device
-purges the BLE bond on every disconnect, so no lasting pairing state exists to
-report.
+needs the radio.
+
+**Pairing and the password are independent.** A BLE bond survives disconnect and
+reboot, so a phone that has paired once reconnects without pairing again. Every
+session still authenticates with the control password, so changing the password
+does not drop bonds and dropping bonds does not change the password. If a phone
+that paired before will no longer connect and re-pairing from the phone does not
+fix it, `forget-ble-bonds` clears them all and every phone pairs again on its
+next connect.
 
 **A snapshot is not a subscription.** `get_device_information()` is a cached
 accessor: it never talks to the device. The snapshot is taken at `open()` and
@@ -328,24 +469,25 @@ ef-cli --password 123456 record list
 ef-cli --password 123456 lock off
 ```
 
-`info`, `state`, `storage` and `factory-reset` answer regardless, so a locked
-device still tells you what it is and can always be recovered. `ef-cli info`
-shows `usb access` and `encryption`; `ef-cli config` shows `encryption` and
-`rectify` alongside the capture mode.
+A locked device still reports its identity, and can always be recovered. `ef-cli info`
+shows `usb access`, `encryption` and `recordings drive`; `ef-cli config` shows
+`encryption` and `rectify` alongside the capture mode.
 
 Authentication is per link, not per command: authenticate once and the rest of
 that session is authenticated. USB and BLE authenticate independently of each
 other.
 
-A grant lasts as long as the link and expires on no clock. It ends when the cable
-is cycled or the UDC is rebound, on a new authentication attempt on the same link,
-when `lock on` is issued, or when the password that earned it is changed. An
-administrator grant additionally ends on its first use, because it is single-use.
+A grant lasts for the link. It ends on a cable cycle, on a new authentication
+attempt on the same link, when `lock on` is issued, or when the password that
+earned it is changed. An administrator grant is single-use and ends on its first.
 The SDK re-runs the handshake and retries transparently, so a long-lived `Device`
 never sees this; a client speaking the wire protocol itself must be ready to
 re-authenticate on `AUTH_REQUIRED`.
 
-⚠ **When you have finished with a locked device, run `lock on` or unplug it.**
+The recordings drive follows the lock; see the recordings drive under
+[`ef-cli`](#ef-cli-control-cli).
+
+**When you have finished with a locked device, run `lock on` or unplug it.**
 
 If you are going to work on a locked device for a while, open it deliberately
 instead of passing a password to every command:
@@ -392,8 +534,8 @@ The reply names the installed key by its `key_id` but does not echo the bytes ba
 you supplied them. `key show` still reads it back afterwards, and a key installed this
 way is otherwise indistinguishable from a generated one.
 
-⚠ **A key passed as an argument lands in your shell history.** Use `key set --in
-<file>` or `key set -` instead when that matters.
+Use `key set --in <file>` or `key set -`. Pass the key as an argument only where
+the command line is not retained.
 
 Like `create`, `key set` is **refused while a key already exists** and names the
 installed one, because replacing a key silently would strand every recording written
@@ -405,7 +547,7 @@ ef-cli --admin-password <pw> key set <new-64-hex>
 ef-cli --admin-password <pw> encryption on
 ```
 
-⚠ **`encryption delete` turns encryption OFF, and installing a key does not turn it
+**`encryption delete` turns encryption OFF, and installing a key does not turn it
 back on.** Without the third step the device holds the new key and writes every
 subsequent recording in the clear. `key set` warns when it lands in that state, and
 `ef-cli info` reports it.
@@ -433,7 +575,7 @@ key, but choosing what future recordings are encrypted under decides who can rea
 which is the same argument that gates `encryption off`.
 
 
-⚠ **Setting it works on either transport and needs no cable.** The first
+**Setting it works on either transport and needs no cable.** The first
 `set-admin-password` takes one argument; changing or removing it afterwards needs the
 administrator password itself.
 
@@ -465,9 +607,7 @@ Against firmware older than this feature it instead reads `operator password (th
 firmware has no admin tier)`. Do not assume a camera is protected without checking
 that line.
 
-**What this protects.** The administrator password is an access control on the
-control plane, not on the storage medium. If a device is physically compromised,
-rotate the key.
+**What this protects.** If a device leaves your physical control, rotate the key.
 
 `encryption on` is refused when no key exists, so a session can never be told it
 is encrypting while it records in the clear. `ef-cli info` reports the key's ID
@@ -553,15 +693,14 @@ ef-cli factory-reset --yes
 
 `factory-reset` restores defaults (password, lock, encryption, wifi, calibration,
 capture config, recordings) and **destroys the encryption key too**. It does not
-show you the key first, deliberately: over USB possession authorises it, and handing a key
-to an unauthenticated caller is exactly what destroying it prevents. Save the key
+show you the key first, deliberately. Save the key
 with `--admin-password <pw> key show --out` before resetting if you still need it.
 It puts the control password back to `123456` and **removes** the administrator
 password: there is no factory default to restore it to, so the device returns to having
 none. Over BLE the reset requires the password like any other verb.
 
-The key lives on `/userdata`, so a full reflash destroys it as surely as a reset
-does. Your saved copy is the only thing that survives either.
+A full reflash destroys the key as surely as a reset does. Your saved copy is the
+only thing that survives either.
 
 ---
 
@@ -574,11 +713,21 @@ ef-cli info            # serial, hw rev, firmware, state, camera geometry, IMU, 
 ef-cli info --json     # the machine-readable subset, including "state"
 ef-cli state           # CLOSED / IDLE / STREAMING / UPDATING
                    #   STREAMING = moving data: live host stream, recording, upload, OR calibration
+                   #   CLOSED = not open, or open but not ready to accept camera work
+                   #   To tell a recording from a livestream or an upload, read `record status`
+                   #     rather than the state alone
 ```
 
 `info` reports the same four-value state as `state`, so one call answers both what the
 device is and what it is doing. `--json` carries it as `"state"`; the JSON field names
 are a contract, so scripts should read that rather than grepping the prose.
+
+In the SDK, `get_state()` is a cached read: free, non-blocking, and kept current by
+`open()` and by every call that moves the device. A program that has been idle and wants
+to see a change it did not cause calls `refresh_state()` first, which re-reads from the
+device and returns an `ERROR_CODE`. On failure the cached value is kept rather than
+replaced with a guess, so an error there means what `get_state()` serves is old, not that
+the device is gone.
 
 **Diagnostics (health)**
 ```sh
@@ -601,6 +750,7 @@ ef-cli record stop
 ef-cli record list                 # clip1  bytes=…  frames=…  dur=…  + remaining storage
 ef-cli download clip1 clip1.mcap   # over the USB/BLE control plane
 ef-cli download clip1 ~/captures/  # a directory destination writes clip1.mcap into it
+# or copy it off the EFFERENCE drive with your file manager, no SDK needed
 ```
 
 `download`'s destination is a file path, or an existing directory to write
@@ -631,12 +781,15 @@ a truncated-tail warning (exit 1); see "Reading an encrypted recording".
 is the last line printed. The reply carries 48 rows; a device holding more keeps
 the newest by session mtime rather than whichever the filesystem happened to
 return first. `record status <name>` and `download <name>` resolve the name on the
-device itself, so they reach sessions older than that window (firmware >= this
-release; against older firmware `record status` falls back to the listed set).
+device itself, so they reach sessions older than that window (firmware >=
+v00.09.19; against older firmware `record status` falls back to the listed set).
 
 `record status`/`record list` report why a completed session ended
 (`RecordingStatus::stopped_reason`: USER, DISK_FULL, WRITE_ERROR, or
-INTERRUPTED for a power-loss recovery; firmware >= v00.09.16).
+INTERRUPTED for a power-loss recovery; firmware >= v00.09.16). DEVICE means the
+device ended the session rather than an operator — a shutdown, or a service
+restart while it was recording. The file is complete, exactly as with USER; the
+value exists so an application does not read those as somebody pressing stop.
 
 **Live view over the USB wire**
 ```sh
@@ -735,6 +888,16 @@ the device snapshot, `poll_fault()` for device state.
 Full surface: [`include/ef/Device.hpp`](include/ef/Device.hpp),
 [`Core.hpp`](include/ef/Core.hpp), [`Enums.hpp`](include/ef/Enums.hpp),
 [`Parameters.hpp`](include/ef/Parameters.hpp).
+
+A call the device does not serve returns `COMMAND_NOT_FOUND`, which usually means the
+SDK is newer than the firmware; update the device. Firmware predating that code reports
+the same call as `INVALID_FUNCTION_CALL`, or as `UNSUPPORTED` on recording calls — so a
+version fallback has to accept both.
+
+**Update the SDK alongside the device, not after it.** An SDK older than the firmware
+has no case for `COMMAND_NOT_FOUND` and falls through to a generic per-context result —
+`UNKNOWN_FAILURE` on control calls — so a device answer that is precise becomes one that
+is not. Nothing breaks, but a diagnosable error stops being diagnosable.
 
 Link with CMake: `find_package(ef REQUIRED)` (point `CMAKE_PREFIX_PATH` at
 `sdk/linux/build`, which `env.sh` does) then

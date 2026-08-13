@@ -34,7 +34,10 @@ typedef enum _ef_v1_ErrorCode {
     ef_v1_ErrorCode_ADMIN_REQUIRED = 19, /* operator credential is not enough; authenticate with AUTH_ROLE_ADMIN */
     /* The verb needs the USB link itself; no password satisfies it over BLE. Not the
  administrator tier, which is transport-independent. */
-    ef_v1_ErrorCode_USB_REQUIRED = 20
+    ef_v1_ErrorCode_USB_REQUIRED = 20,
+    /* No handler for this verb on this firmware. Distinct from UNSUPPORTED, which
+ means the verb ran and refused the arguments. */
+    ef_v1_ErrorCode_COMMAND_NOT_FOUND = 21
 } ef_v1_ErrorCode;
 
 /* ============================ Enums ============================ */
@@ -146,23 +149,21 @@ typedef enum _ef_v1_RateControl {
     ef_v1_RateControl_RC_FIXQP = 3
 } ef_v1_RateControl;
 
-/* IMU capture mode. Default IMU_RAW: record uncalibrated samples + carry the full
- ImuCalibration params as metadata (consumer applies M·S·(x−b)). IMU_CALIBRATED: the
- device applies the calibration to the samples on-device. IMU_BOTH: emit both (dual topics). */
+/* IMU capture mode: RAW records uncalibrated samples with the calibration as metadata, CALIBRATED applies it on-device, BOTH emits each. */
 typedef enum _ef_v1_ImuData {
     ef_v1_ImuData_IMU_RAW = 0,
     ef_v1_ImuData_IMU_CALIBRATED = 1,
     ef_v1_ImuData_IMU_BOTH = 2
 } ef_v1_ImuData;
 
-/* Why a session stopped. UNSPECIFIED for in-progress sessions and recordings
- made by firmware that predates the field. */
+/* Why a session stopped; UNSPECIFIED while in progress or from firmware predating the field. */
 typedef enum _ef_v1_StopReason {
     ef_v1_StopReason_STOP_UNSPECIFIED = 0,
     ef_v1_StopReason_STOP_USER = 1, /* explicit stop */
     ef_v1_StopReason_STOP_DISK_FULL = 2, /* storage reserve reached; finalized cleanly */
     ef_v1_StopReason_STOP_WRITE_ERROR = 3, /* sink write error ended the session */
-    ef_v1_StopReason_STOP_INTERRUPTED = 4 /* power loss / crash; recovered at next boot */
+    ef_v1_StopReason_STOP_INTERRUPTED = 4, /* power loss / crash; recovered at next boot */
+    ef_v1_StopReason_STOP_DEVICE = 5 /* the device ended it, not a user; the file is complete */
 } ef_v1_StopReason;
 
 /* ============================ WiFi ============================
@@ -173,16 +174,32 @@ typedef enum _ef_v1_WifiBand {
     ef_v1_WifiBand_WIFI_BAND_5_GHZ = 2
 } ef_v1_WifiBand;
 
-/* Credential tier for the challenge and the proof. ADMIN grants are SINGLE-USE and
- answered only once an administrator password is set (DeviceInformation.admin_provisioned). */
+/* Layered: usable is `health == UNSPECIFIED || health >= WIFI_HEALTH_UNVERIFIED` (0 = firmware predates this). */
+typedef enum _ef_v1_WifiHealth {
+    ef_v1_WifiHealth_WIFI_HEALTH_UNSPECIFIED = 0,
+    ef_v1_WifiHealth_WIFI_HEALTH_DISCONNECTED = 1,
+    ef_v1_WifiHealth_WIFI_HEALTH_NO_ADDRESS = 2,
+    ef_v1_WifiHealth_WIFI_HEALTH_NO_DNS = 3,
+    ef_v1_WifiHealth_WIFI_HEALTH_UNREACHABLE = 4,
+    ef_v1_WifiHealth_WIFI_HEALTH_UNVERIFIED = 5,
+    ef_v1_WifiHealth_WIFI_HEALTH_OK = 6
+} ef_v1_WifiHealth;
+
+/* ============================ Time / System ============================
+ Whether a Location holds a position. UNSPECIFIED means the sender predates this field and is storing one. */
+typedef enum _ef_v1_LocationState {
+    ef_v1_LocationState_LOCATION_UNSPECIFIED = 0,
+    ef_v1_LocationState_LOCATION_SET = 1,
+    ef_v1_LocationState_LOCATION_NONE = 2
+} ef_v1_LocationState;
+
+/* Credential tier for the challenge and the proof; ADMIN grants are single-use and need admin_provisioned. */
 typedef enum _ef_v1_AuthRole {
     ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED = 0, /* operator: the credential every verb below admin uses */
     ef_v1_AuthRole_AUTH_ROLE_ADMIN = 1
 } ef_v1_AuthRole;
 
-/* Which cipher a key is for, and which one a recording was written with. Carried
- explicitly from the start so the format is not pigeonholed to one algorithm; the
- container header spends a byte on the same id. */
+/* Which cipher a key is for, and which one a recording was written with. */
 typedef enum _ef_v1_EncryptionAlgorithm {
     ef_v1_EncryptionAlgorithm_ENC_ALG_UNSPECIFIED = 0, /* "device default" on a request; AES_256_GCM in a file */
     ef_v1_EncryptionAlgorithm_ENC_ALG_AES_256_GCM = 1
@@ -313,10 +330,7 @@ typedef struct _ef_v1_DeleteRecording {
     char name[64];
 } ef_v1_DeleteRecording;
 
-/* Pull a device-local recording to the host over the control plane, mirroring the
- OTA push (chunk-over-transport, no networking). Host loops offset->EOF; each reply
- carries up to 7168 B of the recording (a finalized .mcap, or an unrepaired
- power-loss partial served as-is) plus the total size and an eof flag. */
+/* Pull a device-local recording over the control plane: loop offset->EOF, each reply carrying recording bytes, the total size and an eof flag. */
 typedef struct _ef_v1_DownloadRecording {
     char name[64];
     uint64_t offset;
@@ -335,6 +349,7 @@ typedef struct _ef_v1_UploadSpec {
     ef_v1_UploadDest dest; /* CLOUD_URL | TO_HOST */
     char presigned_url[2048]; /* when dest = CLOUD_URL */
     ef_v1_UploadMode mode; /* AFTER_STOP | STREAMING */
+    bool resumable; /* presigned_url is a resumable-session URI; omit for a plain PUT */
 } ef_v1_UploadSpec;
 
 typedef struct _ef_v1_StartUpload {
@@ -360,13 +375,7 @@ typedef struct _ef_v1_UploadStatus {
 } ef_v1_UploadStatus;
 
 /* ============================ Chunked upload ============================
- The APP (BLE central) holds the ONLY mTLS cert and runs the app-side ingest protocol
- (create/finalize/refresh-url). The DEVICE is a PUT-worker: it lists a session's
- chunks (GetSessionManifest), receives pre-signed per-chunk URLs (PutChunks),
- PUTs each chunk over WiFi (no cert), and reports per-chunk outcome
- (GetChunkUploadStatus). Delete is app-gated (DeleteRecording after finalize).
- URLs are ~1-2 KB; PutChunks is sent in small batches to stay under
- EFR_PROTO_MAX_PAYLOAD (8192). */
+ Chunked upload: list a session's chunks, receive pre-signed per-chunk URLs in small batches, PUT them, report the outcome. */
 typedef struct _ef_v1_GetSessionManifest {
     char name[64];
 } ef_v1_GetSessionManifest;
@@ -413,8 +422,7 @@ typedef struct _ef_v1_ChunkUploadStatus {
 } ef_v1_ChunkUploadStatus;
 
 /* ============================ OTA (thin front-end over the device OTA) ============================
- Thin front-end over the device OTA. Commit and rollback happen automatically
- after boot; the host observes OTA_SUCCESS / OTA_ROLLEDBACK via OtaStatus. */
+ Thin front-end over the device OTA; commit and rollback are automatic after boot and observable via OtaStatus. */
 typedef struct _ef_v1_OtaCheck {
     char dummy_field;
 } ef_v1_OtaCheck;
@@ -441,10 +449,7 @@ typedef struct _ef_v1_SetOtaConfig {
     bool stage_mode;
 } ef_v1_SetOtaConfig;
 
-/* OTA push: relay a self-contained .eff to the device over the wire (no-WiFi update).
-   USB (B1): OtaPushBegin -> raw .eff bytes on the bulk-OUT push endpoint -> OtaPushEnd.
-   BLE (B2): OtaPushBegin -> OtaPushChunk{offset,data,eof} over the command channel (delta-sized).
- The device stores it locally and consumes it via the existing file:// path. */
+/* Relay a self-contained .eff over the wire: USB sends raw bytes on the bulk-OUT push endpoint, BLE sends OtaPushChunk{offset,data,eof}. */
 typedef struct _ef_v1_OtaPushBegin {
     char name[64];
     uint64_t total_size;
@@ -474,10 +479,7 @@ typedef struct _ef_v1_OtaStatus {
 } ef_v1_OtaStatus;
 
 /* ============================ Health ============================
- StartHealthCheck{deep} kicks off the sweep; GetHealthStatus reports it.
- health_passed is an inline core-presence gate; overall is the sweep verdict
- (PASS only if no FAIL); checks[] carries each probe. Non-critical FAILs are
- reported, never latched. */
+ StartHealthCheck{deep} runs the sweep, GetHealthStatus reports it: overall is PASS only if nothing FAILed, and checks[] carries each probe. */
 typedef struct _ef_v1_StartHealthCheck {
     bool deep;
 } ef_v1_StartHealthCheck;
@@ -570,16 +572,16 @@ typedef struct _ef_v1_WifiStatus {
     int32_t link_speed; /* negotiated PHY link rate, Mbps (0 = unknown) */
     int32_t freq_mhz; /* associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz) */
     char security[16]; /* "WPA2" / "WPA3" / "WPA2/WPA3" / "Open" ("" = unknown) */
+    ef_v1_WifiHealth health; /* whether the link actually works; `connected` is association alone */
 } ef_v1_WifiStatus;
 
-/* ============================ Time / System ============================
- Device geographic location, written into each MCAP's foxglove.LocationFix.
- covariance_diag fills the diagonal of the 3x3 position covariance (accuracy). */
+/* Device location, written into each recording's foxglove.LocationFix; covariance_diag is the position covariance diagonal in m^2. LOCATION_NONE means none is stored and recordings carry none. */
 typedef struct _ef_v1_Location {
     double latitude;
     double longitude;
     double altitude;
     double covariance_diag;
+    ef_v1_LocationState state;
 } ef_v1_Location;
 
 /* ============================ Recording ============================ */
@@ -589,7 +591,7 @@ typedef struct _ef_v1_StartRecording {
     bool has_upload;
     ef_v1_UploadSpec upload; /* optional auto-upload policy */
     bool has_location;
-    ef_v1_Location location; /* optional per-session location override (this MCAP only) */
+    ef_v1_Location location; /* optional location for this MCAP only; leaves the stored one alone */
 } ef_v1_StartRecording;
 
 typedef struct _ef_v1_SetLocation {
@@ -633,8 +635,7 @@ typedef struct _ef_v1_StorageInfo {
     uint32_t recordings;
 } ef_v1_StorageInfo;
 
-/* Current device FSM state (INIT/IDLE/COLLECT/CAL/OTA/HEALTH_TEST/SAFE/SLEEP),
- the reported device_state, and whether it is fault-latched in SAFE. */
+/* Current device state, plus whether it is fault-latched in SAFE. */
 typedef struct _ef_v1_GetState {
     char dummy_field;
 } ef_v1_GetState;
@@ -695,13 +696,13 @@ typedef struct _ef_v1_ImuCalibration {
     double gyro_noise_density;
     pb_size_t imu_to_camera_count;
     double imu_to_camera[16];
-    /* ---- additive (6+): full per-sensor M·S·(x−b) model, noise model, temporal offset.
+    /* ---- additive (6+): full per-sensor M*S*(x-b) model, noise model, temporal offset.
  Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
- uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream. */
+ uncalibrated + these params travel as metadata; consumer applies M*S*(x-b) downstream. */
     pb_size_t accel_scale_misalign_count;
-    double accel_scale_misalign[9]; /* accel 3x3 M·S, row-major (empty = identity) */
+    double accel_scale_misalign[9]; /* accel 3x3 M*S, row-major (empty = identity) */
     pb_size_t gyro_scale_misalign_count;
-    double gyro_scale_misalign[9]; /* gyro  3x3 M·S, row-major (empty = identity; model is bias-only) */
+    double gyro_scale_misalign[9]; /* gyro  3x3 M*S, row-major (empty = identity; model is bias-only) */
     double accel_bias_random_walk; /* Allan +1/2 slope */
     double gyro_bias_random_walk;
     double accel_tau; /* bias-instability correlation time (Gauss-Markov), s */
@@ -747,15 +748,18 @@ typedef struct _ef_v1_DeviceInformation {
     /* This firmware enforces the ADMIN tier on the encryption-key verbs. */
     bool admin_gate;
     /* A key exists with no administrator password, so the control password reads it.
- ⚠ Do not report such a device as protected. Setting one later protects it too. */
+ Do not report such a device as protected. Setting one later protects it too. */
     bool key_unprotected;
     /* An administrator password is set; there is no factory default. False means the
  encryption-key verbs are served at the control-password tier. */
     bool admin_provisioned;
+    /* The recordings drive is exposed to the host right now; it follows the USB lock. */
+    bool recordings_volume_attached;
+    /* Recordings published on that drive; 0 when it is not attached. */
+    uint32_t recordings_volume_files;
 } ef_v1_DeviceInformation;
 
-/* Write calibration for one sensor (IDLE only; applied on the next capture
- session). Get is folded into GetDeviceInformation (camera/imu fields). */
+/* Write calibration for one sensor, IDLE only, applied on the next capture session; read it from GetDeviceInformation. */
 typedef struct _ef_v1_SetCalibration {
     pb_size_t which_target;
     union {
@@ -764,8 +768,7 @@ typedef struct _ef_v1_SetCalibration {
     } target;
 } ef_v1_SetCalibration;
 
-/* Restore factory-default calibration for the selected sensor(s) (IDLE only).
- Camera factory default is currently all-zeros (uncalibrated). */
+/* Restore factory-default calibration for the selected sensors, IDLE only; the camera default is uncalibrated. */
 typedef struct _ef_v1_ResetCalibration {
     bool camera;
     bool imu;
@@ -795,61 +798,46 @@ typedef struct _ef_v1_SetBlePassword {
     char new_password[64];
 } ef_v1_SetBlePassword;
 
-/* Provision the administrator password (empty old_password) or change it; changing
- always requires the current value, on either transport. */
+/* Provision the administrator password with an empty old_password, or change it by supplying the current one. */
 typedef struct _ef_v1_SetAdminPassword {
     char old_password[64];
     char new_password[64];
 } ef_v1_SetAdminPassword;
 
-/* ⚠ Remove the administrator password: the key verbs drop back to the control
- password. Needs an ADMIN grant AND the current password. */
+/* Remove the administrator password so the key verbs fall back to the control password; needs an ADMIN grant and the current value. */
 typedef struct _ef_v1_ClearAdminPassword {
     char current_password[64];
 } ef_v1_ClearAdminPassword;
 
-/* USB access control. Unlocked (factory default) USB carries OPERATOR privilege with
- no password, matching today's behavior for everything below the admin tier. Locked, a USB session is gated exactly like a BLE one: only
- info, state, storage, the auth handshake, and FactoryReset answer without a
- password. Toggling either way requires the current password.
- session_only scopes it to this power session: {locked=false} opens a device that
- is ALREADY locked (refused otherwise) until re-locked from either transport or
- power is lost, and usb_locked stays true throughout. USB only, and never set
- implicitly by Authenticate. Omitted = the persistent behavior. */
+/* USB access control: locked, a USB session gates like a BLE one, and session_only scopes it to this power session. */
 typedef struct _ef_v1_SetUsbLock {
     bool locked;
     bool session_only;
 } ef_v1_SetUsbLock;
 
-/* Enable/disable at-rest encryption for SUBSEQUENT recordings; refused with no key.
- State is DeviceInformation.encryption_enabled. */
+/* Drops the device's side of every BLE pairing; each phone must forget it too. */
+typedef struct _ef_v1_ForgetBleBonds {
+    char dummy_field;
+} ef_v1_ForgetBleBonds;
+
+/* Enable/disable at-rest encryption for SUBSEQUENT recordings, refused with no key; read the state from DeviceInformation. */
 typedef struct _ef_v1_SetEncryption {
     bool enabled;
     ef_v1_EncryptionAlgorithm algorithm;
 } ef_v1_SetEncryption;
 
 /* ---- key lifecycle: ADMIN-gated once an administrator password exists ----
- A key is generated by the device (Create, returned ONCE) or supplied by the operator
- (Set). Either way a factory reset destroys the device's copy. */
+ A key is generated by the device (Create, returned ONCE) or supplied by the operator (Set); a factory reset destroys the device's copy. */
 typedef struct _ef_v1_GetEncryptionKey {
     char dummy_field;
 } ef_v1_GetEncryptionKey;
 
-/* Refused when a key already exists: replacing one would make every recording
- written under it permanently undecryptable, so rotation is delete-then-create,
- two deliberate steps rather than one that can be typed by accident. */
+/* Refused when a key already exists; rotate with delete then create. */
 typedef struct _ef_v1_CreateEncryptionKey {
     ef_v1_EncryptionAlgorithm algorithm;
 } ef_v1_CreateEncryptionKey;
 
-/* `key_id` must match the installed key. The guard lives here rather than only in
- the CLI so an SDK or BLE caller cannot destroy a key it never identified. The
- reply carries the destroyed key's bytes with present=false, which is the last
- chance to keep it for ciphertext already recorded under it.
-
- IDLE-only, like FactoryReset: a running session holds the key in memory and
- would keep encrypting under it, so the device would report the key destroyed
- and then finish writing a recording that needs exactly that key. */
+/* Destroys the key; `key_id` must match the installed one, device must be IDLE, and the reply returns the bytes once. */
 typedef struct _ef_v1_DeleteEncryptionKey {
     char key_id[16];
 } ef_v1_DeleteEncryptionKey;
@@ -898,10 +886,7 @@ typedef struct _ef_v1_Response {
     } body;
 } ef_v1_Response;
 
-/* Restore factory settings: password, USB lock, encryption, wifi and runtime state.
- ⚠ DESTROYS the encryption key, making every recording under it permanently
- undecryptable. Provisioning and factory identity survive. Needs no password over
- USB; over BLE it needs the control password. */
+/* Restore factory settings. DESTROYS the encryption key, so recordings under it become unreadable; provisioning and factory identity survive. */
 typedef struct _ef_v1_FactoryReset {
     char dummy_field;
 } ef_v1_FactoryReset;
@@ -964,26 +949,27 @@ typedef struct _ef_v1_Request {
         ef_v1_Reboot reboot;
         ef_v1_GetStorage get_storage;
         ef_v1_GetState get_state;
-        ef_v1_SetLocation set_location; /* persist device location on the device */
-        ef_v1_GetLocation get_location; /* read current effective device location */
+        ef_v1_SetLocation set_location; /* store or clear the device location */
+        ef_v1_GetLocation get_location; /* read the stored device location */
         /* calibration (per-sensor; get is folded into GetDeviceInformation.camera/imu) */
         ef_v1_SetCalibration set_calibration; /* write intrinsics (IDLE only, next session) */
         ef_v1_ResetCalibration reset_calibration; /* restore factory default (IDLE only) */
         /* auth / access control (BLE password is user-facing) */
         ef_v1_GetAuthChallenge get_auth_challenge; /* device -> nonce (auth handshake, both transports) */
         ef_v1_Authenticate authenticate; /* prove the control password (HMAC over nonce) */
-        ef_v1_SetBlePassword set_ble_password; /* set/rekey; UNLOCKED usb may reset w/o old */
+        ef_v1_SetBlePassword set_ble_password; /* set or change the control password */
         ef_v1_SetUsbLock set_usb_lock; /* lock/unlock USB; locked USB gates like BLE */
         /* ADMIN-gated once an administrator password exists, FactoryReset excepted; while
      none is set they are served at the control-password tier. See AuthRole. */
         ef_v1_GetEncryptionKey get_encryption_key; /* read the video-encryption key */
-        ef_v1_FactoryReset factory_reset; /* lost-password recovery; over USB, possession authorises */
+        ef_v1_FactoryReset factory_reset; /* restore factory settings; DESTROYS the encryption key */
         ef_v1_SetEncryption set_encryption; /* turn at-rest video encryption on/off */
         ef_v1_CreateEncryptionKey create_encryption_key; /* generate a key; returned ONCE */
         ef_v1_DeleteEncryptionKey delete_encryption_key; /* destroy the key (key_id must match) */
         ef_v1_SetAdminPassword set_admin_password; /* provision one, or change it with the current */
         ef_v1_ClearAdminPassword clear_admin_password; /* REMOVE admin; needs the current one */
         ef_v1_SetEncryptionKey set_encryption_key; /* install a key the OPERATOR supplies */
+        ef_v1_ForgetBleBonds forget_ble_bonds; /* drop this device's BLE bonds; each phone must forget it too */
     } body;
 } ef_v1_Request;
 
@@ -994,8 +980,8 @@ extern "C" {
 
 /* Helper constants for enums */
 #define _ef_v1_ErrorCode_MIN ef_v1_ErrorCode_SUCCESS
-#define _ef_v1_ErrorCode_MAX ef_v1_ErrorCode_USB_REQUIRED
-#define _ef_v1_ErrorCode_ARRAYSIZE ((ef_v1_ErrorCode)(ef_v1_ErrorCode_USB_REQUIRED+1))
+#define _ef_v1_ErrorCode_MAX ef_v1_ErrorCode_COMMAND_NOT_FOUND
+#define _ef_v1_ErrorCode_ARRAYSIZE ((ef_v1_ErrorCode)(ef_v1_ErrorCode_COMMAND_NOT_FOUND+1))
 
 #define _ef_v1_Mode_MIN ef_v1_Mode_MODE_UNKNOWN
 #define _ef_v1_Mode_MAX ef_v1_Mode_UVC
@@ -1062,12 +1048,20 @@ extern "C" {
 #define _ef_v1_ImuData_ARRAYSIZE ((ef_v1_ImuData)(ef_v1_ImuData_IMU_BOTH+1))
 
 #define _ef_v1_StopReason_MIN ef_v1_StopReason_STOP_UNSPECIFIED
-#define _ef_v1_StopReason_MAX ef_v1_StopReason_STOP_INTERRUPTED
-#define _ef_v1_StopReason_ARRAYSIZE ((ef_v1_StopReason)(ef_v1_StopReason_STOP_INTERRUPTED+1))
+#define _ef_v1_StopReason_MAX ef_v1_StopReason_STOP_DEVICE
+#define _ef_v1_StopReason_ARRAYSIZE ((ef_v1_StopReason)(ef_v1_StopReason_STOP_DEVICE+1))
 
 #define _ef_v1_WifiBand_MIN ef_v1_WifiBand_WIFI_BAND_AUTO
 #define _ef_v1_WifiBand_MAX ef_v1_WifiBand_WIFI_BAND_5_GHZ
 #define _ef_v1_WifiBand_ARRAYSIZE ((ef_v1_WifiBand)(ef_v1_WifiBand_WIFI_BAND_5_GHZ+1))
+
+#define _ef_v1_WifiHealth_MIN ef_v1_WifiHealth_WIFI_HEALTH_UNSPECIFIED
+#define _ef_v1_WifiHealth_MAX ef_v1_WifiHealth_WIFI_HEALTH_OK
+#define _ef_v1_WifiHealth_ARRAYSIZE ((ef_v1_WifiHealth)(ef_v1_WifiHealth_WIFI_HEALTH_OK+1))
+
+#define _ef_v1_LocationState_MIN ef_v1_LocationState_LOCATION_UNSPECIFIED
+#define _ef_v1_LocationState_MAX ef_v1_LocationState_LOCATION_NONE
+#define _ef_v1_LocationState_ARRAYSIZE ((ef_v1_LocationState)(ef_v1_LocationState_LOCATION_NONE+1))
 
 #define _ef_v1_AuthRole_MIN ef_v1_AuthRole_AUTH_ROLE_UNSPECIFIED
 #define _ef_v1_AuthRole_MAX ef_v1_AuthRole_AUTH_ROLE_ADMIN
@@ -1170,7 +1164,9 @@ extern "C" {
 
 
 
+#define ef_v1_WifiStatus_health_ENUMTYPE ef_v1_WifiHealth
 
+#define ef_v1_Location_state_ENUMTYPE ef_v1_LocationState
 
 
 
@@ -1197,6 +1193,7 @@ extern "C" {
 
 
 #define ef_v1_Authenticate_role_ENUMTYPE ef_v1_AuthRole
+
 
 
 
@@ -1238,7 +1235,7 @@ extern "C" {
 #define ef_v1_DeleteRecording_init_default       {""}
 #define ef_v1_DownloadRecording_init_default     {"", 0, 0}
 #define ef_v1_RecordingChunk_init_default        {{0, {0}}, 0, 0}
-#define ef_v1_UploadSpec_init_default            {_ef_v1_UploadDest_MIN, "", _ef_v1_UploadMode_MIN}
+#define ef_v1_UploadSpec_init_default            {_ef_v1_UploadDest_MIN, "", _ef_v1_UploadMode_MIN, 0}
 #define ef_v1_StartUpload_init_default           {"", false, ef_v1_UploadSpec_init_default}
 #define ef_v1_StopUpload_init_default            {""}
 #define ef_v1_GetUploadStatus_init_default       {""}
@@ -1275,8 +1272,8 @@ extern "C" {
 #define ef_v1_WifiListResult_init_default        {0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}}
 #define ef_v1_StartWifiCheck_init_default        {0}
 #define ef_v1_GetWifiStatus_init_default         {0}
-#define ef_v1_WifiStatus_init_default            {0, "", 0, "", 0, 0, 0, "", 0, 0, ""}
-#define ef_v1_Location_init_default              {0, 0, 0, 0}
+#define ef_v1_WifiStatus_init_default            {0, "", 0, "", 0, 0, 0, "", 0, 0, "", _ef_v1_WifiHealth_MIN}
+#define ef_v1_Location_init_default              {0, 0, 0, 0, _ef_v1_LocationState_MIN}
 #define ef_v1_SetLocation_init_default           {false, ef_v1_Location_init_default}
 #define ef_v1_GetLocation_init_default           {0}
 #define ef_v1_SetTime_init_default               {0}
@@ -1289,7 +1286,7 @@ extern "C" {
 #define ef_v1_GetState_init_default              {0}
 #define ef_v1_StateInfo_init_default             {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_default  {0}
-#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0}
+#define ef_v1_DeviceInformation_init_default     {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_default, false, ef_v1_ImuCalibration_init_default, 0, 0, 0, false, ef_v1_VideoConfig_init_default, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_default, false, ef_v1_WifiStatus_init_default, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0, 0, 0}
 #define ef_v1_CapMode_init_default               {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_default          {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default, ef_v1_CapMode_init_default}}
 #define ef_v1_CameraIntrinsics_init_default      {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1303,6 +1300,7 @@ extern "C" {
 #define ef_v1_SetAdminPassword_init_default      {"", ""}
 #define ef_v1_ClearAdminPassword_init_default    {""}
 #define ef_v1_SetUsbLock_init_default            {0, 0}
+#define ef_v1_ForgetBleBonds_init_default        {0}
 #define ef_v1_SetEncryption_init_default         {0, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_GetEncryptionKey_init_default      {0}
 #define ef_v1_CreateEncryptionKey_init_default   {_ef_v1_EncryptionAlgorithm_MIN}
@@ -1333,7 +1331,7 @@ extern "C" {
 #define ef_v1_DeleteRecording_init_zero          {""}
 #define ef_v1_DownloadRecording_init_zero        {"", 0, 0}
 #define ef_v1_RecordingChunk_init_zero           {{0, {0}}, 0, 0}
-#define ef_v1_UploadSpec_init_zero               {_ef_v1_UploadDest_MIN, "", _ef_v1_UploadMode_MIN}
+#define ef_v1_UploadSpec_init_zero               {_ef_v1_UploadDest_MIN, "", _ef_v1_UploadMode_MIN, 0}
 #define ef_v1_StartUpload_init_zero              {"", false, ef_v1_UploadSpec_init_zero}
 #define ef_v1_StopUpload_init_zero               {""}
 #define ef_v1_GetUploadStatus_init_zero          {""}
@@ -1370,8 +1368,8 @@ extern "C" {
 #define ef_v1_WifiListResult_init_zero           {0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}}
 #define ef_v1_StartWifiCheck_init_zero           {0}
 #define ef_v1_GetWifiStatus_init_zero            {0}
-#define ef_v1_WifiStatus_init_zero               {0, "", 0, "", 0, 0, 0, "", 0, 0, ""}
-#define ef_v1_Location_init_zero                 {0, 0, 0, 0}
+#define ef_v1_WifiStatus_init_zero               {0, "", 0, "", 0, 0, 0, "", 0, 0, "", _ef_v1_WifiHealth_MIN}
+#define ef_v1_Location_init_zero                 {0, 0, 0, 0, _ef_v1_LocationState_MIN}
 #define ef_v1_SetLocation_init_zero              {false, ef_v1_Location_init_zero}
 #define ef_v1_GetLocation_init_zero              {0}
 #define ef_v1_SetTime_init_zero                  {0}
@@ -1384,7 +1382,7 @@ extern "C" {
 #define ef_v1_GetState_init_zero                 {0}
 #define ef_v1_StateInfo_init_zero                {"", "", 0, ""}
 #define ef_v1_GetDeviceInformation_init_zero     {0}
-#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0}
+#define ef_v1_DeviceInformation_init_zero        {"", "", "", 0, "", 0, false, ef_v1_CameraIntrinsics_init_zero, false, ef_v1_ImuCalibration_init_zero, 0, 0, 0, false, ef_v1_VideoConfig_init_zero, _ef_v1_RateControl_MIN, 0, false, ef_v1_Capabilities_init_zero, false, ef_v1_WifiStatus_init_zero, 0, "", "", 0, 0, 0, "", _ef_v1_EncryptionAlgorithm_MIN, 0, 0, 0, 0, 0, 0, 0}
 #define ef_v1_CapMode_init_zero                  {0, 0, 0, "", 0}
 #define ef_v1_Capabilities_init_zero             {0, {"", "", "", "", "", "", "", ""}, 0, {"", "", "", ""}, 0, {"", "", "", ""}, 0, {ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero, ef_v1_CapMode_init_zero}}
 #define ef_v1_CameraIntrinsics_init_zero         {0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0, 0}, 0, 0}
@@ -1398,6 +1396,7 @@ extern "C" {
 #define ef_v1_SetAdminPassword_init_zero         {"", ""}
 #define ef_v1_ClearAdminPassword_init_zero       {""}
 #define ef_v1_SetUsbLock_init_zero               {0, 0}
+#define ef_v1_ForgetBleBonds_init_zero           {0}
 #define ef_v1_SetEncryption_init_zero            {0, _ef_v1_EncryptionAlgorithm_MIN}
 #define ef_v1_GetEncryptionKey_init_zero         {0}
 #define ef_v1_CreateEncryptionKey_init_zero      {_ef_v1_EncryptionAlgorithm_MIN}
@@ -1464,6 +1463,7 @@ extern "C" {
 #define ef_v1_UploadSpec_dest_tag                1
 #define ef_v1_UploadSpec_presigned_url_tag       2
 #define ef_v1_UploadSpec_mode_tag                3
+#define ef_v1_UploadSpec_resumable_tag           4
 #define ef_v1_StartUpload_recording_name_tag     1
 #define ef_v1_StartUpload_spec_tag               2
 #define ef_v1_StopUpload_recording_name_tag      1
@@ -1544,10 +1544,12 @@ extern "C" {
 #define ef_v1_WifiStatus_link_speed_tag          9
 #define ef_v1_WifiStatus_freq_mhz_tag            10
 #define ef_v1_WifiStatus_security_tag            11
+#define ef_v1_WifiStatus_health_tag              12
 #define ef_v1_Location_latitude_tag              1
 #define ef_v1_Location_longitude_tag             2
 #define ef_v1_Location_altitude_tag              3
 #define ef_v1_Location_covariance_diag_tag       4
+#define ef_v1_Location_state_tag                 5
 #define ef_v1_StartRecording_name_tag            1
 #define ef_v1_StartRecording_target_tag          2
 #define ef_v1_StartRecording_upload_tag          3
@@ -1627,6 +1629,8 @@ extern "C" {
 #define ef_v1_DeviceInformation_admin_gate_tag   31
 #define ef_v1_DeviceInformation_key_unprotected_tag 33
 #define ef_v1_DeviceInformation_admin_provisioned_tag 34
+#define ef_v1_DeviceInformation_recordings_volume_attached_tag 35
+#define ef_v1_DeviceInformation_recordings_volume_files_tag 36
 #define ef_v1_SetCalibration_camera_tag          1
 #define ef_v1_SetCalibration_imu_tag             2
 #define ef_v1_ResetCalibration_camera_tag        1
@@ -1739,6 +1743,7 @@ extern "C" {
 #define ef_v1_Request_set_admin_password_tag     103
 #define ef_v1_Request_clear_admin_password_tag   104
 #define ef_v1_Request_set_encryption_key_tag     105
+#define ef_v1_Request_forget_ble_bonds_tag       106
 
 /* Struct field encoding specification for nanopb */
 #define ef_v1_Request_FIELDLIST(X, a) \
@@ -1802,7 +1807,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,create_encryption_key,body.create_encry
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,delete_encryption_key,body.delete_encryption_key), 101) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_admin_password,body.set_admin_password), 103) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,clear_admin_password,body.clear_admin_password), 104) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption_key,body.set_encryption_key), 105)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption_key,body.set_encryption_key), 105) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,forget_ble_bonds,body.forget_ble_bonds), 106)
 #define ef_v1_Request_CALLBACK NULL
 #define ef_v1_Request_DEFAULT NULL
 #define ef_v1_Request_body_get_device_information_MSGTYPE ef_v1_GetDeviceInformation
@@ -1865,6 +1871,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,set_encryption_key,body.set_encryption_
 #define ef_v1_Request_body_set_admin_password_MSGTYPE ef_v1_SetAdminPassword
 #define ef_v1_Request_body_clear_admin_password_MSGTYPE ef_v1_ClearAdminPassword
 #define ef_v1_Request_body_set_encryption_key_MSGTYPE ef_v1_SetEncryptionKey
+#define ef_v1_Request_body_forget_ble_bonds_MSGTYPE ef_v1_ForgetBleBonds
 
 #define ef_v1_Response_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   corr_id,           1) \
@@ -2067,7 +2074,8 @@ X(a, STATIC,   SINGULAR, BOOL,     eof,               3)
 #define ef_v1_UploadSpec_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UENUM,    dest,              1) \
 X(a, STATIC,   SINGULAR, STRING,   presigned_url,     2) \
-X(a, STATIC,   SINGULAR, UENUM,    mode,              3)
+X(a, STATIC,   SINGULAR, UENUM,    mode,              3) \
+X(a, STATIC,   SINGULAR, BOOL,     resumable,         4)
 #define ef_v1_UploadSpec_CALLBACK NULL
 #define ef_v1_UploadSpec_DEFAULT NULL
 
@@ -2310,7 +2318,8 @@ X(a, STATIC,   SINGULAR, DOUBLE,   mbps_up,           7) \
 X(a, STATIC,   SINGULAR, STRING,   state,             8) \
 X(a, STATIC,   SINGULAR, INT32,    link_speed,        9) \
 X(a, STATIC,   SINGULAR, INT32,    freq_mhz,         10) \
-X(a, STATIC,   SINGULAR, STRING,   security,         11)
+X(a, STATIC,   SINGULAR, STRING,   security,         11) \
+X(a, STATIC,   SINGULAR, UENUM,    health,           12)
 #define ef_v1_WifiStatus_CALLBACK NULL
 #define ef_v1_WifiStatus_DEFAULT NULL
 
@@ -2318,7 +2327,8 @@ X(a, STATIC,   SINGULAR, STRING,   security,         11)
 X(a, STATIC,   SINGULAR, DOUBLE,   latitude,          1) \
 X(a, STATIC,   SINGULAR, DOUBLE,   longitude,         2) \
 X(a, STATIC,   SINGULAR, DOUBLE,   altitude,          3) \
-X(a, STATIC,   SINGULAR, DOUBLE,   covariance_diag,   4)
+X(a, STATIC,   SINGULAR, DOUBLE,   covariance_diag,   4) \
+X(a, STATIC,   SINGULAR, UENUM,    state,             5)
 #define ef_v1_Location_CALLBACK NULL
 #define ef_v1_Location_DEFAULT NULL
 
@@ -2419,7 +2429,9 @@ X(a, STATIC,   SINGULAR, BOOL,     session_unlocked,  28) \
 X(a, STATIC,   SINGULAR, BOOL,     ble_connected,    30) \
 X(a, STATIC,   SINGULAR, BOOL,     admin_gate,       31) \
 X(a, STATIC,   SINGULAR, BOOL,     key_unprotected,  33) \
-X(a, STATIC,   SINGULAR, BOOL,     admin_provisioned,  34)
+X(a, STATIC,   SINGULAR, BOOL,     admin_provisioned,  34) \
+X(a, STATIC,   SINGULAR, BOOL,     recordings_volume_attached,  35) \
+X(a, STATIC,   SINGULAR, UINT32,   recordings_volume_files,  36)
 #define ef_v1_DeviceInformation_CALLBACK NULL
 #define ef_v1_DeviceInformation_DEFAULT NULL
 #define ef_v1_DeviceInformation_camera_MSGTYPE ef_v1_CameraIntrinsics
@@ -2532,6 +2544,11 @@ X(a, STATIC,   SINGULAR, BOOL,     locked,            1) \
 X(a, STATIC,   SINGULAR, BOOL,     session_only,      2)
 #define ef_v1_SetUsbLock_CALLBACK NULL
 #define ef_v1_SetUsbLock_DEFAULT NULL
+
+#define ef_v1_ForgetBleBonds_FIELDLIST(X, a) \
+
+#define ef_v1_ForgetBleBonds_CALLBACK NULL
+#define ef_v1_ForgetBleBonds_DEFAULT NULL
 
 #define ef_v1_SetEncryption_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
@@ -2661,6 +2678,7 @@ extern const pb_msgdesc_t ef_v1_SetBlePassword_msg;
 extern const pb_msgdesc_t ef_v1_SetAdminPassword_msg;
 extern const pb_msgdesc_t ef_v1_ClearAdminPassword_msg;
 extern const pb_msgdesc_t ef_v1_SetUsbLock_msg;
+extern const pb_msgdesc_t ef_v1_ForgetBleBonds_msg;
 extern const pb_msgdesc_t ef_v1_SetEncryption_msg;
 extern const pb_msgdesc_t ef_v1_GetEncryptionKey_msg;
 extern const pb_msgdesc_t ef_v1_CreateEncryptionKey_msg;
@@ -2758,6 +2776,7 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_SetAdminPassword_fields &ef_v1_SetAdminPassword_msg
 #define ef_v1_ClearAdminPassword_fields &ef_v1_ClearAdminPassword_msg
 #define ef_v1_SetUsbLock_fields &ef_v1_SetUsbLock_msg
+#define ef_v1_ForgetBleBonds_fields &ef_v1_ForgetBleBonds_msg
 #define ef_v1_SetEncryption_fields &ef_v1_SetEncryption_msg
 #define ef_v1_GetEncryptionKey_fields &ef_v1_GetEncryptionKey_msg
 #define ef_v1_CreateEncryptionKey_fields &ef_v1_CreateEncryptionKey_msg
@@ -2782,10 +2801,11 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_CreateEncryptionKey_size           2
 #define ef_v1_DeleteEncryptionKey_size           17
 #define ef_v1_DeleteRecording_size               65
-#define ef_v1_DeviceInformation_size             1893
+#define ef_v1_DeviceInformation_size             1905
 #define ef_v1_DownloadRecording_size             82
 #define ef_v1_EncryptionKey_size                 55
 #define ef_v1_FactoryReset_size                  0
+#define ef_v1_ForgetBleBonds_size                0
 #define ef_v1_GetAuthChallenge_size              2
 #define ef_v1_GetChunkUploadStatus_size          65
 #define ef_v1_GetDeviceInformation_size          0
@@ -2807,7 +2827,7 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_ImuCalibration_size                425
 #define ef_v1_ImuConfig_size                     22
 #define ef_v1_ListRecordings_size                0
-#define ef_v1_Location_size                      36
+#define ef_v1_Location_size                      38
 #define ef_v1_OtaAbort_size                      0
 #define ef_v1_OtaApply_size                      0
 #define ef_v1_OtaCheck_size                      0
@@ -2831,16 +2851,16 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_SetCalibration_size                428
 #define ef_v1_SetEncryptionKey_size              36
 #define ef_v1_SetEncryption_size                 4
-#define ef_v1_SetLocation_size                   38
+#define ef_v1_SetLocation_size                   40
 #define ef_v1_SetOtaConfig_size                  522
 #define ef_v1_SetSetting_size                    11
 #define ef_v1_SetTime_size                       11
 #define ef_v1_SetUsbLock_size                    4
 #define ef_v1_SettingValue_size                  13
 #define ef_v1_StartHealthCheck_size              2
-#define ef_v1_StartRecording_size                2162
+#define ef_v1_StartRecording_size                2166
 #define ef_v1_StartStream_size                   79
-#define ef_v1_StartUpload_size                   2122
+#define ef_v1_StartUpload_size                   2124
 #define ef_v1_StartWifiCheck_size                0
 #define ef_v1_StateInfo_size                     109
 #define ef_v1_StopRecording_size                 65
@@ -2851,7 +2871,7 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_StreamTarget_size                  75
 #define ef_v1_TimeSyncReply_size                 33
 #define ef_v1_TimeSync_size                      11
-#define ef_v1_UploadSpec_size                    2054
+#define ef_v1_UploadSpec_size                    2056
 #define ef_v1_UploadStatus_size                  91
 #define ef_v1_VideoConfig_size                   28
 #define ef_v1_WifiAdd_size                       106
@@ -2862,7 +2882,7 @@ extern const pb_msgdesc_t ef_v1_FactoryReset_msg;
 #define ef_v1_WifiScanResult_size                2880
 #define ef_v1_WifiScan_size                      0
 #define ef_v1_WifiSelect_size                    36
-#define ef_v1_WifiStatus_size                    170
+#define ef_v1_WifiStatus_size                    172
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -4,7 +4,7 @@
 // ef::toCvMat() is a zero-copy view, with no colour conversion or per-frame
 // allocation.
 //
-//   ./opencv_01_opencv_display        # USB
+//   ./opencv_display        # USB
 //
 // Press ESC or 'q' to quit.
 

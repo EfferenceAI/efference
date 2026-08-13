@@ -229,6 +229,18 @@ ERROR_CODE Device::set_ble_password(const std::string& old_password,
     return ec;
 }
 
+ERROR_CODE Device::forget_ble_bonds() {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    // USB only, and the device enforces it too. This drops the bond of every
+    // paired peer, so over BLE it would cut the link the reply had to travel on.
+    if (impl_->init.input_type != INPUT_TYPE::USB)
+        return ERROR_CODE::INVALID_FUNCTION_CALL;
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body = ef_v1_Request_forget_ble_bonds_tag;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
 ERROR_CODE Device::set_admin_password(const std::string& old_password,
                                       const std::string& new_password) {
     if (!is_open())           return ERROR_CODE::DEVICE_NOT_INITIALIZED;
@@ -302,7 +314,7 @@ ERROR_CODE Device::authenticate_admin(const std::string& admin_password) {
                                                &refused_at_challenge,
                                                ef_v1_Request_set_ble_password_tag);
     if (ec == ERROR_CODE::SUCCESS) return ec;
-    // ⚠ Failing must not leave the handle worse off than before it asked, and the two
+    // Failing must not leave the handle worse off than before it asked, and the two
     // failures differ. Refused BEFORE a nonce was issued (no administrator password on
     // the device): nothing was revoked, but control_auth_locked writes `authenticated`
     // unconditionally, so put it back. Refused at the PROOF: the challenge already
@@ -359,6 +371,24 @@ ERROR_CODE Device::set_location(double latitude, double longitude,
     req.body.set_location.location.longitude       = longitude;
     req.body.set_location.location.altitude        = altitude;
     req.body.set_location.location.covariance_diag = covariance_diag;
+    req.body.set_location.location.state           = ef_v1_LocationState_LOCATION_SET;
+    WireResponse resp;
+    return impl_->call(req, resp);
+}
+
+ERROR_CODE Device::clear_location() {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
+    // A device that does not report its location state cannot clear: it would read this as a
+    // request to store 0,0 and overwrite the location it holds. Refuse instead.
+    Location cur;
+    ERROR_CODE ec = get_location(cur);
+    if (ec != ERROR_CODE::SUCCESS) return ec;
+    if (!cur.clear_supported) return ERROR_CODE::UNSUPPORTED;
+
+    WireRequest req = ef_v1_Request_init_zero;
+    req.which_body                        = ef_v1_Request_set_location_tag;
+    req.body.set_location.has_location    = true;
+    req.body.set_location.location.state = ef_v1_LocationState_LOCATION_NONE;
     WireResponse resp;
     return impl_->call(req, resp);
 }
@@ -376,6 +406,12 @@ ERROR_CODE Device::get_location(Location& out) {
     out.longitude       = resp.body.location.longitude;
     out.altitude        = resp.body.location.altitude;
     out.covariance_diag = resp.body.location.covariance_diag;
+    // Firmware that predates the field always carried a location, so UNSPECIFIED
+    // means "set", not "none". Reporting it as unset would tell a caller the device
+    // sends no location while it is still stamping one into every recording.
+    const auto st = resp.body.location.state;
+    out.clear_supported = (st != ef_v1_LocationState_LOCATION_UNSPECIFIED);
+    out.is_set          = (st != ef_v1_LocationState_LOCATION_NONE);
     return ERROR_CODE::SUCCESS;
 }
 

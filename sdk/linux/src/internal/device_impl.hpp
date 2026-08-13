@@ -154,6 +154,11 @@ enum class Ctx {
     SESSION,     // configure / start_stream during open()
     RECORDING,   // device-local recording verbs (incl. download)
     UPLOAD,      // upload verbs
+    // The outcome the destination gave a transfer, read back from
+    // UploadStatus.last_error. Separate from UPLOAD because the same wire code means
+    // a different thing here: NOT_FOUND on an upload CALL means the recording is
+    // missing, while NOT_FOUND in a transfer's outcome means the URL is dead.
+    UPLOAD_STATUS,
     UPDATE,      // OTA verbs
     WIFI,        // wifi verbs; BUSY surfaces as a retryable ERROR_CODE::BUSY
 };
@@ -173,7 +178,7 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         case ef_v1_ErrorCode_STORAGE_FULL:             return ERROR_CODE::STORAGE_FULL;
         // Name conflict on record start (recording-specific, same meaning in any ctx).
         case ef_v1_ErrorCode_ALREADY_EXISTS:           return ERROR_CODE::RECORDING_ALREADY_EXISTS;
-        // Whatever was asked, the gate that failed is a credential. ⚠ This runs inside
+        // Whatever was asked, the gate that failed is a credential. This runs inside
         // call_locked on the FIRST round trip, before any escalation, and the collapsed
         // code is also what call() returns on paths that never escalate at all: a
         // latched credential, or a verb outside the escalation list. So it does NOT
@@ -181,16 +186,31 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
         // it was, and last_error_message() for the device's own wording.
         case ef_v1_ErrorCode_AUTH_REQUIRED:
         case ef_v1_ErrorCode_ADMIN_REQUIRED:
-        case ef_v1_ErrorCode_AUTH_FAILED:              return ERROR_CODE::INVALID_PASSWORD;
+        // In an upload OUTCOME the credential that failed is the destination's, not
+        // this device's: the URL was refused or has expired. Reporting that as a
+        // password error sends the caller to rekey a device that is working fine.
+        case ef_v1_ErrorCode_AUTH_FAILED:
+            return ctx == Ctx::UPLOAD_STATUS ? ERROR_CODE::UPLOAD_URL_REJECTED
+                                             : ERROR_CODE::INVALID_PASSWORD;
         // Retained for wire compatibility. No current firmware emits this code; the
         // mapping stays so an older or future device that does is not reported as a
         // password error, which would send the user hunting for the wrong fix.
         case ef_v1_ErrorCode_USB_REQUIRED:             return ERROR_CODE::USB_REQUIRED;
+        // The device routed nothing for this verb, whatever it was: the same answer in
+        // every context, so it is decided here rather than per-Ctx, and never worth
+        // retrying against this firmware. Firmware carrying this code emits UNSUPPORTED
+        // only for a handler that ran and refused its arguments; older firmware also
+        // used it for an unrouted verb, which is what the RECORDING arm below still
+        // absorbs.
+        case ef_v1_ErrorCode_COMMAND_NOT_FOUND:        return ERROR_CODE::COMMAND_NOT_FOUND;
         // A control request that timed out means the device stopped answering
         // (grab timeouts come from the host-side reader, never from here).
+        // An upload OUTCOME that timed out is the destination being slow, not this
+        // device going quiet, and it is worth retrying.
         case ef_v1_ErrorCode_TIMEOUT:
-            return ctx == Ctx::UPDATE ? ERROR_CODE::FAILED_TO_UPDATE
-                                      : ERROR_CODE::COMMUNICATION_ERROR;
+            if (ctx == Ctx::UPDATE)        return ERROR_CODE::FAILED_TO_UPDATE;
+            if (ctx == Ctx::UPLOAD_STATUS) return ERROR_CODE::DEVICE_BUSY;
+            return ERROR_CODE::COMMUNICATION_ERROR;
         default: break;
     }
 
@@ -224,9 +244,28 @@ inline ERROR_CODE err_from(WireErrorCode c, Ctx ctx) {
                 case ef_v1_ErrorCode_NOT_FOUND:         return ERROR_CODE::RECORDING_NOT_FOUND;
                 // Unmet precondition, not a broken link: provision WiFi first.
                 case ef_v1_ErrorCode_WIFI_NOT_CONNECTED: return ERROR_CODE::WIFI_NOT_CONNECTED;
+                // An upload is already running for this recording; retry once it
+                // ends. Retryable-busy stays distinct from a sequencing error, the
+                // same rule RECORDING and WIFI follow.
+                case ef_v1_ErrorCode_BUSY:              return ERROR_CODE::DEVICE_BUSY;
                 case ef_v1_ErrorCode_INVALID_PARAMETER:
-                case ef_v1_ErrorCode_BUSY:
                 case ef_v1_ErrorCode_INVALID_STATE:     return ERROR_CODE::INVALID_FUNCTION_CALL;
+                default:                                return ERROR_CODE::UNKNOWN_FAILURE;
+            }
+        case Ctx::UPLOAD_STATUS:
+            // AUTH_FAILED, TIMEOUT and STORAGE_FULL are decided by the shared switch
+            // above and must not be repeated here — a second entry would be dead and
+            // would read as authoritative.
+            switch (c) {
+                // The transfer never got an answer: on this device that is the WiFi
+                // link far more often than the server.
+                case ef_v1_ErrorCode_WIFI_NOT_CONNECTED: return ERROR_CODE::WIFI_NOT_CONNECTED;
+                // The destination rejected or no longer knows this URL. Terminal:
+                // retrying the same URL cannot succeed, so mint a fresh one.
+                case ef_v1_ErrorCode_NOT_FOUND:
+                case ef_v1_ErrorCode_INVALID_PARAMETER: return ERROR_CODE::UPLOAD_URL_REJECTED;
+                // Transient: the destination asked us to back off.
+                case ef_v1_ErrorCode_BUSY:              return ERROR_CODE::DEVICE_BUSY;
                 default:                                return ERROR_CODE::UNKNOWN_FAILURE;
             }
         case Ctx::UPDATE:
@@ -674,11 +713,10 @@ struct Device::Impl {
             // Which credential the device wants. `ec` already proves a decoded reply
             // rejected us on one, so resp.code is safe to read and only says which.
             //
-            // ⚠ Scoped to the seven verbs that can legitimately demand it: the peer chooses
-            // when to say ADMIN_REQUIRED, so the credential is never derived for a verb
-            // that has no business asking. control_auth_locked floors ch.iters for the
-            // same reason. Set/ClearAdminPassword belong here because changing or removing
-            // the credential needs a grant the client would otherwise never earn.
+            // Scoped to the seven verbs that can legitimately demand it, so the admin
+            // credential is never derived for a verb that has no business asking.
+            // Set/ClearAdminPassword belong here because changing or removing the
+            // credential needs a grant the client would otherwise never earn.
             const bool admin = (resp.code == ef_v1_ErrorCode_ADMIN_REQUIRED) &&
                                (req.which_body == ef_v1_Request_get_encryption_key_tag ||
                                 req.which_body == ef_v1_Request_delete_encryption_key_tag ||
@@ -709,13 +747,12 @@ struct Device::Impl {
             // four wasted round trips and two 200k-iteration derivations, each challenge
             // revoking the link's grant, for a refusal no operator credential can clear.
             //
-            // ⚠ The list above is NOT a mirror of the device's verb_requires_admin, even
+            // The list above is NOT a mirror of the device's verb_requires_admin, even
             // though the two agree today. It answers a different question: on which verbs
-            // will this handle derive PBKDF2 over its ADMIN password against a salt the
-            // PEER chose? BLE is Just Works with the bond purged per disconnect, so a
-            // peer is not authenticated. Do not widen it just to "match" a new device-side
-            // gate; widen it only if disclosing the admin credential on that verb is
-            // acceptable. This break is what makes a divergence a clean error.
+            // will this handle derive its ADMIN password at all? Do not widen it just to
+            // "match" a new device-side gate; widen it only if deriving the admin
+            // credential on that verb is acceptable. This break is what makes a
+            // divergence a clean error rather than a silent one.
             //
             // SetEncryptionKey is listed on its own merits, not to match the device:
             // omitting it would protect nothing and would make the verb unreachable,
@@ -766,16 +803,11 @@ struct Device::Impl {
                     // A caller-supplied credential never latches: it is not the one the
                     // latch describes.
                     admin_pw_bad = true;
-                // Asking for a challenge REVOKES whatever grant the link held, so a
-                // refused escalation would otherwise leave the handle worse off than
-                // before it asked and break every later operator verb.
-                //
-                // ⚠ Not unconditional on the device side: a challenge REFUSED before it
-                // is issued costs the caller nothing, because the revoke happens only
-                // once the device has decided to answer. Restoring after such a refusal
-                // would tear down a live grant to re-earn it, which is why this is
-                // keyed on the stage rather than assumed from the loop's break above:
-                // resp.code there answers the original VERB, never the challenge.
+                // Re-earn the operator grant, because a failed escalation would otherwise
+                // leave the handle unable to run the ordinary verbs it could run before.
+                // Keyed on the stage rather than on the loop's break: resp.code there
+                // answers the original verb, never the challenge, and re-authenticating
+                // when nothing was lost would tear down a live grant to replace it.
                 if (ever_authed && !challenge_refused)
                     (void)control_auth_locked(init.ble_password);
             } else if (re == ERROR_CODE::INVALID_PASSWORD && !challenge_refused) {
@@ -866,15 +898,18 @@ struct Device::Impl {
     }
 
     // Device-truth state: ask the device FSM (get_state) and fold it into the
-    // DEVICE_STATE cache. Best-effort: on failure the cache keeps its last value
-    // (the public contract has no UNKNOWN state).
-    void refresh_device_state() {
-        if (!connection) return;
+    // DEVICE_STATE cache. On failure the cache keeps its last value (the public
+    // contract has no UNKNOWN state), so the returned code is the only way a
+    // caller learns the answer is stale -- which is what Device::refresh_state()
+    // exists to surface.
+    ERROR_CODE refresh_device_state() {
+        if (!connection) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
         WireRequest req = ef_v1_Request_init_zero;
         req.which_body = ef_v1_Request_get_state_tag;
         WireResponse resp;
-        if (call(req, resp, ef_v1_Response_state_info_tag) != ERROR_CODE::SUCCESS)
-            return;
+        ERROR_CODE ec = call(req, resp, ef_v1_Response_state_info_tag);
+        if (ec != ERROR_CODE::SUCCESS)
+            return ec;
         const char* fsm = resp.body.state_info.state;         // authoritative device firmware state
         const char* dev = resp.body.state_info.device_state;  // reported_status (BLE projection)
 
@@ -910,6 +945,7 @@ struct Device::Impl {
                  !std::strcmp(fsm, "CAL"))  state = DEVICE_STATE::STREAMING;
         else if (!std::strcmp(fsm, "IDLE")) state = DEVICE_STATE::IDLE;
         else                                state = DEVICE_STATE::CLOSED;  // INIT/RESET/HEALTH_TEST/SLEEP
+        return ERROR_CODE::SUCCESS;
     }
 
     // Configure the ISO_LIVE session: geometry, NV12, codec + HQ quality, IMU.
@@ -1086,6 +1122,11 @@ struct Device::Impl {
         std::lock_guard<std::mutex> lk(info_mtx);
         forget_wifi_association();
         info.wireless.ble_connected = false;
+        // Same reason as the association: the drive is host-facing state we can no
+        // longer observe, and a stale `attached` is what a UI renders as a mounted
+        // volume for a device that is gone.
+        info.recordings_volume_attached = false;
+        info.recordings_volume_files    = 0;
         // health is deliberately NOT cleared: it records a sweep that happened, and
         // HealthStatus{} defaults to passed=false, so blanking it would call a
         // healthy device failed across the OTA reconnect. close() still clears it.
@@ -1253,21 +1294,12 @@ struct Device::Impl {
         }
 
         const ef_v1_AuthChallenge& ch = resp.body.auth_challenge;
-        // The KDF parameters come from the peer, so a cost factor below what a real
-        // device sends is refused rather than derived against. Bounded on BOTH sides and
-        // compared in the same unsigned domain the field uses: `ch.iters < 200000` alone
-        // let 0x80000000 through, which the (int) cast below then made NEGATIVE,
-        // defeating the very cost factor the floor exists to guarantee.
+        // The KDF parameters arrive from the peer, so they are bounded at both ends and
+        // compared in the field's own unsigned domain before anything is derived.
         //
-        // ⚠ NOT a copy of the firmware's AUTH_PBKDF2_ITERS, though they are equal today.
-        // That is "the cost this device chooses"; this is "the least cost this client
-        // will derive against for an untrusted peer". They are independent, and the
-        // coupling runs ONE WAY: a device may raise its value freely and this still
-        // holds, but a device that drops BELOW this floor is refused by every shipped
-        // client. So this may never be raised above what deployed firmware sends, and
-        // firmware may never lower AUTH_PBKDF2_ITERS under it. Stated at both ends;
-        // nothing enforces it, because the two live in different repos with no shared
-        // build.
+        // These bounds are this client's, not a mirror of any device constant. Raising
+        // the lower bound past what deployed devices send would refuse them, so treat it
+        // as fixed unless you know what every fielded device sends.
         static constexpr uint32_t kMinPbkdf2Iters = 200000u;
         static constexpr uint32_t kMaxPbkdf2Iters = 10000000u;   // a peer must not stall us for hours
         if (ch.iters < kMinPbkdf2Iters || ch.iters > kMaxPbkdf2Iters || ch.salt.size == 0)
@@ -1277,11 +1309,9 @@ struct Device::Impl {
                               (int)ch.iters, EVP_sha256(), 32, key) != 1)
             return ERROR_CODE::UNKNOWN_FAILURE;   // else `key` is used uninitialized
         unsigned int mlen = 0;
-        // Checked for the same reason as the derivation above, and it matters more here:
-        // on failure `mac` is uninitialized, gets sent as the proof, and comes back
-        // AUTH_FAILED -> INVALID_PASSWORD -> a latch that condemns a CORRECT password for
-        // the life of the handle. A nonce of zero length is refused on the same grounds:
-        // nanopb bounds it, but a zero-length one carries no freshness at all.
+        // Failing here must not fall through: an unchecked failure would send a MAC that
+        // was never computed, and the resulting AUTH_FAILED latches a correct password as
+        // invalid for the life of the handle. A zero-length nonce is refused too.
         if (ch.nonce.size == 0 ||
             HMAC(EVP_sha256(), key, 32, ch.nonce.bytes, ch.nonce.size, mac, &mlen) == nullptr ||
             mlen != 32)
@@ -1289,7 +1319,7 @@ struct Device::Impl {
 
         WireRequest areq = ef_v1_Request_init_zero;
         areq.which_body                     = ef_v1_Request_authenticate_tag;
-        // Set on the proof as well as the challenge, per docs/ble-integration.md. The
+        // Set on the proof as well as the challenge. The
         // device takes the granted tier from the nonce it issued, so this only lets it
         // reject a caller whose claim disagrees -- but leaving it unset made the SDK
         // the one client that never exercised its own documented contract.

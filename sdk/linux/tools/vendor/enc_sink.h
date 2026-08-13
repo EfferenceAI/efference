@@ -31,15 +31,14 @@
  *     8+N  16   GCM tag
  *
  * Per-chunk nonce = base_nonce with its trailing 8 bytes XORed by the big-endian
- * chunk index, so a repeat needs a 96-bit base_nonce collision.
+ * chunk index.
  *
  * AAD = header || be64(index) || the 8-byte record prefix. Binding the header
  * makes any edit to chunk_bytes/device_id/base_nonce fail every tag; binding the
  * index and length blocks reordering, splicing, and truncating a chunk short.
  *
  * The final chunk carries cflags bit0 (and may be zero-length), so a decryptor
- * distinguishes a clean close from a truncated file. An attacker cannot forge
- * the end marker, because cflags is covered by the tag.
+ * distinguishes a clean close from a truncated file.
  */
 
 #ifndef EFR_ENC_SINK_H

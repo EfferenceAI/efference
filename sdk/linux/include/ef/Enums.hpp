@@ -45,6 +45,7 @@ enum class ERROR_CODE : int {
     INSUFFICIENT_PERMISSIONS = 26,      // Cannot access the device; add the udev rule / grant USB access.
     UNSUPPORTED = 27,                   // Operation not supported in this build.
     DEVICE_BUSY = 28,                   // Device busy (e.g. recording or livestreaming); retry once it is idle.
+    COMMAND_NOT_FOUND = 29,             // The device has no handler for this call; usually an SDK newer than the firmware. Update the device. Firmware predating this code reports INVALID_FUNCTION_CALL, or UNSUPPORTED on recording calls.
 
     // --- 40-59: sensor parameters & calibration ---
     INVALID_RESOLUTION = 40,            // Resolution not in the device's supported set.
@@ -71,6 +72,7 @@ enum class ERROR_CODE : int {
     RECORDING_ALREADY_EXISTS = 86,      // A recording with that name already exists; delete it or pick a new name.
     USB_REQUIRED = 87,                  // Needs the USB link itself; no password satisfies it over BLE.
     DESTINATION_NOT_WRITABLE = 88,      // The local destination could not be written; the recording on the device is fine.
+    UPLOAD_URL_REJECTED = 89,           // The upload destination rejected the URL (expired, revoked, or unknown). Mint a fresh one; retrying this URL cannot succeed.
 
     UNKNOWN_FAILURE = 100               // Unclassified failure.
 };
@@ -147,7 +149,8 @@ enum class VIEW {
 // Device lifecycle state. No UNKNOWN: an unreadable state surfaces as an
 // ERROR_CODE on the call that hit it; get_state() keeps the last known value.
 enum class DEVICE_STATE {
-    CLOSED    = 0,  // Device is detected but not open.
+    CLOSED    = 0,  // Not open, or open and unavailable. If retrying does not clear it,
+                    // poll_fault() reports whether a fault is latched.
     IDLE      = 1,  // Device is open but not moving data.
     STREAMING = 2,  // Device is moving data: live host stream, recording, upload, or calibration.
     UPDATING  = 3,  // Device is connected, but unavailable, due to updating.
@@ -215,6 +218,7 @@ enum class STOP_REASON {
     DISK_FULL   = 2,   // storage reserve reached; finalized cleanly
     WRITE_ERROR = 3,   // sink write error ended the session
     INTERRUPTED = 4,   // power loss / crash; recovered at next boot
+    DEVICE      = 5,   // the device ended it, not a user; the file is complete
 };
 
 // Firmware update phases. New values are appended; 0-3 keep their values.

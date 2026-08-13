@@ -2,7 +2,7 @@
 //
 // Single source of truth for the control plane. Generated to:
 //   - device: nanopb (static, no malloc), vendored runtime + nanopb_generator
-//   - host:   protobuf C++ (and later Python)
+//   - host:   protobuf C++
 // Carried as the payload AFTER the 12-byte wire header
 //   (magic=0xEF, version, type{1=REQ,2=RESP,3=ERR,4=EVENT-reserved}, flags, corr_id u32, len u32).
 //
@@ -70,20 +70,21 @@ message Request {
     Reboot               reboot                 = 73;
     GetStorage           get_storage            = 74;
     GetState             get_state              = 75;
-    SetLocation          set_location           = 76;  // persist device location on the device
-    GetLocation          get_location           = 77;  // read current effective device location
+    SetLocation          set_location           = 76;  // store or clear the device location
+    GetLocation          get_location           = 77;  // read the stored device location
     // calibration (per-sensor; get is folded into GetDeviceInformation.camera/imu)
     SetCalibration       set_calibration        = 78;  // write intrinsics (IDLE only, next session)
     ResetCalibration     reset_calibration      = 79;  // restore factory default (IDLE only)
     // auth / access control (BLE password is user-facing)
     GetAuthChallenge     get_auth_challenge     = 92;  // device -> nonce (auth handshake, both transports)
     Authenticate         authenticate           = 93;  // prove the control password (HMAC over nonce)
-    SetBlePassword       set_ble_password       = 94;  // set/rekey; UNLOCKED usb may reset w/o old
+    SetBlePassword       set_ble_password       = 94;  // set or change the control password
     SetUsbLock           set_usb_lock           = 96;  // lock/unlock USB; locked USB gates like BLE
+    ForgetBleBonds       forget_ble_bonds       = 106; // drop this device's BLE bonds; each phone must forget it too
     // ADMIN-gated once an administrator password exists, FactoryReset excepted; while
     // none is set they are served at the control-password tier. See AuthRole.
     GetEncryptionKey     get_encryption_key     = 97;  // read the video-encryption key
-    FactoryReset         factory_reset          = 98;  // lost-password recovery; over USB, possession authorises
+    FactoryReset         factory_reset          = 98;  // restore factory settings; DESTROYS the encryption key
     SetEncryption        set_encryption         = 99;  // turn at-rest video encryption on/off
     CreateEncryptionKey  create_encryption_key  = 100; // generate a key; returned ONCE
     DeleteEncryptionKey  delete_encryption_key  = 101; // destroy the key (key_id must match)
@@ -149,6 +150,9 @@ enum ErrorCode {
   // The verb needs the USB link itself; no password satisfies it over BLE. Not the
   // administrator tier, which is transport-independent.
   USB_REQUIRED             = 20;
+  // No handler for this verb on this firmware. Distinct from UNSUPPORTED, which
+  // means the verb ran and refused the arguments.
+  COMMAND_NOT_FOUND        = 21;
 }
 
 // ============================ Enums ============================
@@ -182,9 +186,7 @@ message VideoConfig {
   Codec codec = 5;                                       // only meaningful in BULK_COLLECT
   uint32 quality = 6;                                    // encoder quality 1-100 (0 = device default); HQ presets use a high value
 }
-// IMU capture mode. Default IMU_RAW: record uncalibrated samples + carry the full
-// ImuCalibration params as metadata (consumer applies M·S·(x−b)). IMU_CALIBRATED: the
-// device applies the calibration to the samples on-device. IMU_BOTH: emit both (dual topics).
+// IMU capture mode: RAW records uncalibrated samples with the calibration as metadata, CALIBRATED applies it on-device, BOTH emits each.
 enum ImuData { IMU_RAW = 0; IMU_CALIBRATED = 1; IMU_BOTH = 2; }
 message ImuConfig { bool enabled = 1; uint32 rate_hz = 2; uint32 accel_range_g = 3; uint32 gyro_range_dps = 4; ImuData data = 5; }
 message Configure { Mode mode = 1; VideoConfig video = 2; ImuConfig imu = 3; }
@@ -216,18 +218,18 @@ message StartRecording {
   string name = 1;                          // empty => default "rec_<utc>_<seq>"
   RecordingTarget target = 2;               // REC_HOST_FILE | REC_DEVICE_LOCAL
   UploadSpec upload = 3;                     // optional auto-upload policy
-  Location location = 4;                     // optional per-session location override (this MCAP only)
+  Location location = 4;                     // optional location for this MCAP only; leaves the stored one alone
 }
 message StopRecording      { string name = 1; }   // empty => current
 message GetRecordingStatus { string name = 1; }
-// Why a session stopped. UNSPECIFIED for in-progress sessions and recordings
-// made by firmware that predates the field.
+// Why a session stopped; UNSPECIFIED while in progress or from firmware predating the field.
 enum StopReason {
   STOP_UNSPECIFIED = 0;
   STOP_USER        = 1;  // explicit stop
   STOP_DISK_FULL   = 2;  // storage reserve reached; finalized cleanly
   STOP_WRITE_ERROR = 3;  // sink write error ended the session
   STOP_INTERRUPTED = 4;  // power loss / crash; recovered at next boot
+  STOP_DEVICE      = 5;  // the device ended it, not a user; the file is complete
 }
 
 message RecordingStatus {
@@ -247,10 +249,7 @@ message RecordingStatus {
 message ListRecordings  {}
 message RecordingList   { repeated RecordingStatus recordings = 1; }
 message DeleteRecording { string name = 1; }
-// Pull a device-local recording to the host over the control plane, mirroring the
-// OTA push (chunk-over-transport, no networking). Host loops offset->EOF; each reply
-// carries up to 7168 B of the recording (a finalized .mcap, or an unrepaired
-// power-loss partial served as-is) plus the total size and an eof flag.
+// Pull a device-local recording over the control plane: loop offset->EOF, each reply carrying recording bytes, the total size and an eof flag.
 message DownloadRecording { string name = 1; uint64 offset = 2; uint32 len = 3; }
 message RecordingChunk    { bytes  data = 1; uint64 total = 2; bool   eof = 3; }
 
@@ -259,6 +258,7 @@ message UploadSpec {
   UploadDest dest          = 1;             // CLOUD_URL | TO_HOST
   string     presigned_url = 2;             // when dest = CLOUD_URL
   UploadMode mode          = 3;             // AFTER_STOP | STREAMING
+  bool       resumable     = 4;             // presigned_url is a resumable-session URI; omit for a plain PUT
 }
 message StartUpload     { string recording_name = 1; UploadSpec spec = 2; }
 message StopUpload      { string recording_name = 1; }
@@ -269,13 +269,7 @@ message UploadStatus {
 }
 
 // ============================ Chunked upload ============================
-// The APP (BLE central) holds the ONLY mTLS cert and runs the app-side ingest protocol
-// (create/finalize/refresh-url). The DEVICE is a PUT-worker: it lists a session's
-// chunks (GetSessionManifest), receives pre-signed per-chunk URLs (PutChunks),
-// PUTs each chunk over WiFi (no cert), and reports per-chunk outcome
-// (GetChunkUploadStatus). Delete is app-gated (DeleteRecording after finalize).
-// URLs are ~1-2 KB; PutChunks is sent in small batches to stay under
-// EFR_PROTO_MAX_PAYLOAD (8192).
+// Chunked upload: list a session's chunks, receive pre-signed per-chunk URLs in small batches, PUT them, report the outcome.
 message GetSessionManifest { string name = 1; }          // empty => current/last session
 message ChunkInfo   { uint32 index = 1; string filename = 2; uint64 size_bytes = 3; }
 message SessionManifest { string name = 1; repeated ChunkInfo chunks = 2; }
@@ -288,8 +282,7 @@ message GetChunkUploadStatus { string name = 1; }
 message ChunkUploadStatus    { string name = 1; repeated ChunkResult results = 2; bool all_ok = 3; }
 
 // ============================ OTA (thin front-end over the device OTA) ============================
-// Thin front-end over the device OTA. Commit and rollback happen automatically
-// after boot; the host observes OTA_SUCCESS / OTA_ROLLEDBACK via OtaStatus.
+// Thin front-end over the device OTA; commit and rollback are automatic after boot and observable via OtaStatus.
 message OtaCheck     {}                      // the host queries the update-check service instead
 message OtaDownload  { string base_url = 1; }// required, one-shot; stages to the inactive slot
 message OtaApply     {}                      // apply the staged (verified) download, then reboot
@@ -297,10 +290,7 @@ message OtaAbort     {}                      // kill a running download (apply =
 message GetOtaStatus {}
 message SetOtaConfig { string base_url = 1;   // reserved: ignored, the URL is per-run
                        uint32 max_retries = 2; bool stage_mode = 3; }
-// OTA push: relay a self-contained .eff to the device over the wire (no-WiFi update).
-//   USB (B1): OtaPushBegin -> raw .eff bytes on the bulk-OUT push endpoint -> OtaPushEnd.
-//   BLE (B2): OtaPushBegin -> OtaPushChunk{offset,data,eof} over the command channel (delta-sized).
-// The device stores it locally and consumes it via the existing file:// path.
+// Relay a self-contained .eff over the wire: USB sends raw bytes on the bulk-OUT push endpoint, BLE sends OtaPushChunk{offset,data,eof}.
 message OtaPushBegin { string name = 1; uint64 total_size = 2; }   // total_size => storage pre-check
 message OtaPushChunk { uint64 offset = 1; bytes data = 2; bool eof = 3; }  // BLE; data <= ~7 KB
 message OtaPushEnd   { bool ok = 1; }                              // USB: raw stream done (false => abort)
@@ -317,10 +307,7 @@ message OtaStatus {
 }
 
 // ============================ Health ============================
-// StartHealthCheck{deep} kicks off the sweep; GetHealthStatus reports it.
-// health_passed is an inline core-presence gate; overall is the sweep verdict
-// (PASS only if no FAIL); checks[] carries each probe. Non-critical FAILs are
-// reported, never latched.
+// StartHealthCheck{deep} runs the sweep, GetHealthStatus reports it: overall is PASS only if nothing FAILed, and checks[] carries each probe.
 message StartHealthCheck { bool deep = 1; }  // deep => ~2 min perf/stress tier
 message GetHealthStatus  {}
 message HealthCheck { string name = 1; HealthVerdict status = 2; string detail = 3; }  // one probe
@@ -350,6 +337,10 @@ message WifiRemove { string ssid = 1; }
 message WifiSelect { string ssid = 1; WifiBand band = 2; }
 message WifiList {}        message WifiListResult { repeated string ssids = 1; }
 message StartWifiCheck {}  message GetWifiStatus {}
+// Layered: usable is `health == UNSPECIFIED || health >= WIFI_HEALTH_UNVERIFIED` (0 = firmware predates this).
+enum WifiHealth { WIFI_HEALTH_UNSPECIFIED = 0; WIFI_HEALTH_DISCONNECTED = 1; WIFI_HEALTH_NO_ADDRESS = 2;
+                  WIFI_HEALTH_NO_DNS = 3; WIFI_HEALTH_UNREACHABLE = 4; WIFI_HEALTH_UNVERIFIED = 5;
+                  WIFI_HEALTH_OK = 6; }
 message WifiStatus { bool connected = 1; string ssid = 2; int32 rssi = 3; string ip = 4;
                      bool internet = 5; double mbps_down = 6; double mbps_up = 7;
                      // Association phase from wpa_state: "connected" / "connecting"
@@ -359,23 +350,24 @@ message WifiStatus { bool connected = 1; string ssid = 2; int32 rssi = 3; string
                      int32  link_speed = 9;    // negotiated PHY link rate, Mbps (0 = unknown)
                      int32  freq_mhz   = 10;   // associated channel frequency, MHz (0 = unknown; host derives 2.4/5 GHz)
                      string security   = 11;   // "WPA2" / "WPA3" / "WPA2/WPA3" / "Open" ("" = unknown)
+                     WifiHealth health  = 12;  // whether the link actually works; `connected` is association alone
                    }
 
 // ============================ Time / System ============================
-// Device geographic location, written into each MCAP's foxglove.LocationFix.
-// covariance_diag fills the diagonal of the 3x3 position covariance (accuracy).
-message Location    { double latitude = 1; double longitude = 2; double altitude = 3; double covariance_diag = 4; }
-message SetLocation { Location location = 1; }   // persist on the device (replaces the default)
-message GetLocation {}                            // -> Response.location (effective: file, else default)
+// Whether a Location holds a position. UNSPECIFIED means the sender predates this field and is storing one.
+enum LocationState { LOCATION_UNSPECIFIED = 0; LOCATION_SET = 1; LOCATION_NONE = 2; }
+// Device location, written into each recording's foxglove.LocationFix; covariance_diag is the position covariance diagonal in m^2. LOCATION_NONE means none is stored and recordings carry none.
+message Location    { double latitude = 1; double longitude = 2; double altitude = 3; double covariance_diag = 4; LocationState state = 5; }
+message SetLocation { Location location = 1; }   // store a location, or clear it with state=LOCATION_NONE
+message GetLocation {}                            // -> Response.location
 
-message SetTime  { uint64 wall_ns = 1; }     // host sets device wall-clock (-> varlink SetTime epoch_ms)
+message SetTime  { uint64 wall_ns = 1; }     // host sets the device wall-clock
 message TimeSync { uint64 host_tx_ns = 1; }  // host monotonic at send
 message TimeSyncReply { uint64 host_tx_ns = 1; uint64 device_mono_ns = 2; uint64 device_wall_ns = 3; }
 message Heartbeat { uint32 timeout_ms = 1; } // miss => device returns to IDLE
 message Reboot {}
 message GetStorage {}  message StorageInfo { uint64 total_bytes = 1; uint64 free_bytes = 2; uint32 recordings = 3; }
-// Current device FSM state (INIT/IDLE/COLLECT/CAL/OTA/HEALTH_TEST/SAFE/SLEEP),
-// the reported device_state, and whether it is fault-latched in SAFE.
+// Current device state, plus whether it is fault-latched in SAFE.
 message GetState {}
 message StateInfo { string state = 1; string device_state = 2; bool fault_latch = 3; string last_fault = 4; }
 
@@ -413,8 +405,12 @@ message DeviceInformation {
   // encryption-key verbs are served at the control-password tier.
   bool         admin_provisioned         = 34;
   // A key exists with no administrator password, so the control password reads it.
-  // ⚠ Do not report such a device as protected. Setting one later protects it too.
+  // Do not report such a device as protected. Setting one later protects it too.
   bool         key_unprotected           = 33;
+  // The recordings drive is exposed to the host right now; it follows the USB lock.
+  bool         recordings_volume_attached = 35;
+  // Recordings published on that drive; 0 when it is not attached.
+  uint32       recordings_volume_files    = 36;
 }
 // Hardware capability menu, mirrors device.json (generated from CAPS[]).
 message CapMode { uint32 width = 1; uint32 height = 2; uint32 fps = 3; string binning = 4; bool usable = 5; }
@@ -433,24 +429,22 @@ message CameraIntrinsics {  // Double-Sphere
 message ImuCalibration {
   repeated double accel_bias = 1; repeated double gyro_bias = 2;
   double accel_noise_density = 3; double gyro_noise_density = 4; repeated double imu_to_camera = 5;
-  // ---- additive (6+): full per-sensor M·S·(x−b) model, noise model, temporal offset.
+  // ---- additive (6+): full per-sensor M*S*(x-b) model, noise model, temporal offset.
   // Empty/zero => that term isn't present (back-compatible with the bias-only base). Recorded
-  // uncalibrated + these params travel as metadata; consumer applies M·S·(x−b) downstream.
-  repeated double accel_scale_misalign = 6;   // accel 3x3 M·S, row-major (empty = identity)
-  repeated double gyro_scale_misalign  = 7;   // gyro  3x3 M·S, row-major (empty = identity; model is bias-only)
+  // uncalibrated + these params travel as metadata; consumer applies M*S*(x-b) downstream.
+  repeated double accel_scale_misalign = 6;   // accel 3x3 M*S, row-major (empty = identity)
+  repeated double gyro_scale_misalign  = 7;   // gyro  3x3 M*S, row-major (empty = identity; model is bias-only)
   double accel_bias_random_walk = 8;          // Allan +1/2 slope
   double gyro_bias_random_walk  = 9;
   double accel_tau = 10;                       // bias-instability correlation time (Gauss-Markov), s
   double gyro_tau  = 11;
   int64  time_offset_ns = 12;                  // IMU->camera temporal offset (0 when HW-sync only)
 }
-// Write calibration for one sensor (IDLE only; applied on the next capture
-// session). Get is folded into GetDeviceInformation (camera/imu fields).
+// Write calibration for one sensor, IDLE only, applied on the next capture session; read it from GetDeviceInformation.
 message SetCalibration {
   oneof target { CameraIntrinsics camera = 1; ImuCalibration imu = 2; }
 }
-// Restore factory-default calibration for the selected sensor(s) (IDLE only).
-// Camera factory default is currently all-zeros (uncalibrated).
+// Restore factory-default calibration for the selected sensors, IDLE only; the camera default is uncalibrated.
 message ResetCalibration { bool camera = 1; bool imu = 2; }
 
 
@@ -460,8 +454,7 @@ message ResetCalibration { bool camera = 1; bool imu = 2; }
 // credentials: OPERATOR (default 123456) and ADMIN, which guards the encryption-key
 // verbs. Full model: sdk/linux/README.md, "Access control and at-rest encryption".
 
-// Credential tier for the challenge and the proof. ADMIN grants are SINGLE-USE and
-// answered only once an administrator password is set (DeviceInformation.admin_provisioned).
+// Credential tier for the challenge and the proof; ADMIN grants are single-use and need admin_provisioned.
 enum AuthRole {
   AUTH_ROLE_UNSPECIFIED = 0;   // operator: the credential every verb below admin uses
   AUTH_ROLE_ADMIN       = 1;
@@ -473,50 +466,30 @@ message Authenticate     { bytes response = 1;                         // HMAC-S
                            AuthRole role = 2;                          // must match the challenge that issued the nonce
                            uint32 admin_verb = 3; }                    // ADMIN only: the Request tag this grant may be spent on
 message SetBlePassword   { string old_password = 1; string new_password = 2; }
-// Provision the administrator password (empty old_password) or change it; changing
-// always requires the current value, on either transport.
+// Provision the administrator password with an empty old_password, or change it by supplying the current one.
 message SetAdminPassword { string old_password = 1; string new_password = 2; }
-// ⚠ Remove the administrator password: the key verbs drop back to the control
-// password. Needs an ADMIN grant AND the current password.
+// Remove the administrator password so the key verbs fall back to the control password; needs an ADMIN grant and the current value.
 message ClearAdminPassword { string current_password = 1; }
 
-// USB access control. Unlocked (factory default) USB carries OPERATOR privilege with
-// no password, matching today's behavior for everything below the admin tier. Locked, a USB session is gated exactly like a BLE one: only
-// info, state, storage, the auth handshake, and FactoryReset answer without a
-// password. Toggling either way requires the current password.
-// session_only scopes it to this power session: {locked=false} opens a device that
-// is ALREADY locked (refused otherwise) until re-locked from either transport or
-// power is lost, and usb_locked stays true throughout. USB only, and never set
-// implicitly by Authenticate. Omitted = the persistent behavior.
+// USB access control: locked, a USB session gates like a BLE one, and session_only scopes it to this power session.
 message SetUsbLock       { bool locked = 1; bool session_only = 2; }
-// Which cipher a key is for, and which one a recording was written with. Carried
-// explicitly from the start so the format is not pigeonholed to one algorithm; the
-// container header spends a byte on the same id.
+// Drops the device's side of every BLE pairing; each phone must forget it too.
+message ForgetBleBonds   {}
+// Which cipher a key is for, and which one a recording was written with.
 enum EncryptionAlgorithm {
   ENC_ALG_UNSPECIFIED = 0;   // "device default" on a request; AES_256_GCM in a file
   ENC_ALG_AES_256_GCM = 1;
 }
 
-// Enable/disable at-rest encryption for SUBSEQUENT recordings; refused with no key.
-// State is DeviceInformation.encryption_enabled.
+// Enable/disable at-rest encryption for SUBSEQUENT recordings, refused with no key; read the state from DeviceInformation.
 message SetEncryption    { bool enabled = 1; EncryptionAlgorithm algorithm = 2; }
 
 // ---- key lifecycle: ADMIN-gated once an administrator password exists ----
-// A key is generated by the device (Create, returned ONCE) or supplied by the operator
-// (Set). Either way a factory reset destroys the device's copy.
+// A key is generated by the device (Create, returned ONCE) or supplied by the operator (Set); a factory reset destroys the device's copy.
 message GetEncryptionKey    {}
-// Refused when a key already exists: replacing one would make every recording
-// written under it permanently undecryptable, so rotation is delete-then-create,
-// two deliberate steps rather than one that can be typed by accident.
+// Refused when a key already exists; rotate with delete then create.
 message CreateEncryptionKey { EncryptionAlgorithm algorithm = 1; }   // 0 = device default
-// `key_id` must match the installed key. The guard lives here rather than only in
-// the CLI so an SDK or BLE caller cannot destroy a key it never identified. The
-// reply carries the destroyed key's bytes with present=false, which is the last
-// chance to keep it for ciphertext already recorded under it.
-//
-// IDLE-only, like FactoryReset: a running session holds the key in memory and
-// would keep encrypting under it, so the device would report the key destroyed
-// and then finish writing a recording that needs exactly that key.
+// Destroys the key; `key_id` must match the installed one, device must be IDLE, and the reply returns the bytes once.
 message DeleteEncryptionKey { string key_id = 1; }
 // Install a key the operator already holds. Exactly 32 bytes; refused while one exists.
 message SetEncryptionKey    { bytes key = 1; EncryptionAlgorithm algorithm = 2; }
@@ -527,9 +500,6 @@ message EncryptionKey {
   bool   present  = 4;   // false on a Delete reply: `key` is what was just destroyed
 }
 
-// Restore factory settings: password, USB lock, encryption, wifi and runtime state.
-// ⚠ DESTROYS the encryption key, making every recording under it permanently
-// undecryptable. Provisioning and factory identity survive. Needs no password over
-// USB; over BLE it needs the control password.
+// Restore factory settings. DESTROYS the encryption key, so recordings under it become unreadable; provisioning and factory identity survive.
 message FactoryReset     {}
 
