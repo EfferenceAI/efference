@@ -142,9 +142,16 @@ public:
     // path to look at, not proof one was written. A failed run leaves a partial
     // file there, not a valid .mcap until a run returns SUCCESS. A re-run resumes
     // it after verifying it belongs to this recording.
-    ERROR_CODE download_recording(const std::string& name,
-                                  const std::string& dest_path,
-                                  std::string* saved_path = nullptr);
+    // on_progress reports the pull once the destination is open: once before any
+    // bytes are written, then as they arrive, on the calling thread. A call that
+    // fails before that never invokes it, and nothing is reported after a failure,
+    // so the return value is the outcome rather than the last progress seen. Keep
+    // it cheap, do not throw, and do not call back into this Device.
+    ERROR_CODE download_recording(
+        const std::string& name,
+        const std::string& dest_path,
+        std::string* saved_path = nullptr,
+        const std::function<void(const DownloadProgress&)>& on_progress = {});
 
     // Hand the device a URL to upload a recording to, over WiFi. Returns once the
     // URL is attached, not when the transfer finishes; poll get_recording_status(),

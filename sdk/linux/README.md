@@ -759,6 +759,23 @@ directory. A destination that cannot be written (missing directory, no
 permission, host disk full) fails with `DESTINATION_NOT_WRITABLE`; the recording
 on the device is untouched and the pull can simply be re-run.
 
+On a terminal, a long pull reports progress on a line that redraws in place. The
+rate is whatever the link is achieving, so it varies with transport:
+
+```
+[download   ]  42%  69.3/164.6 MB  16.0 MB/s
+```
+
+The line is erased when the transfer ends, leaving `saved <path>` as the result.
+Nothing is printed for a recording that finishes in under a moment, and nothing
+is printed at all when output is redirected, so a script still reads exactly the
+one `saved <path>` line.
+
+An interrupted pull is resumed by re-running the same command, and the progress
+it reports opens at the fraction already on disk. Until a run returns success the
+file left behind is a partial, not a readable `.mcap`; finish the pull before
+handing it to a reader.
+
 **One command at a time.** The USB claim is exclusive for the life of each
 process, so a second command issued while the first is still running fails
 immediately with `DEVICE_BUSY` from `open()`. There is no minimum delay to

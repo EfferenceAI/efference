@@ -101,14 +101,6 @@ fi
 cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD" -j"$(nproc)"
 
-# Internal lint, absent from the public mirror, so its absence must be silent.
-# Warns rather than fails: help text drifting from the parser is worth seeing on
-# every build, not worth blocking one over.
-if [ -x "$ROOT/../../ci/ef-usage-test.sh" ]; then
-    "$ROOT/../../ci/ef-usage-test.sh" >/dev/null 2>&1 ||
-        echo ">> note: a CLI parses a flag its --help omits. Run ci/ef-usage-test.sh" >&2
-fi
-
 # --- optional install -------------------------------------------------------
 # Copy ef-cli (and the library + headers) to /usr/local so ef-cli is on PATH
 # everywhere. Needs sudo. Skip it to keep everything inside the repo.

@@ -38,6 +38,8 @@
 
 #include <ef/Device.hpp>
 
+#include "progress.hpp"
+
 using namespace ef;
 
 // Why the link is not usable, or nullptr when it is (UNSPECIFIED included: older
@@ -396,6 +398,7 @@ struct UpdatePrinter {
     // After a successful update, close the last open phase.
     void done() { if (have) commit("done"); have = false; }
 };
+
 
 // Classify a generic FAILED_TO_UPDATE by the device's message. Match BUSY before
 // NETWORK: the lock also fails in the download phase.
@@ -1103,7 +1106,10 @@ int main(int argc, char** argv) {
     if (cmd == "download" && args.size() > 1) {
         std::string dest = args.size() > 2 ? args[2] : args[1] + ".mcap";
         std::string saved;
-        ec = dev.download_recording(args[1], dest, &saved);
+        ef::DownloadPrinter pr;
+        ec = dev.download_recording(args[1], dest, &saved,
+                                    [&pr](const DownloadProgress& p) { pr.on(p); });
+        pr.done();
         // The device names the specific problem ("recording not found: <name>");
         // the code alone sends people hunting the wrong fault.
         if (ec != ERROR_CODE::SUCCESS)

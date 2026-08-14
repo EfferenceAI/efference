@@ -444,6 +444,12 @@ struct UpdateStatus {
     ERROR_CODE   last_error = ERROR_CODE::SUCCESS;
 };
 
+struct DownloadProgress {
+    uint64_t received     = 0;   // bytes on disk now, resumed_from included
+    uint64_t total        = 0;   // recording size, 0 when the device reports none
+    uint64_t resumed_from = 0;   // bytes a resume started with; 0 on a fresh pull
+};
+
 }  // namespace ef
 
 #endif  // EF_CORE_HPP

@@ -21,6 +21,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "internal/device_impl.hpp"
+#include "internal/recording_paths.hpp"
 
 namespace ef {
 
@@ -273,27 +274,17 @@ ERROR_CODE Device::delete_recording(const std::string& name) {
     return impl_->call(req, resp, 0, Ctx::RECORDING);
 }
 
-ERROR_CODE Device::download_recording(const std::string& name,
-                                      const std::string& dest_path,
-                                      std::string* saved_path) {
-    if (!is_open())                        return ERROR_CODE::DEVICE_NOT_INITIALIZED;
-    if (name.empty() || dest_path.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
+ERROR_CODE Device::download_recording(
+    const std::string& name,
+    const std::string& dest_path,
+    std::string* saved_path,
+    const std::function<void(const DownloadProgress&)>& on_progress) {
+    if (!is_open()) return ERROR_CODE::DEVICE_NOT_INITIALIZED;
 
-    // A directory destination means "put it in here", the way scp and adb pull
-    // read it. fopen() rejects one with EISDIR, so without this a plain
-    // `download <name> ../` failed as if the recording were broken.
-    std::string out_path = dest_path;
-    struct stat ds;
-    if (::stat(out_path.c_str(), &ds) == 0 && S_ISDIR(ds.st_mode)) {
-        // The name is joined onto a caller-chosen directory, and callers get names
-        // from list_recordings() -- i.e. from the device. Reject a separator or a
-        // parent ref before the join rather than trusting the peer not to send one.
-        if (name.find('/') != std::string::npos ||
-            name.find('\\') != std::string::npos ||
-            name == ".." || name.find("../") != std::string::npos)
-            return ERROR_CODE::INVALID_FUNCTION_CALL;
-        if (out_path.back() != '/') out_path += '/';
-        out_path += name + ".mcap";
+    std::string out_path;
+    {
+        ERROR_CODE ec = internal::resolve_download_dest(name, dest_path, out_path);
+        if (ec != ERROR_CODE::SUCCESS) return ec;
     }
     if (saved_path) *saved_path = out_path;
 
@@ -371,6 +362,16 @@ ERROR_CODE Device::download_recording(const std::string& name,
     std::FILE* f = std::fopen(out_path.c_str(), append ? "ab" : "wb");
     if (!f) return ERROR_CODE::DESTINATION_NOT_WRITABLE;
 
+    // What a resume already has, reported before any bytes are written so a caller
+    // can tell resumed bytes from ones it watched arrive.
+    DownloadProgress prog;
+    prog.resumed_from = append ? offset : 0;
+    if (on_progress) {
+        prog.received = offset;
+        prog.total    = first.body.recording_chunk.total;
+        on_progress(prog);
+    }
+
     ERROR_CODE result = ERROR_CODE::SUCCESS;
     for (;;) {
         WireResponse resp;
@@ -386,6 +387,11 @@ ERROR_CODE Device::download_recording(const std::string& name,
             }
             offset += c.data.size;
         }
+        if (on_progress) {
+            prog.received = offset;
+            prog.total    = total;
+            on_progress(prog);
+        }
         if (c.eof) break;
         if (c.data.size == 0) { result = ERROR_CODE::COMMUNICATION_ERROR; break; }  // no progress, not eof
     }
@@ -399,25 +405,12 @@ ERROR_CODE Device::download_recording(const std::string& name,
     return result;
 }
 
-// Device uploads via HTTP PUT to a pre-signed URL, so only http(s) schemes are
-// meaningful. Reject anything else host-side (case-insensitive per RFC 3986)
-// rather than shipping a bad URL that fails opaquely on-device.
-static bool is_http_url(const std::string& u) {
-    auto starts_with_ci = [&](const char* p) {
-        std::size_t n = std::strlen(p);
-        if (u.size() < n) return false;
-        for (std::size_t i = 0; i < n; ++i)
-            if (std::tolower((unsigned char)u[i]) != p[i]) return false;
-        return true;
-    };
-    return starts_with_ci("http://") || starts_with_ci("https://");
-}
 
 ERROR_CODE Device::upload_recording(const std::string& name, const std::string& url,
                                     bool resumable) {
     if (!is_open())                 return ERROR_CODE::DEVICE_NOT_INITIALIZED;
     if (name.empty() || url.empty()) return ERROR_CODE::INVALID_FUNCTION_CALL;
-    if (!is_http_url(url))          return ERROR_CODE::INVALID_FUNCTION_CALL;
+    if (!internal::is_http_url(url))          return ERROR_CODE::INVALID_FUNCTION_CALL;
     WireRequest req = ef_v1_Request_init_zero;
     req.which_body = ef_v1_Request_start_upload_tag;
     std::snprintf(req.body.start_upload.recording_name,

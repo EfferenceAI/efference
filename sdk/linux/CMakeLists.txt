@@ -144,11 +144,10 @@ endif()
 find_package(OpenCV QUIET COMPONENTS core imgproc highgui)
 
 # ---- calibration solvers (prebuilt, closed source) --------------------------------
-# The camera and IMU field-calibration solvers ship as per-architecture BINARIES,
-# built from sdk/linux/calibration/ (private source; copybara excludes it from the
-# public repo, which carries only these .so + the public headers ef/Checkerboard.h
-# and ef/ImuCalib.h). Two independent libs, each bundling the shared linalg. When a
-# .so is absent, the things that need it are skipped and the rest builds as usual.
+# The camera and IMU field-calibration solvers ship as per-architecture BINARIES
+# alongside the public headers ef/Checkerboard.h and ef/ImuCalib.h. Two independent
+# libs, each bundling the shared linalg. When a .so is absent, the things that need
+# it are skipped and the rest builds as usual.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(EF_CAL_ARCH linux-aarch64)      # arm64 Linux
 else()
